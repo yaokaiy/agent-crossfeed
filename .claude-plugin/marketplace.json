@@ -1,0 +1,6 @@
+{
+  "name": "agent-crossfeed",
+  "description": "Hands execution work from Claude Code to the Codex CLI before Claude's 5-hour window runs out.",
+  "owner": { "name": "yaokaiy" },
+  "plugins": [{ "name": "agent-crossfeed", "source": "./" }]
+}

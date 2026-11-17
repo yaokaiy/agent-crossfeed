@@ -1,0 +1,65 @@
+{
+  "name": "agent-crossfeed",
+  "version": "0.1.0",
+  "description": "Hands execution work from Claude Code to the Codex CLI before Claude's 5-hour window runs out.",
+  "author": {
+    "name": "yaokaiy"
+  },
+  "license": "MIT",
+  "userConfig": {
+    "mode": {
+      "type": "string",
+      "title": "Crossfeed mode",
+      "description": "Choose automatic routing, always hand off eligible work with headroom, or turn steering off.",
+      "options": [
+        "auto",
+        "always",
+        "off"
+      ],
+      "default": "auto"
+    },
+    "effort": {
+      "type": "string",
+      "title": "Codex reasoning effort",
+      "description": "Reasoning effort for work handed to Codex.",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "high"
+    },
+    "model": {
+      "type": "string",
+      "title": "Codex model",
+      "description": "Model for work handed to Codex. Leave empty to use Codex's own default.",
+      "default": ""
+    },
+    "eligibleTypes": {
+      "type": "string",
+      "title": "Eligible agent types",
+      "description": "Comma-separated subagent types whose briefs can be handed to Codex.",
+      "default": "general-purpose,claude"
+    },
+    "stretchCalls": {
+      "type": "number",
+      "title": "Long-stretch reminder",
+      "description": "Main-loop tool calls before a hand-off reminder when pressure is high.",
+      "default": 12
+    },
+    "codexStopPercent": {
+      "type": "number",
+      "title": "Codex stop percentage",
+      "description": "Stop handing off new work when a long Codex quota window reaches this percentage.",
+      "default": 85
+    },
+    "timeoutMinutes": {
+      "type": "number",
+      "title": "Job timeout in minutes",
+      "description": "Maximum time for each job handed to Codex.",
+      "default": 30
+    }
+  }
+}

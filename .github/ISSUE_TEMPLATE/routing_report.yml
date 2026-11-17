@@ -1,0 +1,33 @@
+name: Routing report
+description: A task was handed off that should not have been, or the other way round
+labels: [routing]
+body:
+  - type: textarea
+    id: task
+    attributes:
+      label: The task
+      description: What kind of work the subagent call was for. A paraphrase is enough; do not paste private code.
+    validations:
+      required: true
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: What crossfeed did
+      options:
+        - Handed it to Codex, and it should have stayed on Claude
+        - Kept it on Claude, and it should have gone to Codex
+        - Handed it off, and the result failed its check
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of /crossfeed status right after
+      description: It names the tier and the reason of the last decision.
+      render: text
+  - type: textarea
+    id: report
+    attributes:
+      label: Output of /crossfeed report (optional)
+      description: Pass rates per tier help decide whether a rule is wrong in general.
+      render: text

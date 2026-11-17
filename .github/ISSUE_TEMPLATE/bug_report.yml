@@ -1,0 +1,30 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of /crossfeed status
+      description: Paste it as text. Remove anything you do not want to share.
+      render: text
+  - type: textarea
+    id: output
+    attributes:
+      label: Dispatcher output
+      description: The "[crossfeed]" lines of the job, if a job was involved.
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `claude --version`, `codex --version` and `python3 --version`, and your operating system.
+    validations:
+      required: true
