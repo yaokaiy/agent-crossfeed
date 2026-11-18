@@ -15,6 +15,19 @@ function failOpen<E, R>($: EngineInterface, e: E, next: ((event: E) => Promise<R
   return next(e)
 }
 
+// A clock that returns no usable time would poison every age the plugin keeps: fail the event instead.
+async function clock($: EngineInterface): Promise<number> {
+  const now: unknown = await $.clock.now()
+  if (typeof now !== 'number' || !Number.isFinite(now)) throw new Error('the clock returned no usable time')
+  return now
+}
+
+function showStatus($: EngineInterface, core: Core, now: number): void {
+  try {
+    void Promise.resolve($.ui.status(core.status(now))).catch(() => { /* The status line must not block the event. */ })
+  } catch { /* The status line must not block the event. */ }
+}
+
 function claudeReading(rateLimits: readonly SessionRateLimit[]): ClaudeReading {
   const reading: ClaudeReading = {}
   for (const window of rateLimits) {
@@ -99,7 +112,7 @@ export const register: Register = (on, options) => {
     session = await $.session.id()
     core = createCore(config, script, session)
     await $.command.register({ name: 'crossfeed', description: 'Show crossfeed status, report or change routing mode.', argumentHint: '[status|report|auto|always|off]' })
-    const now = await $.clock.now()
+    const now = await clock($)
     lastProbeAt = -Infinity
     if (config.mode !== 'off') lastProbeAt = now
     const [quota, lockout] = await Promise.all([
@@ -109,15 +122,15 @@ export const register: Register = (on, options) => {
     core.setCodex(quota.reading, quota.problem)
     core.setLockout(lockout)
     core.measure(claudeReading((await $.session.usage()).rateLimits), now)
-    $.ui.status(core.status(now))
+    showStatus($, core, now)
     return next(e)
   }).catch(failOpen)
 
   on('session.measure', async ($, e, next) => {
     if (core) {
-      const now = await $.clock.now()
+      const now = await clock($)
       core.measure(claudeReading(e.rateLimits), now)
-      $.ui.status(core.status(now))
+      showStatus($, core, now)
     }
     return next(e)
   }).catch(failOpen)
@@ -135,8 +148,8 @@ export const register: Register = (on, options) => {
 
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
     if (!core) return next(e)
-    const now = await $.clock.now()
-    if (core.needsCodex(e) && core.codexAge(now) > 5 * 60000 && now - lastProbeAt > 5 * 60000) {
+    const now = await clock($)
+    if (core.needsCodex(e) && core.codexAge(now) > 5 * 60000 && Math.abs(now - lastProbeAt) > 5 * 60000) {
       lastProbeAt = now
       const quota = await readCodex($, script, now)
       core.setCodex(quota.reading, quota.problem)
@@ -147,7 +160,7 @@ export const register: Register = (on, options) => {
     const route = core.route(e, now)
     const stay = core.lastStay()
     // The decision may rest on readings newer than the ones the status line was drawn from.
-    try { $.ui.status(core.status(now)) } catch { /* The status line must not block the call. */ }
+    showStatus($, core, now)
     if (!route) {
       try { $.ui.log(core.lastDecision()) } catch { /* Logging must not block the call. */ }
       const ran = await next(e)
@@ -163,15 +176,16 @@ export const register: Register = (on, options) => {
 
   on('tool.call', async (_$, e, next) => {
     const ran = await next(e)
-    const note = core?.toolCall(String(e.tool), e.agentId !== undefined)
+    // A refused call is not a hands-on step and must not use up the one reminder.
     if (ran.deny !== undefined || e.agentId !== undefined) return ran
+    const note = core?.toolCall(String(e.tool), false)
     const notices = core?.takeNotices() ?? []
     if (note) notices.push(note)
     return notices.length ? { ...ran, context: [...(ran.context ?? []), ...notices] } : ran
   }).catch(failOpen)
 
   on('classic.StopFailure', async ($, e, next) => {
-    const lockout = core?.stopFailure(e.error, await $.clock.now())
+    const lockout = core?.stopFailure(e.error, await clock($))
     if (lockout) await $.process.run(['python3', '-I', script, 'lockout', '--reset-at', lockout.resetAt, ...(session === undefined ? [] : ['--session', session])])
     return next(e)
   }).catch(failOpen)
@@ -179,12 +193,12 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'crossfeed' }, async ($, e, next) => {
     if (!core) return next(e)
     const args = e.args.trim()
-    const now = await $.clock.now()
+    const now = await clock($)
     if (args === '' || args === 'status') return { text: core.describe(now) }
     if (args === 'report') return { text: (await $.process.run(['python3', '-I', script, 'report'])).stdout }
     if (args === 'auto' || args === 'always' || args === 'off') {
       core.setMode(args)
-      $.ui.status(core.status(now))
+      showStatus($, core, now)
       return { text: `crossfeed mode: ${args} (this session)` }
     }
     return { text: 'usage: /crossfeed [status|report|auto|always|off]' }

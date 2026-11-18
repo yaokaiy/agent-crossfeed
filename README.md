@@ -140,9 +140,10 @@ For each subagent call crossfeed asks three questions.
    Codex's weekly use approaches 85%.
 
 The forecast cannot see subagents that have just started, so two more
-rules apply. Once two tier A or B calls have stayed on Claude within 10
-minutes, further tier B calls in that time go to Codex too, while it has
-headroom. And a window that begins within two hours of a locked window's
+rules apply. Once two calls that could have been handed off (tier A or B)
+have stayed on Claude within 10 minutes, further tier B calls in that time
+go to Codex too, while it has headroom. And a window that begins within two
+hours of a locked window's
 reset starts with pressure already raised; that start counts for the
 window's first 30 minutes.
 

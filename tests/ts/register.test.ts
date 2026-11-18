@@ -24,7 +24,7 @@ function setup(on: On) {
     stash: processResult('/tmp/检查 brief.md\n'), rejectStash: false,
     processes: [] as { argv: readonly string[]; timeout?: number; stdin?: string }[],
     agents: [] as unknown[], statuses: [] as (string | undefined)[], logs: [] as string[], commands: [] as string[],
-    bashCalls: 0, denyBash: false, denyAgent: false,
+    bashCalls: 0, denyBash: false, denyAgent: false, failStatus: false,
   }
   on('clock.now', () => {
     if (world.failClock) { world.failClock = false; return { deny: 'clock unavailable' } }
@@ -35,7 +35,11 @@ function setup(on: On) {
   on('session.usage', () => ({ value: { startedAt: BASE, context: { window: 200000 }, rateLimits: world.usage } }))
   on('session.cwd', () => ({ value: world.cwd }))
   on('session.id', () => ({ value: 'test-session' }))
-  on('ui.status', (_$, e) => { world.statuses.push(e.text); return { value: undefined } })
+  on('ui.status', (_$, e) => {
+    if (world.failStatus) throw new Error('status unavailable')
+    world.statuses.push(e.text)
+    return { value: undefined }
+  })
   on('ui.log', (_$, e) => { world.logs.push(e.text); return { value: undefined } })
   on('command.register', (_$, e) => { world.commands.push(e.name); return { value: { command: e.name } } })
   on('command.run', () => ({ text: 'engine command' }))
@@ -501,3 +505,46 @@ for (const [name, age, accepted] of [
     expect(status.includes('no Codex reading (quota probe returned an invalid age)')).toBe(!accepted)
   })
 }
+
+for (const bad of [NaN, Infinity, undefined, null, '1794902400000'] as const) {
+  test(`a clock that returns ${String(bad)} at startup does not leave a reading that never ages`, async ($, on) => {
+    const world = setup(on)
+    world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+    world.now = bad as unknown as number
+    await start($)
+    const probes = () => world.processes.filter(call => call.argv[3] === 'quota').length
+    expect(probes()).toBe(0)
+    expect((await $.tool.call(AGENT)).deny).toBe(undefined)
+    world.now = BASE
+    expect((await $.tool.call(AGENT)).deny?.startsWith('crossfeed:')).toBe(true)
+    expect(probes()).toBe(1)
+    world.now = BASE + 24 * 60 * MINUTE
+    await $.tool.call(AGENT)
+    expect(probes()).toBe(2)
+  })
+}
+
+test('a refused tool call is not counted and does not use up the stretch reminder', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 95)
+  for (let i = 0; i < 11; i++) await $.tool.call({ tool: 'Bash', command: 'true' })
+  world.denyBash = true
+  for (let i = 0; i < 3; i++) expect(await $.tool.call({ tool: 'Bash', command: 'true' })).toEqual({ deny: 'engine denied' })
+  world.denyBash = false
+  const result = await $.tool.call({ tool: 'Bash', command: 'true' })
+  const reminder = result.context?.find(text => text.includes('main-loop tool calls'))
+  expect(reminder?.startsWith('crossfeed: 12 main-loop tool calls')).toBe(true)
+})
+
+test('a status line that cannot be drawn does not block commands, readings or routing', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+  await start($)
+  world.failStatus = true
+  expect((await command($, 'always')).text).toBe('crossfeed mode: always (this session)')
+  await measure($, world, 3)
+  expect((await $.tool.call(RESEARCH)).deny?.startsWith('crossfeed:')).toBe(true)
+  expect((await command($, 'off')).text).toBe('crossfeed mode: off (this session)')
+  expect((await $.tool.call(RESEARCH)).deny).toBe(undefined)
+})

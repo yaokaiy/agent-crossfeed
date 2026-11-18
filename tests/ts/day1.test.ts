@@ -239,3 +239,29 @@ test('reminder is read-only by default and quotes session; static guidance cover
   }
   expect(staticSection('/plugin/crossfeed.py').includes('Exit code 127 means the codex CLI was not found: do the work yourself and tell the user.')).toBe(true)
 })
+
+for (const [early, expected] of [[5 * MINUTE, 0.3], [5 * MINUTE + 1, 0], [60 * MINUTE, 0]] as const) {
+  test(`a reading for a window that begins ${early} ms from now starts at ${expected}`, async () => {
+    const start = BASE + early
+    expect(updatePressure(INITIAL_PRESSURE, reading(2, start + 300 * MINUTE), BASE, start).p).toBe(expected)
+  })
+}
+
+test('a clock that goes back does not keep a burst or a Codex reading alive', async () => {
+  const core = createCore(DEFAULTS, '/plugin/crossfeed.py')
+  core.measure(reading(), BASE)
+  core.setCodex(codex())
+  core.route(B, BASE)
+  core.route(B, BASE)
+  const earlier = BASE - 60 * MINUTE
+  expect(core.describe(earlier).includes('eligible calls stayed on Claude in 10 minutes: 0')).toBe(true)
+  expect(core.codexAge(earlier)).toBe(60 * MINUTE)
+  expect(core.status(earlier).includes('codex wk 24% stale')).toBe(true)
+  expect(headroomCause(codex(), DEFAULTS, earlier)).toBe('Codex reading is dated 60 minutes ahead of the clock')
+  expect(core.route(B, earlier)).toBe(undefined)
+  expect(core.lastDecision().includes('ahead of the clock')).toBe(true)
+  // With a reading taken on the new clock the earlier calls still do not count.
+  core.setCodex({ ...codex(), readAt: earlier })
+  expect(core.route(B, earlier)).toBe(undefined)
+  expect(core.lastDecision().includes('pressure is low')).toBe(true)
+})

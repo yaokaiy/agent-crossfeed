@@ -49,7 +49,8 @@ export function createCore(config: Config, script: string, session?: string): Co
   let lastDecision = 'last subagent call: none yet'
 
   function codexAge(now: number): number {
-    return codex === undefined ? Infinity : now - codex.readAt
+    // A reading dated ahead of the clock (the clock went back) is as untrusted as an old one.
+    return codex === undefined ? Infinity : Math.abs(now - codex.readAt)
   }
 
   function status(now: number): string {
@@ -79,7 +80,7 @@ export function createCore(config: Config, script: string, session?: string): Co
   }
 
   function burstCount(now: number): number {
-    return stayedCalls.filter(time => time >= now - 10 * 60000).length
+    return stayedCalls.filter(time => time >= now - 10 * 60000 && time <= now).length
   }
 
   return {
@@ -119,7 +120,7 @@ export function createCore(config: Config, script: string, session?: string): Co
     },
 
     route(call, now) {
-      stayedCalls = stayedCalls.filter(time => time >= now - 10 * 60000)
+      stayedCalls = stayedCalls.filter(time => time >= now - 10 * 60000 && time <= now)
       lastStay = undefined
       const eligibility = eligible(call, config)
       if (!eligibility.ok) {

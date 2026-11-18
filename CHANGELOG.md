@@ -15,9 +15,14 @@ All notable changes to this project are recorded here. The format follows
   could not start a job, and its quota reading silently came from the
   newest session log; once that was older than 15 minutes nothing was
   handed off. `run` exits with 127 when Codex is not found.
-- When Codex headroom is zero, the status and the last-decision line say
-  why (no reading, a reading that is too old, Codex's reported limit, or
-  the window that is used up) instead of "no Codex headroom".
+- When Codex headroom is zero, `/crossfeed status` says why (no reading, a
+  reading that is too old, Codex's reported limit, or the window that is
+  used up), and so does the last-decision line when that is what kept a
+  call on Claude. Before, both said only "no Codex headroom".
+- A refused tool call no longer counts as a hands-on step or uses up the
+  long-stretch reminder.
+- A clock that returns no usable time, or goes back, no longer leaves a
+  Codex reading or a burst count that never ages.
 
 ### Changed
 
@@ -31,7 +36,8 @@ All notable changes to this project are recorded here. The format follows
 - The status line is redrawn when a subagent call is decided, from the
   readings the decision used.
 - Deliver queued notices with the next main-loop tool result or user prompt,
-  whichever comes first.
+  whichever comes first. A refused tool call or a slash command does not
+  carry them.
 - Include the session id in lockout records from the plugin.
 
 ### Added

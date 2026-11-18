@@ -121,17 +121,18 @@ is not.
 - A reset time that moves by more than one minute means a new window: the
   readings and any queued notices are cleared and `p` returns to `p0`. A
   reading without a reset time, once the known reset time has passed, also
-  starts over, with `p = 0`.
+  starts over, with `p0 = 0`.
 - After a lockout `p0` is 0.3, on the assumption that the work that filled
   one window continues into the next; the first minutes of a window have no
   pace to measure. It applies when the new window began between 5 minutes
   before and 2 hours after the time the locked window was due to reset, and
   only during that window's first 30 minutes, judged from the reading's own
-  reset time. A session that starts later in the window, or resumes after a
-  pause, begins at 0 as in any other window. The plugin knows a lockout
-  from the session's own rate-limit error and, at session start, from the
-  newest lockout in the ledger. A lockout recorded without a reset time is
-  ignored.
+  reset time (a reading for a window that begins more than 5 minutes from
+  now does not count). Outside those minutes `p0` is 0, so a session that
+  starts later in the window, or whose readings resume after a long pause,
+  is treated as in any other window. The plugin knows a lockout from the
+  session's own rate-limit error and, at session start, from the newest
+  lockout in the ledger that has a reset time.
 - Claude's weekly use `w` adds `b = 0.25 * clamp((w - 75) / 15, 0, 1)`.
   Pressure is `P = max(p, b)`.
 
@@ -141,7 +142,8 @@ can use most of a window before `p` moves. So calls are counted as well:
 when 2 eligible tier A or B calls have stayed on Claude in the last 10
 minutes of the session, the next call is decided with `P` taken as at least
 0.3. A call that something else then refuses, so that no subagent starts,
-is not counted. Notices and the long-stretch reminder use `P` itself.
+is taken out of the count when the refusal arrives. Notices and the
+long-stretch reminder use `P` itself.
 
 ### 4. Headroom: how much Codex quota is left?
 
@@ -154,13 +156,15 @@ with `v` its percent used and `D` the days to its reset (7 when unknown):
 so hand-offs taper over the last 10 to 20 points, sooner when the reset is
 far away. A window of 6 hours or less gives 0 at 90% used and 1 below. With
 several windows the smallest value counts. `g` is 0 when Codex reported its
-limit, when the reading is older than 15 minutes, or when there is none.
+limit, when the reading is more than 15 minutes old or dated that far ahead
+of the clock, or when there is none.
 
 When `g` is 0 the plugin keeps the cause: no reading, a reading that is too
 old, Codex's reported limit, or the window that is used up. `/crossfeed
-status` and the last-decision line name it, with the dispatcher's error
-when the app server could not be asked. The status line shows `codex
-unavailable` without a reading and marks one that is too old as `stale`.
+status` names it, and so does the last-decision line when headroom is what
+kept the call on Claude, with the dispatcher's error when there is one. The
+status line shows `codex unavailable` without a reading and marks one that
+is too old as `stale`.
 
 The Codex reading is refreshed when it is older than 5 minutes and a call
 could be handed off. After a failed read the plugin waits 5 minutes before
@@ -178,9 +182,11 @@ Two more signals reach the model, each once per window or stretch:
 
 - when `P` first reaches 0.3, and when `u` first reaches 90, a one-line
   notice is attached to the next tool result in the main loop or to the
-  user's next prompt, whichever comes first;
+  user's next prompt, whichever comes first. A refused tool call, a slash
+  command and a meta prompt do not carry it;
 - after `stretchCalls` hands-on tool calls (default 12) with no user prompt
   in between, while `P >= 0.3`, one reminder is attached to a tool result.
+  Refused calls are not counted.
 
 ## What a hand-off looks like
 
@@ -241,8 +247,9 @@ plugin.
   the job is recorded as `timeout` or `interrupted`.
 - **Failures are told apart.** Codex's own usage-limit message gives exit
   code 75 and a line telling the model to do the work itself; hand-offs stop
-  once a later quota reading reports the limit. Any other failure gives exit
-  code 1 with the last log lines. Nothing is retried automatically. An exit
+  once a later quota reading reports the limit. Any other failure of a Codex
+  that started gives exit code 1 with the last log lines. Nothing is retried
+  automatically. An exit
   code of 0 without a result is a failure. An error event during a run that
   still finished with a result is not.
 - **Change list.** For a `--write` job in a git repository the dispatcher
@@ -255,7 +262,7 @@ plugin.
 - **Ledger.** `ledger.jsonl` in the data directory, append-only, written
   under a file lock: one line when a job ends, one per check, one per
   lockout. A check records the program's name, not its arguments.
-  `lockout --last` prints the newest lockout's reset time.
+  `lockout --last` prints the reset time of the newest lockout that has one.
 - **Quota.** `quota` asks `codex app-server` for the account's rate limits,
   with no model turn. If that fails it reads the last rate-limit event in
   the newest 8 Codex session logs and reports its age and the app server's
