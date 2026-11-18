@@ -1,9 +1,15 @@
-# agent-crossfeed
+<p align="center">
+  <img src=".claude-plugin/icon.png" width="120" alt="agent-crossfeed icon: two fuel tanks joined by a crossfeed valve">
+</p>
 
-**Dynamic subagent routing from Claude Code to Codex.**
+<h1 align="center">agent-crossfeed</h1>
 
-[![ci](https://github.com/yaokaiy/agent-crossfeed/actions/workflows/ci.yml/badge.svg)](https://github.com/yaokaiy/agent-crossfeed/actions/workflows/ci.yml)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<p align="center"><strong>Dynamic subagent routing from Claude Code to Codex.</strong></p>
+
+<p align="center">
+  <a href="https://github.com/yaokaiy/agent-crossfeed/actions/workflows/ci.yml"><img src="https://github.com/yaokaiy/agent-crossfeed/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
+</p>
 
 agent-crossfeed is a Claude Code plugin for people who also have a Codex
 subscription. Each time Claude is about to start a subagent, crossfeed
@@ -31,18 +37,12 @@ The default `auto` mode, for calls Codex can take, while both quotas can be
 read. Pressure is a value crossfeed raises while Claude's window is on pace
 to fill. [How it routes](#how-it-routes) has the numbers.
 
-> [!NOTE]
-> Alpha (0.1.1). Hand-offs have been run end to end against the real Claude
-> Code and Codex CLIs. Their effect on lockouts has not been measured yet;
-> see [Status and limits](#status-and-limits). This is an independent
-> project, not affiliated with or endorsed by Anthropic or OpenAI.
-
 ## Why
 
 Claude's 5-hour usage window stops every Claude session when it fills. Much
 of what fills it is execution: subagents, and long runs of commands and
-edits. Several subagents started together can commit most of a window
-before their usage shows up in any reading.
+edits. Several subagents started together can fill a window within half an
+hour.
 
 If you also pay for Codex, that quota may be sitting unused while Claude is
 locked. A usage meter shows you this, and a delegation command lets you
@@ -51,6 +51,32 @@ moment it starts, and says why.
 
 The name comes from aviation, where crossfeed lets an engine draw fuel from
 the other side's tank so that neither runs dry first.
+
+## Measured so far
+
+The first five rows come from one heavy user's Claude Code logs. "Routable"
+means a subagent call crossfeed would consider: a general-purpose call with
+a brief of 100 characters or more. The last three rows come from building
+crossfeed itself, where implementation jobs were given to Codex by hand
+with the same kind of brief and check the plugin uses.
+
+| Measure | Result |
+| --- | --- |
+| Lockouts of the 5-hour window in the 30 days before installing | 6, with Claude locked for 12.9 hours in total |
+| Of those, windows in which three or more routable subagents started within 10 minutes | 3 of the 6 |
+| Share of a locked window's usage that came from routable subagents | about a quarter (median; 4% to 42%) |
+| Fastest burn on record, on the first day installed | 7 routable subagents started within 73 seconds, and the window was full 29 minutes after its reset |
+| Share of that window's usage from routable subagents | 63% |
+| Implementation jobs handed to Codex with a test command | 10, and all 10 passed their tests on first delivery |
+| Codex time per job | 7 minutes (median; 5 to 16) |
+| Codex quota used | about 5 points of one week's quota on that user's plan, two review jobs included |
+
+Usage shares are estimates: tokens are weighted by API price ratios,
+because the subscription's own weighting is not published. Nothing was
+handed off during the fastest burn: version 0.1.0 could not find Codex in
+that session. Version 0.1.1 fixed that and added the rule for bursts. A
+before and after count of lockouts needs more weeks of use and is not in
+yet.
 
 ## Quick start
 
@@ -278,8 +304,11 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Status and limits
 
-- Hand-offs aim to make lockouts rarer and later. Whether they do, and what
-  the hand-offs themselves cost in Claude usage, has not been measured yet.
+Version 0.1.1 is an early release.
+
+- Hand-offs aim to make lockouts rarer and later. A before and after count
+  is not in yet (see [Measured so far](#measured-so-far)), and what the
+  hand-offs themselves cost in Claude usage has not been measured.
 - The tiers are keyword heuristics informed by published benchmarks and one
   practitioner's routing rules, not by your tasks. They will misfile some
   briefs. `/crossfeed report` shows check results per tier so you can see
@@ -330,3 +359,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and the
 ## License
 
 [MIT](LICENSE)
+
+agent-crossfeed is an independent project, not affiliated with or endorsed
+by Anthropic or OpenAI.
