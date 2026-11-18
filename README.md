@@ -1,67 +1,62 @@
 # agent-crossfeed
 
+**Dynamic subagent routing from Claude Code to Codex.**
+
 [![ci](https://github.com/yaokaiy/agent-crossfeed/actions/workflows/ci.yml/badge.svg)](https://github.com/yaokaiy/agent-crossfeed/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A Claude Code plugin that hands self-contained execution work to the Codex
-CLI before Claude's 5-hour usage window runs out, and records each job.
+agent-crossfeed is a Claude Code plugin for people who also have a Codex
+subscription. Each time Claude is about to start a subagent, crossfeed
+decides whether that work should stay on Claude or go to the Codex CLI. It
+decides from three signals: what kind of task the brief describes, how fast
+Claude's 5-hour window is filling, and how much Codex quota is left. When
+the work should move, crossfeed refuses the subagent call and hands Claude
+one command that runs the same brief on Codex. Claude keeps planning the
+work and talking to you, and is told to check what comes back.
 
-It is for people who use Claude Code as their main agent and also have a
-Codex subscription. In aviation, crossfeed lets an engine draw fuel from the
-other side's tank so that neither runs dry first. This does the same with
-two subscriptions.
-
-Status: alpha (0.1.1). A hand-off has been run end to end against the real
-Claude Code and Codex CLIs. Its effect on lockouts has not been measured
-yet. See [Limits](#limits).
-
-This is an independent project. It is not affiliated with or endorsed by
-Anthropic or OpenAI.
-
-## What it does
-
-Claude's 5-hour window stops every Claude session when it fills. Much of
-what fills it is execution: subagents and long runs of commands and edits.
-crossfeed watches both quotas. When Claude is about to start a subagent
-whose brief the rules judge suitable for Codex, it refuses the call and
-gives Claude one command to run instead:
-
-```
-crossfeed: run this on Codex instead of a Claude subagent.
-Why: tier A (has a check command and is implementation-type work). Claude 5h 62%, on pace for 104%; Codex weekly 17%.
-The brief you just wrote is saved. Start this as a background Bash command:
-python3 -I '.../scripts/crossfeed.py' run --tier A --kind subagent --dir '/your/repo' --write --brief-file '.../briefs/20260101-120000-ab12.md'
-Add --write if the task must change files, drop it if not. Wait for the exit notification and do not poll. Check the result before you report it.
+```mermaid
+flowchart TD
+    S(["Claude is about to start a general-purpose subagent"]) --> F{{"Task fit<br/>(keyword rules)"}}
+    F -- "C: design, UX, naming" --> CL["Stays on Claude"]
+    F -- "A: implementation with<br/>a check command" --> H{{"Plenty of Codex<br/>headroom left?"}}
+    F -- "B: research, review,<br/>everything else" --> P{{"Pressure high, or a burst<br/>of subagents?"}}
+    H -- "yes" --> CX["Handed off to<br/>the Codex CLI"]
+    H -- "no" --> CL
+    P -- "yes, and Codex has room" --> CX
+    P -- "no" --> CL
+    CX --> R(["Claude is told to<br/>check the result"])
 ```
 
-When the command exits, Claude Code notifies Claude, which reads its output:
+The default `auto` mode, for calls Codex can take, while both quotas can be
+read. Pressure is a value crossfeed raises while Claude's window is on pace
+to fill. [How it routes](#how-it-routes) has the numbers.
 
-```
-[crossfeed] job 20260101-120000-ab12 done in 1m32s; tier A; kind subagent; sandbox workspace-write; codex tokens 48210
-[crossfeed] changed 2 file(s): calc.py, test_calc.py
-[crossfeed] record the outcome: python3 -I .../scripts/crossfeed.py check 20260101-120000-ab12 -- <your check command>
-```
+> [!NOTE]
+> Alpha (0.1.1). Hand-offs have been run end to end against the real Claude
+> Code and Codex CLIs. Their effect on lockouts has not been measured yet;
+> see [Status and limits](#status-and-limits). This is an independent
+> project, not affiliated with or endorsed by Anthropic or OpenAI.
 
-Claude is told to run the brief's check through `crossfeed.py check`, which
-records pass or fail, and then to report to you. Claude still coordinates
-the work, talks to you and reviews what comes back.
+## Why
 
-## Requirements
+Claude's 5-hour usage window stops every Claude session when it fills. Much
+of what fills it is execution: subagents, and long runs of commands and
+edits. Several subagents started together can commit most of a window
+before their usage shows up in any reading.
 
-- [Claude Code](https://code.claude.com/docs) 2.1.325 or later, on a
-  subscription plan. crossfeed uses the function-hook plugin API, which is
-  early access and may change.
-- Codex CLI 0.167 or later, logged in (`codex login`).
-- Python 3.9 or later, and git.
-- macOS or Linux.
+If you also pay for Codex, that quota may be sitting unused while Claude is
+locked. A usage meter shows you this, and a delegation command lets you
+move one task by hand. crossfeed decides for every subagent call at the
+moment it starts, and says why.
 
-crossfeed looks for `codex` in `$CROSSFEED_CODEX` when that is set and not
-empty, then on `PATH`, then in the usual install directories listed in
-[the design](docs/design.md#the-dispatcher). If your Codex is somewhere
-else and Claude Code runs with a `PATH` that lacks it, set `CROSSFEED_CODEX`
-to the executable's path.
+The name comes from aviation, where crossfeed lets an engine draw fuel from
+the other side's tank so that neither runs dry first.
 
-## Install
+## Quick start
+
+You need [Claude Code](https://code.claude.com/docs) 2.1.325 or later on a
+subscription plan, the Codex CLI 0.167 or later (logged in with
+`codex login`), Python 3.9 or later, and git. macOS and Linux are supported.
 
 At the prompt of a Claude Code terminal session:
 
@@ -75,40 +70,104 @@ Or from a shell:
 claude plugin install agent-crossfeed --marketplace yaokaiy/agent-crossfeed
 ```
 
-To try it from a clone for one session:
-
-```bash
-claude --plugin-dir /path/to/agent-crossfeed
-```
-
-There is nothing else to set up. Claude Code asks you to approve the
-dispatcher command when it runs, as it does for any shell command. To skip
-that prompt for hand-offs, allow the dispatcher's `run` command in your
-Claude Code settings, using the script path shown in the refusal message:
-
-```json
-{
-  "permissions": {
-    "allow": ["Bash(python3 -I '/path/to/agent-crossfeed/scripts/crossfeed.py' run *)"]
-  }
-}
-```
-
-Do not allow `check` the same way: it runs whatever command you give it.
-
-To remove the plugin: `claude plugin uninstall agent-crossfeed@agent-crossfeed`.
-
-## Use
-
-A line under the prompt shows the state:
+There is nothing else to set up. A line under the prompt shows what
+crossfeed sees:
 
 ```
 crossfeed auto · claude 5h 62% (pace 104%) · 7d 41% · codex wk 17% · pressure 0.4
 ```
 
-When Codex's quota cannot be read the line says `codex unavailable`, and a
-reading older than 15 minutes is marked `stale`. Nothing is handed off in
-either state; `/crossfeed status` says why.
+Work as usual. When a subagent call should move, crossfeed refuses it and
+tells Claude what to run instead. [Install notes](#install-notes) covers permissions, where `codex` is looked
+up, and removal.
+
+## What a hand-off looks like
+
+crossfeed refuses the subagent call and gives Claude one command to run
+instead:
+
+```
+crossfeed: run this on Codex instead of a Claude subagent.
+Why: tier A (has a check command and is implementation-type work). Claude 5h 62%, on pace for 104%; Codex weekly 17%.
+The brief you just wrote is saved. Start this as a background Bash command:
+python3 -I '.../scripts/crossfeed.py' run --tier A --kind subagent --dir '/your/repo' --write --brief-file '.../briefs/20260101-120000-ab12.md'
+Add --write if the task must change files, drop it if not. Wait for the exit notification and do not poll. Check the result before you report it.
+```
+
+Claude is told to start the command in the background, where waiting costs
+no model turns. When it exits, Claude Code notifies Claude, which reads its
+output:
+
+```
+[crossfeed] job 20260101-120000-ab12 done in 1m32s; tier A; kind subagent; sandbox workspace-write; codex tokens 48210
+[crossfeed] changed 2 file(s): calc.py, test_calc.py
+[crossfeed] record the outcome: python3 -I .../scripts/crossfeed.py check 20260101-120000-ab12 -- <your check command>
+```
+
+Claude is told to run the brief's check through `crossfeed.py check`, which
+records pass or fail, and then to report to you.
+
+## How it routes
+
+For each subagent call crossfeed asks three questions.
+
+1. **Fit.** What kind of task is this? The answer comes from keyword rules
+   on the call's description and brief.
+
+   | Tier | Work | Handed to Codex |
+   | --- | --- | --- |
+   | A | a brief that names a check command (`pytest`, `npm test`, `cargo test` and similar) and reads as implementation work: implement, refactor, migrate, fix failing tests, reproduce, triage logs | while headroom is at least one half: Codex's weekly use below 75 to 80%, depending on how near its reset is, and any short window below 90% |
+   | B | everything else that is eligible: research, reading code, review, implementation without a recognised check command | when pressure reaches 0.3, while Codex has any headroom |
+   | C | briefs under 100 characters, and calls whose description or opening lines contain design, architecture, UX, front-end, naming or brainstorming keywords | never |
+
+2. **Pressure.** How fast is Claude's 5-hour window filling? crossfeed
+   forecasts where the window will end at the current pace. It raises a
+   pressure value in small steps while that forecast is above 95% and lowers
+   it when the forecast is below 80%. Tier B work moves once pressure
+   reaches 0.3; tier A does not wait for it.
+
+3. **Headroom.** How much Codex quota is left? A headroom value falls from
+   1 to 0 over the last 10 to 20 points before Codex's weekly use reaches
+   85%. Tier A work stops moving when it drops below one half and tier B
+   when it reaches 0, which leaves quota for your own Codex work. A job
+   that is already running is not stopped.
+
+The forecast cannot see subagents that have just started, so two more
+rules apply. Once two calls that could have been handed off (tier A or B)
+have stayed on Claude within 10 minutes, further tier B calls in that time
+go to Codex too, while it has headroom. And a window that begins within two
+hours of a locked window's reset starts with pressure already raised; that
+start counts for the window's first 30 minutes.
+
+If either quota cannot be read, nothing is handed off, and `/crossfeed
+status` names the reason. By default a call is considered when it names no
+agent type or one of the general-purpose types (the `eligibleTypes`
+option). Other agent types, calls pinned to the `haiku` model, named or
+remote agents, calls made by a subagent itself, and briefs that mention
+browser tools or other Claude-only tools crossfeed recognises stay on
+Claude.
+
+The exact rules and formulas are in [docs/design.md](docs/design.md).
+
+## What you get
+
+- A routing decision for every subagent call, with its reason in one line.
+  `/crossfeed status` shows the readings, the pressure, what would be
+  handed off now, and why the last call was or was not.
+- A one-line notice to Claude when pressure first reaches the level at
+  which tier B work moves and when the window reaches 90%, and a reminder
+  after a long run of hands-on tool calls while pressure is high.
+- A local record of every finished job: how long it took, the Codex token
+  count it reported, and, when a check was run, whether it passed.
+  `/crossfeed report` sums up the last 7 days, including the lockouts it
+  saw.
+- It fails open. If the plugin itself errors, the subagent call goes ahead
+  on Claude, unchanged.
+- A small footprint: no daemon, no database, no MCP server. The dispatcher
+  is one Python file that uses only the standard library, and it also works
+  [without the plugin](#the-dispatcher).
+
+## Commands
 
 | Command | Effect |
 | --- | --- |
@@ -118,42 +177,23 @@ either state; `/crossfeed status` says why.
 | `/crossfeed auto` | back to the default (this session) |
 | `/crossfeed off` | stop steering, keep the record (this session) |
 
-## How it decides
+When Codex's quota cannot be read the status line says `codex unavailable`,
+and a reading older than 15 minutes is marked `stale`. Nothing is handed
+off in either state.
 
-For each subagent call crossfeed asks three questions.
+## Options
 
-1. **Fit.** What kind of task is this? The answer comes from keyword rules
-   on the call's description and brief.
+Set them with `/plugin configure agent-crossfeed@agent-crossfeed`.
 
-   | Tier | Work | Handed to Codex |
-   | --- | --- | --- |
-   | A | a brief that names a check command (`pytest`, `npm test`, `cargo test` and similar) and reads as implementation work: implement, refactor, migrate, fix failing tests, reproduce, triage logs | when Codex headroom is at least half |
-   | B | everything else that is eligible: research, reading code, review, implementation without a recognised check command | when Claude's window is filling fast |
-   | C | design, architecture, UX, front-end look, naming, brainstorming, and briefs under 100 characters | never |
-
-2. **Pressure.** How fast is Claude's 5-hour window filling? crossfeed
-   forecasts where the window will end at the current pace. It raises a
-   pressure value in small steps while that forecast is above 95% and lowers
-   it when the forecast is below 80%.
-
-3. **Headroom.** How much Codex quota is left? Hand-offs taper off as
-   Codex's weekly use approaches 85%.
-
-The forecast cannot see subagents that have just started, so two more
-rules apply. Once two calls that could have been handed off (tier A or B)
-have stayed on Claude within 10 minutes, further tier B calls in that time
-go to Codex too, while it has headroom. And a window that begins within two
-hours of a locked window's
-reset starts with pressure already raised; that start counts for the
-window's first 30 minutes.
-
-If either quota cannot be read, nothing is handed off, and `/crossfeed
-status` names the reason. Only calls to the general-purpose agent types are
-considered. Other agent types, calls pinned
-to the `haiku` model, named or remote agents, and briefs that mention
-browser tools or other Claude-only tools stay on Claude.
-
-The exact rules, formulas and sources are in [docs/design.md](docs/design.md).
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `auto` | `auto`, `always` or `off` |
+| `effort` | `high` | Codex reasoning effort for hand-offs |
+| `model` | empty | Codex model; empty uses your Codex configuration |
+| `eligibleTypes` | `general-purpose,claude` | subagent types that may be redirected |
+| `stretchCalls` | `12` | hands-on tool calls since your last prompt before the one reminder sent while pressure is high |
+| `codexStopPercent` | `85` | Codex weekly use at which hand-offs stop |
+| `timeoutMinutes` | `30` | time limit for one job |
 
 ## The dispatcher
 
@@ -184,19 +224,39 @@ or an interrupt the Codex process group is stopped.
 `check` runs your check command and records pass or fail for the job. The
 verdict comes from the command's exit status, not from the model.
 
-## Options
+## Install notes
 
-Set them with `/plugin configure agent-crossfeed@agent-crossfeed`.
+crossfeed uses Claude Code's function-hook plugin API, which is early access
+and may change.
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `mode` | `auto` | `auto`, `always` or `off` |
-| `effort` | `high` | Codex reasoning effort for hand-offs |
-| `model` | empty | Codex model; empty uses your Codex configuration |
-| `eligibleTypes` | `general-purpose,claude` | subagent types that may be redirected |
-| `stretchCalls` | `12` | hands-on tool calls in a row before one reminder |
-| `codexStopPercent` | `85` | Codex weekly use at which hand-offs stop |
-| `timeoutMinutes` | `30` | time limit for one job |
+It looks for `codex` in `$CROSSFEED_CODEX` when that is set and not empty,
+then on `PATH`, then in the usual install directories listed in
+[the design](docs/design.md#the-dispatcher). If your Codex is somewhere
+else and Claude Code runs with a `PATH` that lacks it, set `CROSSFEED_CODEX`
+to the executable's path.
+
+Claude Code asks you to approve the dispatcher command when it runs, as it
+does for any shell command. To skip that prompt for hand-offs, allow the
+dispatcher's `run` command in your Claude Code settings, using the script
+path shown in the refusal message:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(python3 -I '/path/to/agent-crossfeed/scripts/crossfeed.py' run *)"]
+  }
+}
+```
+
+Do not allow `check` the same way: it runs whatever command you give it.
+
+To try the plugin from a clone for one session:
+
+```bash
+claude --plugin-dir /path/to/agent-crossfeed
+```
+
+To remove it: `claude plugin uninstall agent-crossfeed@agent-crossfeed`.
 
 ## Safety and data
 
@@ -216,7 +276,7 @@ Set them with `/plugin configure agent-crossfeed@agent-crossfeed`.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
-## Limits
+## Status and limits
 
 - Hand-offs aim to make lockouts rarer and later. Whether they do, and what
   the hand-offs themselves cost in Claude usage, has not been measured yet.
@@ -238,23 +298,25 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - Continuing a task on Codex after Claude is locked out is planned and not
   in this version.
 
-## Related work
+## Research behind the design
 
-- [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc):
-  OpenAI's plugin for calling Codex from Claude Code, for reviews and task
-  hand-offs on request.
-- [steipete/CodexBar](https://github.com/steipete/CodexBar): shows Claude and
-  Codex usage in the menu bar and on the command line.
-- [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router):
-  routes an agent's model requests to other models.
-- [wr/quota-router](https://github.com/wr/quota-router),
-  [contains-studio/fable-delegator](https://github.com/contains-studio/fable-delegator)
-  and [surlymochan/swrm](https://github.com/surlymochan/swrm): other takes on
-  quota-aware delegation between coding agents.
+The routing rules draw on published work on LLM routing, budget pacing and
+coding-agent teams. crossfeed does not reproduce these papers' results, and
+its own thresholds have not been tuned on measurements yet.
 
-crossfeed's own angle: it decides per subagent call from task fit and a
-pacing controller, refuses the call at the hook instead of advising, and
-records outcomes so the rules can be checked.
+| Paper | What crossfeed takes from it |
+| --- | --- |
+| Ong et al., [RouteLLM: Learning to Route LLMs with Preference Data](https://arxiv.org/abs/2406.18665) (2024) | Routing is decided per request. "Which model suits this task" is a separate question from "how tight is the budget". |
+| Ding et al., [Hybrid LLM: Cost-Efficient and Quality-Aware Query Routing](https://arxiv.org/abs/2404.14618) (2024) | How much work goes to the other model can be tuned at run time. In crossfeed's default mode that tuning comes from pressure: tier B work moves when pressure, or the burst rule, reaches the threshold. |
+| Chen, Zaharia and Zou, [FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance](https://arxiv.org/abs/2305.05176) (2023) | Choosing the model per query can cut cost at the same quality. Unlike the paper's cascade, crossfeed routes each call once, because a second attempt would spend quota too. |
+| Taberner-Miller, [ParetoBandit: Budget-Paced Adaptive Routing for Non-Stationary LLM Serving](https://arxiv.org/abs/2604.00136) (2026) | Budget pacing as a closed loop. The pressure controller reacts to a forecast of the window in place of a fixed threshold. |
+| Qin et al., [Pathwise-Budgeted LLM Routing: Online Allocation with K-Bit Tail-Cost Learning](https://arxiv.org/abs/2611.05835) (2026) | One expensive task can exhaust what is left of a budget, so the controller's line for "too fast" is a forecast of 95%, which leaves a margin below a full window. |
+| Samway et al., [Scaling Inference-Time Compute with Teams of Coding Agents](https://arxiv.org/abs/2610.17471) (2026) | What delegation buys depends on the stage that is delegated and on the models in the team. crossfeed judges fit per brief and records outcomes per tier, so its rules can be corrected. |
+| Xiang et al., [Cross-Model LLM Code Review: Should you use Claude to review Codex or vice versa?](https://arxiv.org/abs/2607.21656) (2026) | In the paper Claude's review raised Codex drafts from 71.6% to 89.7% on 116 tasks, and the reverse order did not pay off. In crossfeed Codex does the work and Claude is told to check the result before reporting it. |
+| Huang et al., [SWE-Shift: Evaluating Coding Agents in Evolving Workspaces](https://arxiv.org/abs/2610.32196) (2026) | Every coding agent the paper tested did worse when the task changed during a run. Tier A asks for a check command in the brief, and briefs that open with design keywords stay on Claude. |
+
+The full source list, including the benchmarks consulted, is in
+[docs/design.md](docs/design.md#references).
 
 ## Contributing
 

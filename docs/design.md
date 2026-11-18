@@ -344,20 +344,26 @@ Routing and budgets:
 
 - Ong et al., "RouteLLM: Learning to Route LLMs with Preference Data",
   [arXiv:2406.18665](https://arxiv.org/abs/2406.18665)
-- Chen et al., "FrugalGPT", [arXiv:2305.05176](https://arxiv.org/abs/2305.05176)
+- Chen, Zaharia and Zou, "FrugalGPT: How to Use Large Language Models While
+  Reducing Cost and Improving Performance",
+  [arXiv:2305.05176](https://arxiv.org/abs/2305.05176)
 - Ding et al., "Hybrid LLM: Cost-Efficient and Quality-Aware Query Routing",
   [arXiv:2404.14618](https://arxiv.org/abs/2404.14618)
-- "ParetoBandit: Budget-Paced Adaptive Routing for Non-Stationary LLM
-  Serving", [arXiv:2604.00136](https://arxiv.org/abs/2604.00136)
-- "Pathwise-Budgeted LLM Routing", [arXiv:2611.05835](https://arxiv.org/abs/2611.05835)
+- Taberner-Miller, "ParetoBandit: Budget-Paced Adaptive Routing for
+  Non-Stationary LLM Serving",
+  [arXiv:2604.00136](https://arxiv.org/abs/2604.00136)
+- Qin et al., "Pathwise-Budgeted LLM Routing: Online Allocation with K-Bit
+  Tail-Cost Learning", [arXiv:2611.05835](https://arxiv.org/abs/2611.05835)
 
 Coding agents and delegation:
 
-- "Scaling Inference-Time Compute with Teams of Coding Agents",
-  [arXiv:2610.17471](https://arxiv.org/abs/2610.17471)
-- "Cross-Model LLM Code Review", [arXiv:2607.21656](https://arxiv.org/abs/2607.21656)
-- "SWE-Shift: Evaluating Coding Agents in Evolving Workspaces",
-  [arXiv:2610.32196](https://arxiv.org/abs/2610.32196)
+- Samway et al., "Scaling Inference-Time Compute with Teams of Coding
+  Agents", [arXiv:2610.17471](https://arxiv.org/abs/2610.17471)
+- Xiang et al., "Cross-Model LLM Code Review: Should you use Claude to
+  review Codex or vice versa?",
+  [arXiv:2607.21656](https://arxiv.org/abs/2607.21656)
+- Huang et al., "SWE-Shift: Evaluating Coding Agents in Evolving
+  Workspaces", [arXiv:2610.32196](https://arxiv.org/abs/2610.32196)
 - skrode's delegation benchmark, which measured that handing small tasks to
   another model raised the planner's token use while pass rates stayed the
   same: <https://github.com/gabrielqfr/skrode/blob/main/docs/benchmark.md>
