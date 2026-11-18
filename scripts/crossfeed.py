@@ -13,6 +13,7 @@ from pathlib import Path
 import secrets
 import selectors
 import shlex
+import shutil
 import signal
 import stat
 import statistics
@@ -31,6 +32,55 @@ PREAMBLE_READ = (
 PREAMBLE_WRITE = PREAMBLE_READ + (
     " Change files only inside that directory and run the check the brief states."
 )
+
+
+# Returned by _execute_job in place of an exit status when codex was not found.
+# A started process that itself exits with 127 is an ordinary failure.
+CODEX_NOT_FOUND = -127
+
+
+def resolve_codex(codex_bin: Optional[str] = None) -> str:
+    """Find an executable, retaining its install directory through symlinks."""
+    configured = os.environ.get("CROSSFEED_CODEX")
+    explicit = configured or codex_bin
+    if explicit:
+        path = Path(os.path.abspath(os.path.expanduser(explicit)))
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+        name = "CROSSFEED_CODEX" if configured else "codex executable"
+        raise FileNotFoundError(
+            "codex was not found: {}={!r} is not an executable regular file".format(name, explicit)
+        )
+    found = shutil.which("codex")
+    if found:
+        return os.path.abspath(found)
+    if "CROSSFEED_CODEX_DIRS" in os.environ:
+        directories = os.environ["CROSSFEED_CODEX_DIRS"].split(os.pathsep)
+    else:
+        directories = ["/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin",
+                       "~/.local/bin", "~/.npm-global/bin", "~/.bun/bin", "~/.volta/bin"]
+    directories = [os.path.abspath(os.path.expanduser(entry)) for entry in directories if entry]
+    for directory in directories:
+        path = Path(directory) / "codex"
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    raise FileNotFoundError(
+        "codex was not found; set CROSSFEED_CODEX to an executable file; "
+        "looked in PATH={!r} and fallback directories {!r}".format(
+            os.environ.get("PATH", os.defpath), directories)
+    )
+
+
+def _codex_environment(codex_bin):
+    """Let an npm-installed codex find `node` beside it when PATH lacks that directory."""
+    environment = os.environ.copy()
+    directory = os.path.dirname(codex_bin)
+    path = environment.get("PATH", os.defpath)
+    # A directory that is already listed keeps its place: reordering PATH would
+    # change which tools the job itself resolves.
+    if directory not in path.split(os.pathsep):
+        environment["PATH"] = directory + (os.pathsep + path if path else "")
+    return environment
 
 
 def home() -> Path:
@@ -159,7 +209,7 @@ def _quota_result(source, limits, age_s):
     return {
         "source": source, "age_s": round(age_s),
         "limit_reached": limits.get("rateLimitReachedType") is not None,
-        "error": None, "windows": windows,
+        "error": None, "windows": windows, "app_server_error": None,
     }
 
 
@@ -210,7 +260,7 @@ def _app_server_quota(codex_bin, timeout_s):
     with tempfile.TemporaryFile() as stderr:
         child = subprocess.Popen(
             [codex_bin, "app-server"], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=stderr,
+            stdout=subprocess.PIPE, stderr=stderr, env=_codex_environment(codex_bin),
         )
         try:
             with selectors.DefaultSelector() as selector:
@@ -218,7 +268,7 @@ def _app_server_quota(codex_bin, timeout_s):
                 messages = _rpc_messages(child.stdout, selector, deadline)
                 _send_rpc(child.stdin, {
                     "id": 1, "method": "initialize",
-                    "params": {"clientInfo": {"name": "crossfeed", "version": "0.1.0"}},
+                    "params": {"clientInfo": {"name": "crossfeed", "version": "0.1.1"}},
                 })
                 _rpc_result(messages, 1)
                 _send_rpc(child.stdin, {"method": "initialized", "params": {}})
@@ -303,19 +353,22 @@ def _log_quota():
     raise ValueError("no usable rate_limits in the newest 8 session logs")
 
 
-def read_quota(codex_bin: str = "codex", timeout_s: float = 10.0) -> dict:
+def read_quota(codex_bin: Optional[str] = None, timeout_s: float = 10.0) -> dict:
     try:
         if not _finite_number(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout must be a positive finite number")
-        return _app_server_quota(codex_bin, timeout_s)
+        return _app_server_quota(resolve_codex(codex_bin), timeout_s)
     except (OSError, ValueError) as error:
-        app_error = "{} app-server: {}".format(codex_bin, error)
+        app_error = " ".join("codex app-server: {}".format(error).split())[:300]
     try:
-        return _log_quota()
+        reading = _log_quota()
+        reading["app_server_error"] = app_error
+        return reading
     except (OSError, ValueError) as error:
         return {
             "source": "none", "age_s": 0, "limit_reached": False,
             "error": "{}; {}".format(app_error, error), "windows": [],
+            "app_server_error": app_error,
         }
 
 
@@ -410,9 +463,17 @@ def _execute_job(command, directory, job_dir, brief, timeout_s, interrupted):
     with _private_open(job_dir / "events.jsonl", "wb") as events, _private_open(job_dir / "stderr.log", "wb") as errors:
         with _private_open(job_dir / "result.md", "wb"):
             pass
+        # Resolved apart from the launch: Popen also raises FileNotFoundError for
+        # other reasons, and only a missing codex is exit code 127.
+        try:
+            command = [resolve_codex(), *command[1:]]
+        except FileNotFoundError as error:
+            errors.write((" ".join(str(error).splitlines()) + "\n").encode("utf-8"))
+            return CODEX_NOT_FOUND, False
         try:
             child = subprocess.Popen(command, cwd=directory, stdin=subprocess.PIPE,
-                                     stdout=events, stderr=errors, start_new_session=True, umask=0o077)
+                                     stdout=events, stderr=errors, start_new_session=True, umask=0o077,
+                                     env=_codex_environment(command[0]))
         except OSError as error:
             errors.write(("could not start codex: {}\n".format(error)).encode("utf-8"))
             return 1, False
@@ -627,7 +688,7 @@ def _job_status(code, timed_out, result, errors):
     if code:
         if not errors:
             errors.append("codex exited {} without error details".format(code))
-        return "failed", 1
+        return "failed", 127 if code == CODEX_NOT_FOUND else 1
     if not result:
         errors.append("[crossfeed] Codex exited 0 without a result.")
         return "failed", 1
@@ -766,6 +827,12 @@ def _parse_timestamp(value):
 
 
 def _lockout(args) -> int:
+    if args.last:
+        reset_at = next((record["reset_at"] for record in reversed(read_ledger())
+                         if isinstance(record, dict) and record.get("type") == "lockout"
+                         and _parse_timestamp(record.get("reset_at")) is not None), None)
+        print(json.dumps({"reset_at": reset_at}))
+        return 0
     if args.reset_at != "unknown" and _parse_timestamp(args.reset_at) is None:
         raise ValueError("--reset-at must be an ISO-8601 timestamp or unknown")
     # The read and append share one lock, so concurrent sessions cannot duplicate a lockout.
@@ -882,7 +949,7 @@ def _report(args) -> int:
 
 def main(argv) -> int:
     parser = argparse.ArgumentParser(prog="crossfeed")
-    parser.add_argument("--version", action="version", version="crossfeed 0.1.0")
+    parser.add_argument("--version", action="version", version="crossfeed 0.1.1")
     subcommands = parser.add_subparsers(dest="command", required=True)
     stash = subcommands.add_parser("stash")
     stash.set_defaults(handler=_stash)
@@ -891,7 +958,9 @@ def main(argv) -> int:
     check.add_argument("check_command", nargs=argparse.REMAINDER)
     check.set_defaults(handler=_check)
     lockout = subcommands.add_parser("lockout")
-    lockout.add_argument("--reset-at", required=True)
+    lockout_action = lockout.add_mutually_exclusive_group(required=True)
+    lockout_action.add_argument("--reset-at")
+    lockout_action.add_argument("--last", action="store_true")
     lockout.add_argument("--session")
     lockout.set_defaults(handler=_lockout)
     report = subcommands.add_parser("report")

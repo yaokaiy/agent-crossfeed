@@ -18,6 +18,13 @@ def app_server():
     pidfile = os.environ.get("FAKE_CODEX_PIDFILE")
     if pidfile:
         Path(pidfile).write_text(str(os.getpid()), encoding="utf-8")
+    if mode in ("multiline", "long-stderr", "non-utf8"):
+        detail = {"multiline": b"first line\r\nsecond line\n",
+                  "long-stderr": b"diagnostic " * 1000,
+                  "non-utf8": b"bad byte: \xff\n"}[mode]
+        sys.stderr.buffer.write(detail)
+        sys.stderr.buffer.flush()
+        return 1
     if mode == "error":
         print("codex app-server failed", file=sys.stderr)
         return 1
@@ -34,7 +41,7 @@ def app_server():
         if method == "initialize":
             assert request == {
                 "id": 1, "method": "initialize",
-                "params": {"clientInfo": {"name": "crossfeed", "version": "0.1.0"}},
+                "params": {"clientInfo": {"name": "crossfeed", "version": "0.1.1"}},
             }
             if mode == "garbage":
                 print("not json: 检查 naïve\r", flush=True)
@@ -169,6 +176,8 @@ def execute():
 
 
 if __name__ == "__main__":
+    if os.environ.get("FAKE_CODEX_PATH"):
+        Path(os.environ["FAKE_CODEX_PATH"]).write_text(os.environ.get("PATH", ""), encoding="utf-8")
     if sys.argv[1:] == ["app-server"]:
         sys.exit(app_server())
     if sys.argv[1:2] == ["exec"]:

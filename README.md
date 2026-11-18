@@ -11,7 +11,7 @@ Codex subscription. In aviation, crossfeed lets an engine draw fuel from the
 other side's tank so that neither runs dry first. This does the same with
 two subscriptions.
 
-Status: alpha (0.1.0). A hand-off has been run end to end against the real
+Status: alpha (0.1.1). A hand-off has been run end to end against the real
 Claude Code and Codex CLIs. Its effect on lockouts has not been measured
 yet. See [Limits](#limits).
 
@@ -54,6 +54,12 @@ the work, talks to you and reviews what comes back.
 - Codex CLI 0.167 or later, logged in (`codex login`).
 - Python 3.9 or later, and git.
 - macOS or Linux.
+
+crossfeed looks for `codex` in `$CROSSFEED_CODEX` when that is set and not
+empty, then on `PATH`, then in the usual install directories listed in
+[the design](docs/design.md#the-dispatcher). If your Codex is somewhere
+else and Claude Code runs with a `PATH` that lacks it, set `CROSSFEED_CODEX`
+to the executable's path.
 
 ## Install
 
@@ -100,6 +106,10 @@ A line under the prompt shows the state:
 crossfeed auto · claude 5h 62% (pace 104%) · 7d 41% · codex wk 17% · pressure 0.4
 ```
 
+When Codex's quota cannot be read the line says `codex unavailable`, and a
+reading older than 15 minutes is marked `stale`. Nothing is handed off in
+either state; `/crossfeed status` says why.
+
 | Command | Effect |
 | --- | --- |
 | `/crossfeed` or `/crossfeed status` | readings, pressure, what would be handed off now, and why the last subagent call was or was not handed off |
@@ -129,8 +139,16 @@ For each subagent call crossfeed asks three questions.
 3. **Headroom.** How much Codex quota is left? Hand-offs taper off as
    Codex's weekly use approaches 85%.
 
-If either quota cannot be read, nothing is handed off. Only calls to the
-general-purpose agent types are considered. Other agent types, calls pinned
+The forecast cannot see subagents that have just started, so two more
+rules apply. Once two tier A or B calls have stayed on Claude within 10
+minutes, further tier B calls in that time go to Codex too, while it has
+headroom. And a window that begins within two hours of a locked window's
+reset starts with pressure already raised; that start counts for the
+window's first 30 minutes.
+
+If either quota cannot be read, nothing is handed off, and `/crossfeed
+status` names the reason. Only calls to the general-purpose agent types are
+considered. Other agent types, calls pinned
 to the `haiku` model, named or remote agents, and briefs that mention
 browser tools or other Claude-only tools stay on Claude.
 
@@ -159,8 +177,8 @@ brief from a file instead of standard input, and `stash` saves standard
 input to such a file and prints its path; the plugin uses the pair.
 
 Exit codes of `run`: 0 done, 1 failed, 2 usage error, 75 Codex reported its
-usage limit, 124 timeout, 130 interrupted. On a timeout or an interrupt the
-Codex process group is stopped.
+usage limit, 124 timeout, 127 Codex not found, 130 interrupted. On a timeout
+or an interrupt the Codex process group is stopped.
 
 `check` runs your check command and records pass or fail for the job. The
 verdict comes from the command's exit status, not from the model.
@@ -205,6 +223,9 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
   practitioner's routing rules, not by your tasks. They will misfile some
   briefs. `/crossfeed report` shows check results per tier so you can see
   whether they hold for you.
+- Subagent calls are counted per session. Subagents started from two
+  sessions at once are not seen as one burst, and subagents that are
+  already running cannot be moved.
 - In a very heavy window only part of the usage can move, so a lockout can
   still happen.
 - A Codex job starts with none of the conversation's context. Thin briefs

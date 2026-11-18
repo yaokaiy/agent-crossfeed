@@ -3,6 +3,7 @@ import { toConfig } from './config'
 import { createCore } from './core'
 import type { Core } from './core'
 import type { ClaudeReading, CodexReading } from './policy'
+import { shortProblem } from './policy'
 import { staticSection } from './text'
 
 function logFailure($: EngineInterface, message: string): void {
@@ -32,27 +33,45 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-async function readCodex($: EngineInterface, script: string, now: number): Promise<CodexReading | undefined> {
+async function readCodex($: EngineInterface, script: string, now: number): Promise<{ reading?: CodexReading; problem?: string }> {
   try {
     const result = await $.process.run(['python3', '-I', script, 'quota'], { timeoutMs: 15000 })
-    if (result.exitCode !== 0 || result.isStdoutTruncated) return undefined
-    const value: unknown = JSON.parse(result.stdout)
+    if (result.exitCode !== 0) return { problem: shortProblem(`quota probe exited with code ${result.exitCode}`) }
+    if (result.isStdoutTruncated) return { problem: 'quota probe output was truncated' }
+    let value: unknown
+    try { value = JSON.parse(result.stdout) } catch { return { problem: 'quota probe returned invalid JSON' } }
+    const problem = isRecord(value) ? shortProblem(value.app_server_error) : undefined
+    if (isRecord(value) && value.source === 'none') {
+      return { problem: problem ?? shortProblem(value.error) ?? 'quota probe returned no reading' }
+    }
     if (!isRecord(value) || (value.source !== 'app-server' && value.source !== 'log') ||
-        value.error !== null || typeof value.limit_reached !== 'boolean' || !Array.isArray(value.windows)) return undefined
+        value.error !== null || typeof value.limit_reached !== 'boolean' || !Array.isArray(value.windows)) return { problem: problem ?? 'quota probe returned invalid data' }
     const windows: CodexReading['windows'] = []
     for (const window of value.windows) {
       if (!isRecord(window) || typeof window.minutes !== 'number' || !Number.isFinite(window.minutes) || window.minutes <= 0 ||
-          typeof window.used_percent !== 'number' || !Number.isFinite(window.used_percent)) return undefined
+          typeof window.used_percent !== 'number' || !Number.isFinite(window.used_percent)) return { problem: problem ?? 'quota probe returned an invalid window' }
       const reset = window.resets_at
-      if (reset !== null && reset !== undefined && (typeof reset !== 'number' || !Number.isFinite(reset * 1000))) return undefined
+      if (reset !== null && reset !== undefined && (typeof reset !== 'number' || !Number.isFinite(reset * 1000))) return { problem: problem ?? 'quota probe returned an invalid reset time' }
       windows.push({ minutes: window.minutes, usedPercent: window.used_percent, resetsAt: typeof reset === 'number' ? reset * 1000 : undefined })
     }
-    const ageMs = typeof value.age_s === 'number' && Number.isFinite(value.age_s) && value.age_s > 0 ? value.age_s * 1000 : 0
-    return { windows, limitReached: value.limit_reached, readAt: now - ageMs }
+    // An unknown age is not a fresh reading. A log stamped slightly ahead of this clock counts as now.
+    const age = value.age_s
+    if (typeof age !== 'number' || !Number.isFinite(age) || age < -300) return { problem: problem ?? 'quota probe returned an invalid age' }
+    return { reading: { windows, limitReached: value.limit_reached, readAt: now - Math.max(0, age) * 1000 }, problem }
   } catch (error) {
-    logFailure($, `quota unavailable: ${String(error)}`)
-    return undefined
+    return { problem: shortProblem(`quota probe failed: ${String(error)}`) }
   }
+}
+
+async function readLockout($: EngineInterface, script: string): Promise<number | undefined> {
+  try {
+    const result = await $.process.run(['python3', '-I', script, 'lockout', '--last'], { timeoutMs: 5000 })
+    if (result.exitCode !== 0 || result.isStdoutTruncated) return undefined
+    const value: unknown = JSON.parse(result.stdout)
+    if (!isRecord(value) || typeof value.reset_at !== 'string') return undefined
+    const resetAt = Date.parse(value.reset_at)
+    return Number.isFinite(resetAt) ? resetAt : undefined
+  } catch { return undefined }
 }
 
 async function stashBrief($: EngineInterface, script: string, prompt: string): Promise<string | undefined> {
@@ -69,6 +88,7 @@ async function stashBrief($: EngineInterface, script: string, prompt: string): P
 export const register: Register = (on, options) => {
   let core: Core | undefined
   let script = ''
+  let session: string | undefined
   // Track attempts separately from reading age: an unavailable or stale reading
   // must not trigger another subprocess on every call.
   let lastProbeAt = -Infinity
@@ -76,14 +96,18 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     script = $.plugin.root + '/scripts/crossfeed.py'
     const config = toConfig(options)
-    core = createCore(config, script, await $.session.id())
+    session = await $.session.id()
+    core = createCore(config, script, session)
     await $.command.register({ name: 'crossfeed', description: 'Show crossfeed status, report or change routing mode.', argumentHint: '[status|report|auto|always|off]' })
     const now = await $.clock.now()
     lastProbeAt = -Infinity
-    if (config.mode !== 'off') {
-      lastProbeAt = now
-      core.setCodex(await readCodex($, script, now))
-    }
+    if (config.mode !== 'off') lastProbeAt = now
+    const [quota, lockout] = await Promise.all([
+      config.mode === 'off' ? Promise.resolve({ reading: undefined, problem: undefined }) : readCodex($, script, now),
+      readLockout($, script),
+    ])
+    core.setCodex(quota.reading, quota.problem)
+    core.setLockout(lockout)
     core.measure(claudeReading((await $.session.usage()).rateLimits), now)
     $.ui.status(core.status(now))
     return next(e)
@@ -114,15 +138,21 @@ export const register: Register = (on, options) => {
     const now = await $.clock.now()
     if (core.needsCodex(e) && core.codexAge(now) > 5 * 60000 && now - lastProbeAt > 5 * 60000) {
       lastProbeAt = now
-      core.setCodex(await readCodex($, script, now))
+      const quota = await readCodex($, script, now)
+      core.setCodex(quota.reading, quota.problem)
     }
     // A measure event may not have fired yet in a session's first turn: take the reading at decision time.
     const latest = claudeReading((await $.session.usage()).rateLimits)
     core.measure(latest, now)
     const route = core.route(e, now)
+    const stay = core.lastStay()
+    // The decision may rest on readings newer than the ones the status line was drawn from.
+    try { $.ui.status(core.status(now)) } catch { /* The status line must not block the call. */ }
     if (!route) {
       try { $.ui.log(core.lastDecision()) } catch { /* Logging must not block the call. */ }
-      return next(e)
+      const ran = await next(e)
+      if (ran.deny !== undefined && stay !== undefined) core.forgetStay(stay)
+      return ran
     }
     const cwd = await $.session.cwd()
     const briefFile = await stashBrief($, script, e.prompt)
@@ -134,12 +164,15 @@ export const register: Register = (on, options) => {
   on('tool.call', async (_$, e, next) => {
     const ran = await next(e)
     const note = core?.toolCall(String(e.tool), e.agentId !== undefined)
-    return note && ran.deny === undefined ? { ...ran, context: [...(ran.context ?? []), note] } : ran
+    if (ran.deny !== undefined || e.agentId !== undefined) return ran
+    const notices = core?.takeNotices() ?? []
+    if (note) notices.push(note)
+    return notices.length ? { ...ran, context: [...(ran.context ?? []), ...notices] } : ran
   }).catch(failOpen)
 
   on('classic.StopFailure', async ($, e, next) => {
     const lockout = core?.stopFailure(e.error, await $.clock.now())
-    if (lockout) await $.process.run(['python3', '-I', script, 'lockout', '--reset-at', lockout.resetAt])
+    if (lockout) await $.process.run(['python3', '-I', script, 'lockout', '--reset-at', lockout.resetAt, ...(session === undefined ? [] : ['--session', session])])
     return next(e)
   }).catch(failOpen)
 

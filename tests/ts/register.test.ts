@@ -8,7 +8,7 @@ const RESET = '2026-11-17T13:00:00.000Z'
 const CWD = '/tmp/检查 project'
 const AGENT = { tool: 'Agent' as const, description: 'Implement parser', prompt: 'Implement the parser specified in docs/plan.md. '.repeat(4) + 'Check: pytest tests/test_parser.py' }
 const AGENT_RESULT = { result: { status: 'async_launched' as const, agentId: 'test-agent', description: AGENT.description, prompt: AGENT.prompt, outputFile: '/tmp/result' } }
-const QUOTA = { source: 'app-server', age_s: 0, limit_reached: false, error: null, windows: [{ minutes: 10080, used_percent: 18, resets_at: 1900000000 }] }
+const QUOTA = { source: 'app-server', age_s: 0, limit_reached: false, error: null, app_server_error: null, windows: [{ minutes: 10080, used_percent: 18, resets_at: 1900000000 }] }
 const COMPOSE = { model: 'test', promptModel: 'test', surfaces: [], tools: [], outputStyle: null, traits: [] }
 const ORIGIN = { kind: 'composer' as const }
 
@@ -20,10 +20,11 @@ function setup(on: On) {
   const world = {
     now: BASE, quota: processResult(JSON.stringify(QUOTA)), rejectProcess: false, failClock: false,
     usage: [] as SessionRateLimit[], cwd: CWD,
+    lockout: processResult('{"reset_at":null}'), processFailure: '',
     stash: processResult('/tmp/检查 brief.md\n'), rejectStash: false,
     processes: [] as { argv: readonly string[]; timeout?: number; stdin?: string }[],
     agents: [] as unknown[], statuses: [] as (string | undefined)[], logs: [] as string[], commands: [] as string[],
-    bashCalls: 0, denyBash: false,
+    bashCalls: 0, denyBash: false, denyAgent: false,
   }
   on('clock.now', () => {
     if (world.failClock) { world.failClock = false; return { deny: 'clock unavailable' } }
@@ -41,10 +42,12 @@ function setup(on: On) {
   on('process.run', (_$, e) => {
     world.processes.push({ argv: e.argv, timeout: e.init?.timeoutMs, stdin: e.init?.stdin })
     if (e.argv[3] === 'stash') return world.rejectStash ? { deny: 'stash unavailable' } : { value: world.stash }
+    if (world.processFailure) throw new Error(world.processFailure)
     if (world.rejectProcess) return { deny: 'process unavailable' }
+    if (e.argv[3] === 'lockout') return { value: world.lockout }
     return { value: e.argv[3] === 'report' ? processResult('synthetic report\n') : world.quota }
   })
-  on('tool.call', { tool: 'Agent' }, (_$, e) => { world.agents.push(e); return AGENT_RESULT })
+  on('tool.call', { tool: 'Agent' }, (_$, e) => { world.agents.push(e); return world.denyAgent ? { deny: 'engine denied' } : AGENT_RESULT })
   on('tool.call', { tool: 'Bash' }, () => {
     world.bashCalls += 1
     return world.denyBash ? { deny: 'engine denied' } : { result: { stdout: 'ok', stderr: '', interrupted: false }, context: ['existing tool context'] }
@@ -176,9 +179,9 @@ test('StopFailure records only corroborated rate limits and converts reset times
   await $.classic.StopFailure({ error: 'overloaded' })
   await measure($, world, 40)
   await $.classic.StopFailure({ error: 'rate_limit' })
-  const lockouts = world.processes.filter(call => call.argv[3] === 'lockout')
+  const lockouts = world.processes.filter(call => call.argv[3] === 'lockout' && call.argv[4] === '--reset-at')
   expect(lockouts.length).toBe(1)
-  expect(lockouts[0]?.argv.slice(3)).toEqual(['lockout', '--reset-at', RESET])
+  expect(lockouts[0]?.argv.slice(3)).toEqual(['lockout', '--reset-at', RESET, '--session', 'test-session'])
 })
 
 test('quota refreshes after five minutes and converts Codex seconds to milliseconds', async ($, on) => {
@@ -250,8 +253,8 @@ test('handoffs stash the exact prompt then deny with the exact saved-brief comma
   const prompt = AGENT.prompt + '\r\n检查 naïve\r\nCROSSFEED_BRIEF_EOF\r\n$(touch pwned)'
   const result = await $.tool.call({ ...AGENT, prompt })
   const script = world.processes[0]!.argv[2]!
-  expect(world.processes.map(call => call.argv[3])).toEqual(['quota', 'stash'])
-  expect(world.processes[1]).toEqual({ argv: ['python3', '-I', script, 'stash'], stdin: prompt, timeout: 5000 })
+  expect(world.processes.map(call => call.argv[3])).toEqual(['quota', 'lockout', 'stash'])
+  expect(world.processes[2]).toEqual({ argv: ['python3', '-I', script, 'stash'], stdin: prompt, timeout: 5000 })
   expect(result.deny).toBe([
     'crossfeed: run this on Codex instead of a Claude subagent.',
     'Why: tier A (has a check command and is implementation-type work). Claude 5h 5%; Codex weekly 18%.',
@@ -277,8 +280,8 @@ for (const failure of ['reject', 'non-zero', 'relative', 'empty', 'truncated'] a
     const prompt = AGENT.prompt + '\r\n' + first + '\r\nCROSSFEED_BRIEF_EOF\r\n$(touch pwned)'
     const result = await $.tool.call({ ...AGENT, prompt })
     const lines = result.deny?.split('\n') ?? []
-    expect(world.processes[1]?.argv[3]).toBe('stash')
-    expect(world.processes[1]?.stdin).toBe(prompt)
+    expect(world.processes[2]?.argv[3]).toBe('stash')
+    expect(world.processes[2]?.stdin).toBe(prompt)
     expect(lines.length).toBe(7)
     expect(lines[2]).toBe('Start it as a background Bash command with the brief you just wrote, unchanged, as stdin:')
     expect(lines[4]).toBe('<the brief>')
@@ -297,7 +300,7 @@ for (const usage of [[], [{ kind: 'seven_day' as const, percentUsed: 82 }]]) {
     await measure($, world, 5)
     world.usage = usage
     expect(await $.tool.call(AGENT)).toEqual(AGENT_RESULT)
-    expect(world.processes.map(call => call.argv[3])).toEqual(['quota'])
+    expect(world.processes.map(call => call.argv[3])).toEqual(['quota', 'lockout'])
   })
 }
 
@@ -326,16 +329,16 @@ for (const failed of ['reject', 'non-zero', 'bad JSON', 'none', 'empty windows']
       : processResult(JSON.stringify({ ...QUOTA, source: failed === 'none' ? 'none' : 'app-server', windows: [] }))
     await start($)
     await measure($, world, 5)
-    expect(world.processes.length).toBe(1)
+    expect(world.processes.filter(call => call.argv[3] === 'quota').length).toBe(1)
     expect(await $.tool.call(AGENT)).toEqual(AGENT_RESULT)
     world.now += MINUTE
     expect(await $.tool.call(AGENT)).toEqual(AGENT_RESULT)
-    expect(world.processes.length).toBe(1)
+    expect(world.processes.filter(call => call.argv[3] === 'quota').length).toBe(1)
     world.now = BASE + 5 * MINUTE + 1
     expect(await $.tool.call(AGENT)).toEqual(AGENT_RESULT)
-    expect(world.processes.length).toBe(2)
+    expect(world.processes.filter(call => call.argv[3] === 'quota').length).toBe(2)
     expect(await $.tool.call(AGENT)).toEqual(AGENT_RESULT)
-    expect(world.processes.length).toBe(2)
+    expect(world.processes.filter(call => call.argv[3] === 'quota').length).toBe(2)
   })
 }
 
@@ -361,3 +364,140 @@ test('each routing decision is logged with the same sentence shown in status', a
   await $.tool.call(AGENT)
   expect(world.logs[world.logs.length - 1]).toBe('last subagent call: stayed on Claude (crossfeed is off)')
 })
+
+for (const [name, response, failure, cause] of [
+  ['nonzero', processResult('', 127), '', 'quota probe exited with code 127'],
+  ['timeout', processResult(''), 'quota timed out', 'quota probe failed'],
+  ['throw', processResult(''), 'synthetic exception', 'quota probe failed'],
+  ['empty', processResult(''), '', 'quota probe returned invalid JSON'],
+  ['garbage', processResult('not json'), '', 'quota probe returned invalid JSON'],
+  ['truncated', { ...processResult(JSON.stringify(QUOTA)), isStdoutTruncated: true }, '', 'quota probe output was truncated'],
+  ['invalid shape', processResult('null'), '', 'quota probe returned invalid data'],
+  ['none', processResult(JSON.stringify({ ...QUOTA, source: 'none', error: 'no logs\r\n检查' })), '', 'no logs 检查'],
+  ['app error', processResult(JSON.stringify({ ...QUOTA, source: 'none', error: 'no logs', app_server_error: 'codex missing' })), '', 'codex missing'],
+] as const) {
+  test(`quota failure ${name} appears as a problem in status and decisions`, async ($, on) => {
+    const world = setup(on)
+    world.quota = response
+    world.processFailure = failure
+    world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+    await start($)
+    await $.tool.call(AGENT)
+    const status = (await command($, 'status')).text ?? ''
+    expect(status.includes(`no Codex reading (${cause}`)).toBe(true)
+    expect(status.includes('codex unavailable')).toBe(true)
+    expect(world.logs.some(log => log.includes(cause))).toBe(true)
+  })
+}
+
+test('stale log fallback preserves a single-line bounded app server error', async ($, on) => {
+  const world = setup(on)
+  const problem = 'missing codex\r\n检查 ' + 'x'.repeat(1000)
+  world.quota = processResult(JSON.stringify({ ...QUOTA, source: 'log', age_s: 180 * 60, app_server_error: problem }))
+  world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+  await start($)
+  await $.tool.call(AGENT)
+  const status = (await command($, 'status')).text ?? ''
+  expect(status.includes('codex wk 18% stale')).toBe(true)
+  expect(status.includes('Codex reading is 180 minutes old (' + problem.replace(/\s+/g, ' ').slice(0, 200) + ')')).toBe(true)
+  expect(status.includes('x'.repeat(201))).toBe(false)
+})
+
+for (const output of ['', 'garbage', 'null', '[]', '{}', '{"reset_at":null}', '{"reset_at":"unknown"}', '{"reset_at":17}', '{"reset_at":""}']) {
+  test(`bad last-lockout output ${JSON.stringify(output)} fails open`, async ($, on) => {
+    const world = setup(on)
+    world.lockout = processResult(output)
+    world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+    await start($)
+    expect((await command($, 'status')).text?.split('\n')[0]?.endsWith('pressure 0')).toBe(true)
+    expect(world.processes.some(call => call.argv[4] === '--last')).toBe(true)
+    expect((await $.tool.call(AGENT)).deny?.startsWith('crossfeed:')).toBe(true)
+  })
+}
+
+test('startup loads the previous lockout before the first measure with a five second timeout', async ($, on) => {
+  const world = setup(on)
+  world.lockout = processResult(JSON.stringify({ reset_at: new Date(BASE).toISOString() }))
+  world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+  await start($)
+  expect(world.statuses[0]?.includes('pressure 0.3')).toBe(true)
+  const probe = world.processes.find(call => call.argv[4] === '--last')
+  expect(probe?.argv.slice(0, 2)).toEqual(['python3', '-I'])
+  expect(probe?.argv.slice(3)).toEqual(['lockout', '--last'])
+  expect(probe?.timeout).toBe(5000)
+  const research = { ...AGENT, description: 'Research', prompt: 'Research the protocol and report vendors with sources. '.repeat(4) }
+  for (const seconds of [0, 10, 20, 31, 44, 59, 73]) {
+    world.now = BASE + seconds * 1000
+    expect((await $.tool.call(research)).deny?.startsWith('crossfeed:')).toBe(true)
+  }
+})
+
+test('notices wait through subagent calls and denials, reach main-loop tool once, then leave prompt clean', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 95)
+  const bash = { tool: 'Bash' as const, command: 'true' }
+  expect((await $.tool.call({ ...bash, agentId: 'child' })).context).toEqual(['existing tool context'])
+  expect((await $.tool.call(AGENT)).deny?.startsWith('crossfeed:')).toBe(true)
+  world.denyBash = true
+  expect(await $.tool.call(bash)).toEqual({ deny: 'engine denied' })
+  world.denyBash = false
+  const result = await $.tool.call(bash)
+  expect(result.context?.length).toBe(3)
+  expect(result.context?.[0]).toBe('existing tool context')
+  expect(result.context?.[1]?.includes('pressure')).toBe(true)
+  expect(result.context?.[2]?.includes('reserve')).toBe(true)
+  expect((await $.tool.call(bash)).context).toEqual(['existing tool context'])
+  expect((await $.prompt.submit({ text: 'next', context: [], wait: false, origin: ORIGIN })).context).toEqual([])
+})
+
+const RESEARCH = { tool: 'Agent' as const, description: 'Research vendors', prompt: 'Research which vendors support the requested protocol and report with sources. '.repeat(3) }
+
+for (const refused of [true, false]) {
+  test(`two subagent calls the engine ${refused ? 'refused' : 'started'} ${refused ? 'do not' : 'do'} make a burst`, async ($, on) => {
+    const world = setup(on)
+    world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+    await start($)
+    world.denyAgent = refused
+    for (let i = 0; i < 2; i++) {
+      world.now += 1000
+      expect((await $.tool.call(RESEARCH)).deny).toBe(refused ? 'engine denied' : undefined)
+    }
+    world.denyAgent = false
+    world.now += 1000
+    const third = await $.tool.call(RESEARCH)
+    expect(third.deny?.startsWith('crossfeed:') ?? false).toBe(!refused)
+    expect(world.agents.length).toBe(refused ? 3 : 2)
+  })
+}
+
+test('the status line is redrawn from the readings a subagent call was decided on', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+  world.rejectProcess = true
+  await start($)
+  expect(world.statuses[world.statuses.length - 1]?.includes('codex unavailable')).toBe(true)
+  world.rejectProcess = false
+  world.now += 6 * MINUTE
+  expect((await $.tool.call(AGENT)).deny?.startsWith('crossfeed:')).toBe(true)
+  const shown = world.statuses[world.statuses.length - 1] ?? ''
+  expect(shown.includes('codex unavailable')).toBe(false)
+  expect(shown.includes('codex wk 18%')).toBe(true)
+})
+
+for (const [name, age, accepted] of [
+  ['missing', undefined, false], ['null', null, false], ['a string', '5', false],
+  ['far in the future', -301, false], ['slightly in the future', -300, true], ['zero', 0, true],
+] as const) {
+  test(`a quota reading whose age is ${name} is ${accepted ? 'used' : 'rejected'}`, async ($, on) => {
+    const world = setup(on)
+    const { age_s: _dropped, ...rest } = QUOTA
+    world.quota = processResult(JSON.stringify(age === undefined ? rest : { ...rest, age_s: age }))
+    world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+    await start($)
+    const result = await $.tool.call(AGENT)
+    expect(result.deny?.startsWith('crossfeed:') ?? false).toBe(accepted)
+    const status = (await command($, 'status')).text ?? ''
+    expect(status.includes('no Codex reading (quota probe returned an invalid age)')).toBe(!accepted)
+  })
+}

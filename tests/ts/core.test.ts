@@ -191,7 +191,7 @@ test('off mode suppresses steering notices and reminders and mode changes stay l
   core.setMode('always')
   expect(agentCall(core, B, CWD, BASE + 25 * MINUTE)?.deny.includes('--tier B')).toBe(true)
   expect(DEFAULTS.mode).toBe('auto')
-  expect(createCore(DEFAULTS, SCRIPT).status(BASE)).toBe('crossfeed auto · waiting for a reading')
+  expect(createCore(DEFAULTS, SCRIPT).status(BASE)).toBe('crossfeed auto · codex unavailable · waiting for a reading')
 })
 
 test('lockouts require rate_limit and at least 95 percent usage', async () => {
@@ -290,7 +290,7 @@ test('describe remembers the last actual decision and preserves policy reasons',
   expect(last()).toBe('last subagent call: stayed on Claude (no Claude reading yet)')
   measure(core, 5)
   core.route(A, BASE)
-  expect(last()).toBe('last subagent call: stayed on Claude (no Codex headroom)')
+  expect(last()).toBe('last subagent call: stayed on Claude (no Codex reading)')
   core.setCodex(codex())
   core.route(A, BASE)
   expect(last()).toBe('last subagent call: handed to Codex (has a check command and is implementation-type work)')
@@ -304,7 +304,7 @@ test('describe remembers the last actual decision and preserves policy reasons',
   core.route(C, BASE)
   expect(last()).toBe('last subagent call: stayed on Claude (tier C stays on Claude)')
   core.route(B, BASE)
-  expect(last()).toBe('last subagent call: stayed on Claude (pressure is low)')
+  expect(last()).toBe('last subagent call: handed to Codex (no check command; burst: 3 earlier subagent calls stayed on Claude in 10 minutes)')
   core.setCodex({ ...codex(), windows: [{ minutes: 10080, usedPercent: 84 }] })
   core.route(A, BASE)
   expect(last()).toBe('last subagent call: stayed on Claude (Codex headroom is low)')

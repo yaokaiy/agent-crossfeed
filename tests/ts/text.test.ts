@@ -64,6 +64,7 @@ test('staticSection reproduces the fixed copy exactly', async () => {
     '- While a write job runs, do not edit files in its directory.',
     "- A Codex result is a claim. Read the change list, run the check as `python3 -I '/x/crossfeed.py' check <job> -- <command>`, then report.",
     '- Exit code 75 means Codex is out of quota: do the work yourself.',
+    '- Exit code 127 means the codex CLI was not found: do the work yourself and tell the user.',
   ].join('\n'))
   expect(text.split('\n').length <= 12).toBe(true)
   expect(text.split('/x/crossfeed.py').length - 1 <= 2).toBe(true)
@@ -73,19 +74,19 @@ test('statusLine matches the full, waiting, off and reserve examples', async () 
   const input = { mode: 'auto' as const, u: 62, F: 104, w: 41, codexPercent: 17, P: 0.4, reserve: false }
   const full = 'crossfeed auto · claude 5h 62% (pace 104%) · 7d 41% · codex wk 17% · pressure 0.4'
   expect(statusLine(input)).toBe(full)
-  expect(statusLine({ mode: 'auto', P: 0, reserve: false })).toBe('crossfeed auto · waiting for a reading')
+  expect(statusLine({ mode: 'auto', P: 0, reserve: false })).toBe('crossfeed auto · codex unavailable · waiting for a reading')
   expect(statusLine({ ...input, mode: 'off', reserve: true })).toBe('crossfeed off')
   expect(statusLine({ ...input, reserve: true })).toBe(full + ' · reserve')
 })
 
 test('statusLine handles partial readings and preserves zero percentages', async () => {
-  expect(statusLine({ mode: 'always', u: 0, P: 0, reserve: false })).toBe('crossfeed always · claude 5h 0% · pressure 0')
+  expect(statusLine({ mode: 'always', u: 0, P: 0, reserve: false })).toBe('crossfeed always · claude 5h 0% · codex unavailable · pressure 0')
   expect(statusLine({ mode: 'auto', w: 0, codexPercent: 0, P: 0.25, reserve: false })).toBe('crossfeed auto · 7d 0% · codex wk 0% · pressure 0.25')
 })
 
 test('pressure displays at most two decimals without trailing zeros', async () => {
   for (const [P, expected] of [[0.30000000000000004, '0.3'], [0.116666, '0.12'], [0, '0'], [1, '1']] as const) {
-    expect(statusLine({ mode: 'auto', u: 5, P, reserve: false })).toBe(`crossfeed auto · claude 5h 5% · pressure ${expected}`)
+    expect(statusLine({ mode: 'auto', u: 5, P, reserve: false })).toBe(`crossfeed auto · claude 5h 5% · codex unavailable · pressure ${expected}`)
     expect(pressureNotice({ u: 5, P })).toBe(`crossfeed: Claude 5h 5%; pressure ${expected}. Hand self-contained implementation, research and review work to Codex when it has headroom.`)
   }
 })

@@ -1,6 +1,6 @@
 {
   "name": "agent-crossfeed",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Hands execution work from Claude Code to the Codex CLI before Claude's 5-hour window runs out.",
   "author": {
     "name": "yaokaiy"

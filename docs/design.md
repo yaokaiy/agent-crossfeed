@@ -110,16 +110,38 @@ is not.
   since a reference reading: the newest one at least 10 minutes old, or the
   oldest one kept. `F = u + r * R` is where the window ends if that pace
   continues.
-- `p` lies in [0, 0.8]. While the readings span less than 10 minutes, `p` is
-  0.5 when `u >= 80` and 0 otherwise. After that it changes at most every 5
-  minutes: while `F > 95` it rises by
+- `p` lies in [0, 0.8] and starts each window at `p0`, which is 0 except
+  early in a window that follows a lockout (below). While the readings span
+  less than 10 minutes,
+  `p` is 0.5 when `u >= 80` and `p0` otherwise. After that it changes at
+  most every 5 minutes: while `F > 95` it rises by
   `min(0.10, 0.20 * (r - a) / max(r, 0.05))`, where
   `a = max(0, 90 - u) / max(R, 1)` is the pace that would end at 90%; while
   `F < 80` it falls by 0.10; between the two it stays.
 - A reset time that moves by more than one minute means a new window: the
-  readings, `p`, and any queued notices are cleared.
+  readings and any queued notices are cleared and `p` returns to `p0`. A
+  reading without a reset time, once the known reset time has passed, also
+  starts over, with `p = 0`.
+- After a lockout `p0` is 0.3, on the assumption that the work that filled
+  one window continues into the next; the first minutes of a window have no
+  pace to measure. It applies when the new window began between 5 minutes
+  before and 2 hours after the time the locked window was due to reset, and
+  only during that window's first 30 minutes, judged from the reading's own
+  reset time. A session that starts later in the window, or resumes after a
+  pause, begins at 0 as in any other window. The plugin knows a lockout
+  from the session's own rate-limit error and, at session start, from the
+  newest lockout in the ledger. A lockout recorded without a reset time is
+  ignored.
 - Claude's weekly use `w` adds `b = 0.25 * clamp((w - 75) / 15, 0, 1)`.
   Pressure is `P = max(p, b)`.
+
+The controller sees only usage that has been reported, and a subagent's
+usage arrives minutes after it starts. Several subagents started together
+can use most of a window before `p` moves. So calls are counted as well:
+when 2 eligible tier A or B calls have stayed on Claude in the last 10
+minutes of the session, the next call is decided with `P` taken as at least
+0.3. A call that something else then refuses, so that no subagent starts,
+is not counted. Notices and the long-stretch reminder use `P` itself.
 
 ### 4. Headroom: how much Codex quota is left?
 
@@ -134,21 +156,29 @@ far away. A window of 6 hours or less gives 0 at 90% used and 1 below. With
 several windows the smallest value counts. `g` is 0 when Codex reported its
 limit, when the reading is older than 15 minutes, or when there is none.
 
+When `g` is 0 the plugin keeps the cause: no reading, a reading that is too
+old, Codex's reported limit, or the window that is used up. `/crossfeed
+status` and the last-decision line name it, with the dispatcher's error
+when the app server could not be asked. The status line shows `codex
+unavailable` without a reading and marks one that is too old as `stale`.
+
 The Codex reading is refreshed when it is older than 5 minutes and a call
 could be handed off. After a failed read the plugin waits 5 minutes before
-trying again.
+trying again. A reading whose age is missing or not a number, or that is
+dated more than 5 minutes ahead of the clock, counts as no reading.
 
 ### The decision
 
 In this order: mode `off` hands nothing off; so does a missing Claude
 reading (unknown is not free capacity); so does `g = 0`; tier C stays; mode
 `always` hands off every remaining call; tier A goes when `g >= 0.5`; tier B
-goes when `P >= 0.3`.
+goes when `P >= 0.3`, which a burst (section 3) can supply.
 
 Two more signals reach the model, each once per window or stretch:
 
 - when `P` first reaches 0.3, and when `u` first reaches 90, a one-line
-  notice is attached to the user's next prompt;
+  notice is attached to the next tool result in the main loop or to the
+  user's next prompt, whichever comes first;
 - after `stretchCalls` hands-on tool calls (default 12) with no user prompt
   in between, while `P >= 0.3`, one reminder is attached to a tool result.
 
@@ -184,6 +214,19 @@ context.
 It needs the Codex CLI, and git for change lists. It works without the
 plugin.
 
+- **Finding Codex.** It uses the executable named by `$CROSSFEED_CODEX`
+  when that is set and not empty, else `codex` on `PATH`, else the first
+  match in a list
+  of install directories: `/opt/homebrew/bin`, `/usr/local/bin`,
+  `/home/linuxbrew/.linuxbrew/bin`, and `.local/bin`, `.npm-global/bin`,
+  `.bun/bin` and `.volta/bin` under the home directory.
+  `$CROSSFEED_CODEX_DIRS`, separated like `PATH`, replaces the list. The
+  list exists because a Claude Code session's `PATH` can lack the directory
+  Codex was installed in. When the directory Codex was found in is not on
+  the child's `PATH`, it is put first, since a Codex installed through npm
+  starts `node` from there. A `$CROSSFEED_CODEX` that is not an executable
+  file is an error, not a reason to look further. When Codex is not found,
+  `run` exits with 127 and says where it looked.
 - **Sandbox.** It asks Codex for its read-only sandbox by default and for
   `workspace-write` in the given directory with `--write`. What those
   sandboxes permit, including network access, is decided by Codex and the
@@ -212,13 +255,16 @@ plugin.
 - **Ledger.** `ledger.jsonl` in the data directory, append-only, written
   under a file lock: one line when a job ends, one per check, one per
   lockout. A check records the program's name, not its arguments.
+  `lockout --last` prints the newest lockout's reset time.
 - **Quota.** `quota` asks `codex app-server` for the account's rate limits,
   with no model turn. If that fails it reads the last rate-limit event in
-  the newest 8 Codex session logs and reports its age.
+  the newest 8 Codex session logs and reports its age and the app server's
+  error.
 
 The data directory is `$CROSSFEED_HOME`, else `$CLAUDE_CONFIG_DIR/crossfeed`,
 else `~/.claude/crossfeed`. Exit codes of `run`: 0 done, 1 failed, 2 usage
-error, 75 Codex usage limit, 124 timeout, 130 interrupted.
+error, 75 Codex usage limit, 124 timeout, 127 Codex not found, 130
+interrupted.
 
 ## Architecture
 
@@ -276,6 +322,9 @@ change the options or open an issue with the numbers.
 - Claude's reading comes from its last API response and Codex's from its
   app server, with a session-log fallback. Either can be missing; then
   nothing is handed off.
+- Calls are counted per session. Subagents started from two sessions at
+  the same time are not seen as one burst, and subagents that are already
+  running cannot be moved.
 
 ## Planned
 

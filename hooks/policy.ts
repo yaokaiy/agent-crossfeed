@@ -50,7 +50,7 @@ export type ClaudeReading = {
   sevenDay?: { percentUsed: number }
 }
 export type CodexWindow = { minutes: number; usedPercent: number; resetsAt?: number }
-export type CodexReading = { windows: CodexWindow[]; limitReached: boolean; readAt: number }
+export type CodexReading = { windows: CodexWindow[]; limitReached: boolean; readAt: number; problem?: string }
 export type PressureState = {
   p: number
   updatedAt: number
@@ -72,19 +72,27 @@ function usageRate(samples: PressureState['samples'], u: number, now: number): n
   return elapsed > 0 ? Math.max(0, (u - ref.u) / elapsed) : undefined
 }
 
-export function updatePressure(state: PressureState, reading: ClaudeReading, now: number): PressureState {
+export function updatePressure(state: PressureState, reading: ClaudeReading, now: number, lockoutResetAt?: number): PressureState {
   if (!reading.fiveHour) return state
   const { percentUsed: u, resetsAt } = reading.fiveHour
-  let next = { ...state, samples: [...state.samples] }
+  // The start after a lockout uses this reading's own reset time, never a remembered one,
+  // and holds only while the window is young: a session that starts or resumes later begins at 0.
+  const windowStart = (resetsAt ?? NaN) - 300 * MINUTE
+  const sinceLockout = windowStart - (lockoutResetAt ?? NaN)
+  const p0 = sinceLockout >= -5 * MINUTE && sinceLockout < 120 * MINUTE && now - windowStart < 30 * MINUTE ? 0.3 : 0
+  let next: PressureState = { ...state, samples: [...state.samples] }
   if (resetsAt !== undefined && (state.windowResetsAt === undefined || Math.abs(resetsAt - state.windowResetsAt) > MINUTE)) {
-    next = { p: 0, updatedAt: 0, samples: [], windowResetsAt: resetsAt }
+    next = { p: p0, updatedAt: 0, samples: [], windowResetsAt: resetsAt }
+  } else if (resetsAt === undefined && state.windowResetsAt !== undefined && now > state.windowResetsAt) {
+    // The known window is over and this reading does not say when the next one ends.
+    next = { p: 0, updatedAt: 0, samples: [] }
   }
   const last = next.samples[next.samples.length - 1]
   if (!last || now > last.t) next.samples.push({ t: now, u })
   next.samples = next.samples.filter(sample => sample.t >= now - 30 * MINUTE)
 
   if (now - next.samples[0]!.t < 10 * MINUTE) {
-    return { ...next, p: u >= 80 ? 0.5 : 0, updatedAt: now }
+    return { ...next, p: u >= 80 ? 0.5 : p0, updatedAt: now }
   }
   if (next.updatedAt > 0 && now - next.updatedAt < 5 * MINUTE) return next
 
@@ -123,11 +131,30 @@ export function headroom(codex: CodexReading | undefined, config: Config, now: n
   }))
 }
 
-export function decide(input: { tier: Tier; P: number; g: number; mode: Mode; claudeKnown: boolean }): { handOff: boolean; reason: string } {
+// Keep diagnostics safe for one-line status and refusal text, regardless of source.
+export function shortProblem(problem: unknown): string | undefined {
+  if (typeof problem !== 'string') return undefined
+  return problem.replace(/\s+/g, ' ').trim().slice(0, 200) || undefined
+}
+
+export function headroomCause(codex: CodexReading | undefined, config: Config, now: number, problem?: string): string | undefined {
+  if (headroom(codex, config, now) > 0) return undefined
+  const detail = shortProblem(problem ?? codex?.problem)
+  const suffix = detail ? ` (${detail})` : ''
+  if (codex?.limitReached) return 'Codex reported its limit' + suffix
+  if (!codex || !codex.windows.length) return 'no Codex reading' + suffix
+  if (now - codex.readAt > 15 * MINUTE) return `Codex reading is ${Math.round((now - codex.readAt) / MINUTE)} minutes old` + suffix
+  const window = codex.windows.find(window => window.usedPercent >= (window.minutes <= 360 ? 90 : config.codexStopPercent))
+  if (!window) return 'no Codex headroom'
+  const label = window.minutes === 10080 ? 'weekly' : `${window.minutes / 60}-hour`
+  return `Codex ${label} use is ${Math.round(window.usedPercent)}%` + suffix
+}
+
+export function decide(input: { tier: Tier; P: number; g: number; mode: Mode; claudeKnown: boolean; headroomProblem?: string }): { handOff: boolean; reason: string } {
   const { tier, P, g, mode, claudeKnown } = input
   if (mode === 'off') return { handOff: false, reason: 'crossfeed is off' }
   if (!claudeKnown) return { handOff: false, reason: 'no Claude reading yet' }
-  if (g <= 0) return { handOff: false, reason: 'no Codex headroom' }
+  if (g <= 0) return { handOff: false, reason: input.headroomProblem ?? 'no Codex headroom' }
   if (tier === 'C') return { handOff: false, reason: 'tier C stays on Claude' }
   if (mode === 'always') return { handOff: true, reason: 'crossfeed is always on' }
   if (tier === 'A') {

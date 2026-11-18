@@ -275,10 +275,17 @@ class RunTests(CrossfeedCase):
         empty_bin = self.root / "empty"
         empty_bin.mkdir()
         result = self.run_job(PATH=str(empty_bin))
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 127)
         self.assertIn(b"codex", result.stdout)
         self.assertIn(b"[crossfeed] last log lines:", result.stdout)
         self.assertEqual(self.records()[-1]["status"], "failed")
+
+        self.assertEqual(self.records()[-1]["exit"], 127)
+        detail = (self.job_dir() / "stderr.log").read_text()
+        self.assertEqual(len(detail.splitlines()), 1)
+        self.assertIn("codex was not found", detail)
+        self.assertIn(str(empty_bin), detail)
+        self.assertIn("CROSSFEED_CODEX", detail)
 
     def test_running_state_exists_before_codex_starts(self):
         result = self.run_job(mode="inspect-state")

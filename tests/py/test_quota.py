@@ -25,7 +25,7 @@ class QuotaTests(CrossfeedCase):
         self.assertEqual(len(result.stdout.splitlines()), 1)
         reading = json.loads(result.stdout)
         self.assertIs(type(reading["age_s"]), int)
-        self.assertEqual(set(reading), {"source", "age_s", "limit_reached", "error", "windows"})
+        self.assertEqual(set(reading), {"source", "age_s", "limit_reached", "error", "windows", "app_server_error"})
         return reading
 
     def write_log(self, name="rollout-test.jsonl", age=120, timestamp=True, limits=None):
@@ -45,7 +45,7 @@ class QuotaTests(CrossfeedCase):
     def test_app_server_reading(self):
         self.assertEqual(self.quota(), {
             "source": "app-server", "age_s": 0, "limit_reached": False,
-            "error": None, "windows": [WEEKLY],
+            "error": None, "windows": [WEEKLY], "app_server_error": None,
         })
 
     def test_garbage_lines_are_ignored(self):
@@ -64,6 +64,7 @@ class QuotaTests(CrossfeedCase):
         self.assertEqual(reading["source"], "log")
         self.assertEqual(reading["windows"], [WEEKLY])
         self.assertIsNone(reading["error"])
+        self.assertIn("codex app-server failed", reading["app_server_error"])
         self.assertFalse(reading["limit_reached"])
         self.assertGreaterEqual(reading["age_s"], 115)
         self.assertLessEqual(reading["age_s"], 130)
@@ -230,3 +231,30 @@ class QuotaTests(CrossfeedCase):
             reading = crossfeed.read_quota(str(self.shim), timeout_s=1)
         self.assertEqual(reading["source"], "app-server")
         self.assertEqual(reading["windows"], [WEEKLY])
+
+    def test_app_server_stderr_is_bounded_single_line(self):
+        for mode, detail in (("multiline", "first line second line"),
+                             ("long-stderr", "diagnostic"), ("non-utf8", "bad byte: \ufffd")):
+            for with_log in (False, True):
+                with self.subTest(mode=mode, with_log=with_log):
+                    if with_log:
+                        self.write_log()
+                    reading = self.quota(mode)
+                    self.assertEqual(reading["source"], "log" if with_log else "none")
+                    error = reading["app_server_error"]
+                    self.assertIn(detail, error)
+                    self.assertEqual(len(error.splitlines()), 1)
+                    self.assertLessEqual(len(error), 300)
+                    if with_log:
+                        for path in Path(self.env["CODEX_HOME"]).rglob("*.jsonl"):
+                            path.unlink()
+
+    def test_missing_codex_retains_error_with_and_without_log(self):
+        for with_log in (False, True):
+            with self.subTest(with_log=with_log):
+                if with_log:
+                    self.write_log()
+                reading = self.quota(PATH="")
+                self.assertEqual(reading["source"], "log" if with_log else "none")
+                self.assertIn("codex was not found", reading["app_server_error"])
+                self.assertIn("CROSSFEED_CODEX", reading["app_server_error"])

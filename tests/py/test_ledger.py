@@ -149,7 +149,7 @@ for number in range(200):
     def test_version(self):
         result = run_crossfeed(["--version"], env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, b"crossfeed 0.1.0\n")
+        self.assertEqual(result.stdout, b"crossfeed 0.1.1\n")
 
     def test_data_directory_and_job_files_are_private_with_permissive_umask(self):
         self.home.rmdir()
@@ -177,3 +177,53 @@ for number in range(200):
                 for path in directory.rglob("*"):
                     if path.is_file():
                         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def last_lockout(self):
+        result = run_crossfeed(["lockout", "--last"], env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        return json.loads(result.stdout)
+
+    def test_last_lockout_missing_and_empty(self):
+        self.assertEqual(self.last_lockout(), {"reset_at": None})
+        (self.home / "ledger.jsonl").touch()
+        self.assertEqual(self.last_lockout(), {"reset_at": None})
+
+    def test_last_lockout_skips_garbage_unknown_and_invalid(self):
+        records = [None, [], "text", {"type": "lockout", "reset_at": "unknown"},
+                   {"type": "lockout", "reset_at": "bad"},
+                   {"type": "lockout", "reset_at": 123}, {"type": "lockout"}]
+        path = self.home / "ledger.jsonl"
+        path.write_bytes(b"garbage\r\n{broken\r\n" +
+                         "\r\n".join(json.dumps(r) for r in records).encode())
+        self.assertEqual(self.last_lockout(), {"reset_at": None})
+
+    def test_last_lockout_uses_newest_valid_record_not_latest_reset(self):
+        records = [
+            {"type": "lockout", "reset_at": "2026-11-18T00:00:00Z"},
+            {"type": "lockout", "reset_at": "2026-11-17T01:00:00-08:00"},
+            {"type": "job", "reset_at": "2026-11-19T00:00:00Z"},
+            {"type": "lockout", "reset_at": "unknown"},
+            {"type": "lockout", "reset_at": "not a timestamp"},
+        ]
+        path = self.home / "ledger.jsonl"
+        content = "\r\n".join(json.dumps(r) for r in records) + "\r\n"
+        path.write_bytes(content.encode())
+        self.assertEqual(self.last_lockout(), {"reset_at": records[1]["reset_at"]})
+        self.assertEqual(path.read_bytes(), content.encode())
+
+    def test_lockout_requires_exactly_one_action(self):
+        for flags in ([], ["--last", "--reset-at", "unknown"]):
+            with self.subTest(flags=flags):
+                result = run_crossfeed(["lockout", *flags], env=self.env)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b"usage:", result.stderr)
+                self.assertEqual(load_crossfeed().read_ledger(), [])
+
+    def test_last_lockout_preserves_write_and_session(self):
+        stamp = "2026-11-17T09:00:00Z"
+        result = run_crossfeed(["lockout", "--reset-at", stamp, "--session", "session-1"], env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.last_lockout(), {"reset_at": stamp})
+        self.assertEqual(load_crossfeed().read_ledger()[-1]["session"], "session-1")

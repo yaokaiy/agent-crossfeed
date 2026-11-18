@@ -50,10 +50,11 @@ export function staticSection(script: string): string {
     '- While a write job runs, do not edit files in its directory.',
     `- A Codex result is a claim. Read the change list, run the check as \`python3 -I ${shellQuote(script)} check <job> -- <command>\`, then report.`,
     '- Exit code 75 means Codex is out of quota: do the work yourself.',
+    '- Exit code 127 means the codex CLI was not found: do the work yourself and tell the user.',
   ].join('\n')
 }
 
-export function statusLine(a: { mode: Mode; u?: number; F?: number; w?: number; codexPercent?: number; P: number; reserve: boolean }): string {
+export function statusLine(a: { mode: Mode; u?: number; F?: number; w?: number; codexPercent?: number; codexAvailable?: boolean; codexStale?: boolean; P: number; reserve: boolean }): string {
   if (a.mode === 'off') return 'crossfeed off'
   const parts = [`crossfeed ${a.mode}`]
   if (a.u !== undefined) {
@@ -61,14 +62,17 @@ export function statusLine(a: { mode: Mode; u?: number; F?: number; w?: number; 
     parts.push(`claude 5h ${Math.round(a.u)}%${pace}`)
   }
   if (a.w !== undefined) parts.push(`7d ${Math.round(a.w)}%`)
-  if (a.codexPercent !== undefined) parts.push(`codex wk ${Math.round(a.codexPercent)}%`)
-  parts.push(parts.length === 1 ? 'waiting for a reading' : `pressure ${Math.round(a.P * 100) / 100}`)
+  const waiting = parts.length === 1 && a.codexPercent === undefined
+  if (a.codexPercent !== undefined) parts.push(`codex wk ${Math.round(a.codexPercent)}%${a.codexStale ? ' stale' : ''}`)
+  else if (!a.codexAvailable) parts.push('codex unavailable')
+  else if (a.codexStale) parts.push('codex stale')
+  parts.push(waiting ? 'waiting for a reading' : `pressure ${Math.round(a.P * 100) / 100}`)
   if (a.reserve) parts.push('reserve')
   return parts.join(' · ')
 }
 
-export function stretchReminder(a: { calls: number; u: number; script: string }): string {
-  return `crossfeed: ${a.calls} main-loop tool calls since the last user prompt; Claude 5h ${Math.round(a.u)}%. Hand self-contained work to Codex with python3 -I ${shellQuote(a.script)} run and the full brief on stdin. Start it as a background Bash command, wait for the exit notification, and check the result.`
+export function stretchReminder(a: { calls: number; u: number; script: string; session?: string }): string {
+  return `crossfeed: ${a.calls} main-loop tool calls since the last user prompt; Claude 5h ${Math.round(a.u)}%. Hand self-contained work to Codex with python3 -I ${shellQuote(a.script)} run${a.session === undefined ? '' : ' --session ' + shellQuote(a.session)} and the full brief on stdin. The job is read-only unless --write is added. Start it as a background Bash command, wait for the exit notification, and check the result.`
 }
 
 export function pressureNotice(a: { u: number; F?: number; P: number }): string {
