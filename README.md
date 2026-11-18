@@ -25,7 +25,7 @@ flowchart TD
     S(["Claude wants to<br/>start a subagent"]) --> F{{"Task fit<br/>(keyword rules)"}}
     F -- "C: design, UX, naming" --> CL["Stays on Claude"]
     F -- "A: implementation with<br/>a check command" --> H{{"Plenty of Codex<br/>headroom left?"}}
-    F -- "B: research, review,<br/>everything else" --> P{{"Pressure high, or<br/>a subagent burst?"}}
+    F -- "B: research, review,<br/>everything else" --> P{{"Pressure high,<br/>or a burst<br/>of subagents?"}}
     H -- "yes" --> CX["Handed off to<br/>the Codex CLI"]
     H -- "no" --> CL
     P -- "yes, and Codex has room" --> CX
