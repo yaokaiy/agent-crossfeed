@@ -4,7 +4,7 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.1.1 - 2026-11-17
+## 0.1.1 - 2026-11-18
 
 ### Fixed
 
@@ -39,12 +39,15 @@ All notable changes to this project are recorded here. The format follows
   whichever comes first. A refused tool call or a slash command does not
   carry them.
 - Include the session id in lockout records from the plugin.
+- The plugin description and the README lead with what the plugin does:
+  routing subagent calls from Claude Code to Codex, call by call.
 
 ### Added
 
 - `app_server_error` on every dispatcher quota response, preserving a bounded,
   single-line failure reason even when a session-log reading is available.
 - `lockout --last` to read the newest lockout record with a valid reset time.
+- A plugin icon.
 
 ## 0.1.0 - 2026-11-17
 
