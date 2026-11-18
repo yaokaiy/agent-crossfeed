@@ -22,10 +22,10 @@ work and talking to you, and is told to check what comes back.
 
 ```mermaid
 flowchart TD
-    S(["Claude is about to start a general-purpose subagent"]) --> F{{"Task fit<br/>(keyword rules)"}}
+    S(["Claude wants to<br/>start a subagent"]) --> F{{"Task fit<br/>(keyword rules)"}}
     F -- "C: design, UX, naming" --> CL["Stays on Claude"]
     F -- "A: implementation with<br/>a check command" --> H{{"Plenty of Codex<br/>headroom left?"}}
-    F -- "B: research, review,<br/>everything else" --> P{{"Pressure high, or a burst<br/>of subagents?"}}
+    F -- "B: research, review,<br/>everything else" --> P{{"Pressure high, or<br/>a subagent burst?"}}
     H -- "yes" --> CX["Handed off to<br/>the Codex CLI"]
     H -- "no" --> CL
     P -- "yes, and Codex has room" --> CX
