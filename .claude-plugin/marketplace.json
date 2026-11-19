@@ -1,6 +1,6 @@
 {
   "name": "agent-crossfeed",
-  "description": "Dynamic subagent routing from Claude Code to Codex: picks, call by call, which subagent work to hand to the Codex CLI, based on task fit, how fast Claude's 5-hour window is filling, and Codex headroom.",
+  "description": "Dynamic subagent routing from Claude Code to Codex: picks, call by call, which subagent work to hand to the Codex CLI or to a cheaper Claude model, based on task fit, how fast Claude's 5-hour window and model weekly limits are filling, and Codex headroom.",
   "owner": { "name": "yaokaiy" },
   "plugins": [{ "name": "agent-crossfeed", "source": "./" }]
 }

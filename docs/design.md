@@ -16,21 +16,33 @@ crossfeed moves execution work to the Codex CLI before the window fills.
 Claude keeps coordinating the work, talking to the user and reviewing what
 comes back.
 
+A second limit works the same way. Some Claude models have their own weekly
+limit on top of the all-model one (Claude Code's `/usage` lists them as
+"Current week (Fable)", for example). That limit can run out days before
+the week resets while the all-model week, the 5-hour window and Codex all
+have room left. Much of what uses it is subagents that never asked for that
+model and inherited it from the main loop. crossfeed watches these limits
+too: while one is being used faster than an even pace, execution goes to
+Codex or to a cheaper Claude model, and the scarce model is kept for
+judgment.
+
 ## Goals and non-goals
 
 Goals:
 
 1. Fewer and shorter 5-hour lockouts for the same work, shown by numbers.
-2. No setup beyond installing: no edits to settings, the status line or
+2. Fewer weeks in which a model's own weekly limit runs out before its
+   reset, and fewer hours without that model, for the same work.
+3. No setup beyond installing: no edits to settings, the status line or
    instruction files.
-3. Every job the dispatcher finishes leaves a record: what ran, how long it
+4. Every job the dispatcher finishes leaves a record: what ran, how long it
    took, how many Codex tokens it used, and, when a check was run, whether
    it passed.
 
 Non-goals:
 
-- It is not a model router. It never changes which model serves Claude
-  Code's own requests.
+- It never changes the main loop's model or the advisor setting; it can
+  suggest them. It changes a subagent's model only as section 5 says.
 - No daemon, no database, no MCP server.
 - One executor for now, the Codex CLI.
 - No quota estimates from token counts. Only readings the vendors report.
@@ -171,12 +183,87 @@ could be handed off. After a failed read the plugin waits 5 minutes before
 trying again. A reading whose age is missing or not a number, or that is
 dated more than 5 minutes ahead of the clock, counts as no reading.
 
+### 5. Model limits: is one model's weekly limit going too fast?
+
+**Reading.** The plugin API reports only the 5-hour and all-model weekly
+windows. Model-scoped weekly limits appear in Claude Code's `/usage`, which
+reads them from the server without a model call. The dispatcher's
+`claude-usage` runs `claude -p /usage --output-format json
+--no-session-persistence --setting-sources project` from the data
+directory (no transcript is kept, and no user plugin loads in that process)
+with a 20-second limit, and parses each `Current week (<label>): <n>% used
+· resets <time>` line whose label is not `all models`. The label's model
+family is the first of fable, opus, sonnet, haiku it contains. Results are
+cached in the data directory for 5 minutes, failures for 1 minute, and
+shared by all sessions; a file lock lets only one session run the probe at
+a time.
+
+The plugin reads at session start; before a subagent decision and on a
+usage update, when its reading is more than 10 minutes old and its last
+attempt was more than 10 minutes ago; and, bypassing the cache, after a
+turn ends with a rate-limit error.
+
+**State.** For a limit at `q` percent with reset time `T`, the even-pace
+line is `L = 100 * (1 - (T - now) / 7 days)`, clamped to [0, 100]. `T` is
+the limit's own reset time, else the all-model weekly reset time Claude
+reports. The limit is
+
+- `unknown` when there is no reading, or it is more than 20 minutes old or
+  dated more than 5 minutes ahead of the clock, or `T` has passed (the
+  reading belongs to a week that has ended; a cached reading in that state
+  is not reused either);
+- `full` at `q >= 100`;
+- `ahead` at `q >= 80`, or at `q >= L + 5` when `T` is known;
+- `ok` otherwise.
+
+Only `ahead` and `full` change anything; `unknown` acts like `ok`, since
+there is no evidence that the model is short. The thresholds were chosen by
+replaying three past weeks of one user's logs; they are heuristics.
+
+A subagent call "would run on" a model family when it names a model of
+that family, or names none and the main loop runs on that family.
+
+**Effects while a family is `ahead` or `full`:**
+
+- A subagent call that would run on it is decided with `P` taken as at
+  least 0.3, so tier B goes to Codex when `g > 0`; tier A keeps its own
+  rule. The known limit also stands in for a missing Claude reading. When
+  the limit is what moved a tier B call (pressure without it is below
+  0.3), the command carries `--cause limit` and the job record keeps it.
+- A subagent that still starts on Claude runs on the `premiumFallback`
+  model (default `opus`; empty turns this off) when its type is
+  `general-purpose` or `claude`, it is not a fork, and either it named no
+  model (or `inherit`) or the family is `full` (a call that names a full
+  model would fail). The fallback must be of a cheaper family (haiku <
+  sonnet < opus < fable) that is not itself `ahead` or `full`; otherwise
+  nothing is rewritten. The list of types is fixed: both inherit the
+  parent's model, while other types may set their own, which the plugin
+  cannot see, and rewriting those could make them more expensive. The
+  plugin records a rewrite only when the started subagent's model is of
+  the fallback's family; the engine can ignore a rewrite, for example for
+  a resumed agent.
+- When the main loop runs on that family, one notice per session when it
+  becomes `ahead` and one when it becomes `full`, delivered like the
+  notices below. It asks the model to keep planning, decisions and review,
+  to hand execution to Codex, and to tell the user once about `/model
+  <fallback>` with `/advisor <family>` (Claude Code's own setting for
+  consulting a stronger model at key moments); without a usable fallback
+  it suggests neither. A notice counts as sent only once it is delivered.
+  The long-stretch reminder also fires while that family is `ahead` or
+  `full`.
+- After a rate-limit error, if the main loop's family is at 100% on a
+  fresh reading, the ledger gets a lockout record for that limit, once
+  per limit and reset time per session. These records never count as
+  5-hour lockouts.
+
 ### The decision
 
 In this order: mode `off` hands nothing off; so does a missing Claude
-reading (unknown is not free capacity); so does `g = 0`; tier C stays; mode
+reading (unknown is not free capacity) unless the call would run on a
+model limit that is `ahead` or `full`; so does `g = 0`; tier C stays; mode
 `always` hands off every remaining call; tier A goes when `g >= 0.5`; tier B
-goes when `P >= 0.3`, which a burst (section 3) can supply.
+goes when `P >= 0.3`, which a burst (section 3) or a model limit (section
+5) can supply.
 
 Two more signals reach the model, each once per window or stretch:
 
@@ -185,8 +272,14 @@ Two more signals reach the model, each once per window or stretch:
   user's next prompt, whichever comes first. A refused tool call, a slash
   command and a meta prompt do not carry it;
 - after `stretchCalls` hands-on tool calls (default 12) with no user prompt
-  in between, while `P >= 0.3`, one reminder is attached to a tool result.
-  Refused calls are not counted.
+  in between, while `P >= 0.3` or the main loop's model limit is `ahead`
+  or `full`, one reminder is attached to a tool result. Refused calls are
+  not counted.
+
+Notices and the stretch count belong to a conversation. Claude Code reports
+`/clear` and a resume as the end of a session without a new start; after
+either, they begin again, and later commands and records carry the new
+session id. Readings and the pressure state are kept.
 
 ## What a hand-off looks like
 
@@ -261,8 +354,14 @@ plugin.
   directories outside git get no change list.
 - **Ledger.** `ledger.jsonl` in the data directory, append-only, written
   under a file lock: one line when a job ends, one per check, one per
-  lockout. A check records the program's name, not its arguments.
-  `lockout --last` prints the reset time of the newest lockout that has one.
+  lockout, one per subagent moved to a cheaper model (`downgrade`). A check
+  records the program's name, not its arguments. A lockout written with
+  `--bucket <label>` is a model-limit lockout. `lockout --last` prints the
+  reset time of the newest 5-hour lockout that has one. `run --cause
+  <word>` stores why a job was handed off.
+- **Claude usage.** `claude-usage` reads model-scoped weekly limits as
+  section 5 says. It finds Claude Code through `$CROSSFEED_CLAUDE`, then
+  `PATH`, then `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`.
 - **Quota.** `quota` asks `codex app-server` for the account's rate limits,
   with no model turn. If that fails it reads the last rate-limit event in
   the newest 8 Codex session logs and reports its age and the app server's
@@ -306,7 +405,10 @@ If a hook throws, it logs the failure and lets the original event continue.
   lost;
 - **jobs** by outcome, Codex tokens, and median job time;
 - **checks**: for each tier, how many jobs' first recorded check passed, and
-  how many jobs have no check.
+  how many jobs have no check;
+- **model limits**: lockouts per limit and the time from each to its reset;
+  subagents moved to a cheaper model; jobs handed off because of a model
+  limit.
 
 Compare a week with crossfeed against a week without. Time locked out
 should fall; most checked jobs should pass their first check in each tier;
@@ -328,10 +430,19 @@ change the options or open an issue with the numbers.
   poor result.
 - Claude's reading comes from its last API response and Codex's from its
   app server, with a session-log fallback. Either can be missing; then
-  nothing is handed off.
+  nothing is handed off, except that a fresh model-limit reading that is
+  `ahead` or `full` stands in for a missing Claude reading (section 5).
 - Calls are counted per session. Subagents started from two sessions at
   the same time are not seen as one burst, and subagents that are already
   running cannot be moved.
+- Model limits are parsed from text Claude Code prints for people. A change
+  in that text makes the reading fail (no limit is acted on) until the
+  parser is updated. A feature request to expose these limits to plugins
+  would remove the parser.
+- The main loop's own use of a scarce model is most of it. The plugin only
+  asks the model to hand off execution and suggests `/model` and
+  `/advisor`; the user decides. Whether advisor calls count toward the
+  advised model's weekly limit has not been measured.
 
 ## Planned
 

@@ -4,7 +4,7 @@
 
 <h1 align="center">agent-crossfeed</h1>
 
-<p align="center"><strong>Dynamic subagent routing from Claude Code to Codex.</strong></p>
+<p align="center"><strong>Dynamic subagent routing from Claude Code to Codex, paced by Claude's usage limits.</strong></p>
 
 <p align="center">
   <a href="https://github.com/yaokaiy/agent-crossfeed/actions/workflows/ci.yml"><img src="https://github.com/yaokaiy/agent-crossfeed/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
@@ -19,6 +19,12 @@ Claude's 5-hour window is filling, and how much Codex quota is left. When
 the work should move, crossfeed refuses the subagent call and hands Claude
 one command that runs the same brief on Codex. Claude keeps planning the
 work and talking to you, and is told to check what comes back.
+
+It also watches Claude's model-scoped weekly limits, such as the one
+Claude Code's `/usage` shows for Fable. While one is being used faster than
+an even pace, subagents that would run on that model go to Codex or run on
+a cheaper Claude model, and the main loop is asked to keep the scarce model
+for planning, decisions and review.
 
 ```mermaid
 flowchart TD
@@ -43,6 +49,12 @@ Claude's 5-hour usage window stops every Claude session when it fills. Much
 of what fills it is execution: subagents, and long runs of commands and
 edits. Several subagents started together can fill a window within half an
 hour.
+
+Some models also have a weekly limit of their own. In one heavy user's logs
+it ran out before its reset three weeks in a row, once 2.3 days into the
+week while the all-model week was at 54%. In that week about 28% of the
+model's use (weighted by API prices) came from subagents that never asked
+for it and inherited it from the main loop.
 
 If you also pay for Codex, that quota may be sitting unused while Claude is
 locked. A usage meter shows you this, and a delegation command lets you
@@ -135,7 +147,7 @@ records pass or fail, and then to report to you.
 
 ## How it routes
 
-For each subagent call crossfeed asks three questions.
+For each subagent call crossfeed asks four questions.
 
 1. **Fit.** What kind of task is this? The answer comes from keyword rules
    on the call's description and brief.
@@ -157,6 +169,21 @@ For each subagent call crossfeed asks three questions.
    85%. Tier A work stops moving when it drops below one half and tier B
    when it reaches 0, which leaves quota for your own Codex work. A job
    that is already running is not stopped.
+
+4. **Model limits.** Is a model's own weekly limit going too fast?
+   crossfeed reads these limits from Claude Code's `/usage` (no model call)
+   every 10 minutes or so while you work. A limit counts as ahead when its
+   use is 5 points past an even pace for the week, or at 80%. Then a
+   subagent call that would run on that model is decided as if pressure
+   were 0.3, so tier B work goes to Codex. A `general-purpose` or `claude`
+   subagent that stays on Claude and named no model runs on the
+   `premiumFallback` model instead (Opus by default), but only when that
+   model is cheaper (Haiku, then Sonnet, Opus, Fable) and its own limit is
+   not ahead too; once the limit is used up, so does one that named it. When your main loop runs on that
+   model, Claude gets one notice asking it to keep the model for planning,
+   decisions and review, and to tell you once about `/model opus` with
+   `/advisor` (Claude Code's setting for consulting a stronger model at key
+   moments). crossfeed never switches your main model itself.
 
 The forecast cannot see subagents that have just started, so two more
 rules apply. Once two calls that could have been handed off (tier A or B)
@@ -182,7 +209,10 @@ The exact rules and formulas are in [docs/design.md](docs/design.md).
   handed off now, and why the last call was or was not.
 - A one-line notice to Claude when pressure first reaches the level at
   which tier B work moves and when the window reaches 90%, and a reminder
-  after a long run of hands-on tool calls while pressure is high.
+  after a long run of hands-on tool calls while pressure is high or the
+  main loop's model limit is ahead.
+- Subagents moved off a model whose weekly limit is ahead, each one logged
+  and recorded.
 - A local record of every finished job: how long it took, the Codex token
   count it reported, and, when a check was run, whether it passed.
   `/crossfeed report` sums up the last 7 days, including the lockouts it
@@ -198,14 +228,16 @@ The exact rules and formulas are in [docs/design.md](docs/design.md).
 | Command | Effect |
 | --- | --- |
 | `/crossfeed` or `/crossfeed status` | readings, pressure, what would be handed off now, and why the last subagent call was or was not handed off |
-| `/crossfeed report` | the last 7 days: lockouts seen, jobs, tokens, results of the first check recorded for each job |
+| `/crossfeed report` | the last 7 days: lockouts seen (5-hour and model limits), subagents moved to a cheaper model, jobs, tokens, results of the first check recorded for each job |
 | `/crossfeed always` | hand off every tier A and B call while Codex has room (this session) |
 | `/crossfeed auto` | back to the default (this session) |
 | `/crossfeed off` | stop steering, keep the record (this session) |
 
 When Codex's quota cannot be read the status line says `codex unavailable`,
 and a reading older than 15 minutes is marked `stale`. Nothing is handed
-off in either state.
+off in either state. A model limit appears in the status line, as
+`fable wk 62% ahead` for example, when your main loop runs on that model or
+the limit is ahead or used up.
 
 ## Options
 
@@ -216,7 +248,8 @@ Set them with `/plugin configure agent-crossfeed@agent-crossfeed`.
 | `mode` | `auto` | `auto`, `always` or `off` |
 | `effort` | `high` | Codex reasoning effort for hand-offs |
 | `model` | empty | Codex model; empty uses your Codex configuration |
-| `eligibleTypes` | `general-purpose,claude` | subagent types that may be redirected |
+| `premiumFallback` | `opus` | Claude model for subagents moved off a model whose weekly limit is ahead; empty turns this off |
+| `eligibleTypes` | `general-purpose,claude` | subagent types that may be redirected to Codex |
 | `stretchCalls` | `12` | hands-on tool calls since your last prompt before the one reminder sent while pressure is high |
 | `codexStopPercent` | `85` | Codex weekly use at which hand-offs stop |
 | `timeoutMinutes` | `30` | time limit for one job |
@@ -304,7 +337,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Status and limits
 
-Version 0.1.1 is an early release.
+Version 0.2.0 is an early release.
 
 - Hand-offs aim to make lockouts rarer and later. A before and after count
   is not in yet (see [Measured so far](#measured-so-far)), and what the
@@ -323,7 +356,15 @@ Version 0.1.1 is an early release.
 - Running the command in the background and checking the result are
   instructions to the model, not something the plugin can enforce.
 - The pressure controller's constants were calculated, not tuned on
-  measurements, and most are fixed in code.
+  measurements, and most are fixed in code. The model-limit thresholds
+  come from replaying three weeks of one user's logs.
+- Model limits are read from text Claude Code prints for people. If the
+  lines crossfeed reads change, it stops seeing model limits until it is
+  updated. If only a reset time cannot be read, it uses the all-model
+  weekly reset time, or acts only from 80% when there is none.
+- Most of a scarce model's use is usually the main loop, which crossfeed
+  does not move. Whether `/advisor` calls count toward the advised model's
+  weekly limit has not been measured.
 - Continuing a task on Codex after Claude is locked out is planned and not
   in this version.
 

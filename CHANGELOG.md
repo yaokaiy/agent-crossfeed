@@ -4,6 +4,41 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.2.0 - 2026-11-19
+
+### Added
+
+- Model-scoped weekly limits. The dispatcher's new `claude-usage` command
+  reads them from Claude Code's `/usage` without a model call (cached for 5
+  minutes, shared by sessions). A limit is `ahead` at 80%, or 5 points past
+  an even pace for its week, and `full` at 100%.
+- While a limit is `ahead` or `full`: subagent calls that would run on that
+  model are decided with pressure of at least 0.3, so tier B work goes to
+  Codex; `general-purpose` and `claude` subagents that stay on Claude and
+  named no model run on the new `premiumFallback` option's model (default
+  `opus`) when it is a cheaper model whose own limit is not ahead, and once
+  the limit is full so do ones that named it; when the main loop runs on
+  that model, Claude gets one notice and the long-stretch reminder, and is
+  asked to tell the user about `/model` with `/advisor`. A reading taken
+  before the limit's reset stops counting once the reset passes.
+- The status line shows a model limit (`fable wk 62% ahead`) when the main
+  loop runs on that model or the limit is ahead or full. `/crossfeed status`
+  lists each limit with its even-pace line and what happens to subagents.
+- Ledger: model-limit lockouts (`lockout --bucket`), subagents moved to a
+  cheaper model (`downgrade`), and the cause of a hand-off (`run --cause`).
+  `/crossfeed report` shows all three.
+
+### Changed
+
+- `lockout --last` and the 5-hour lockout count ignore model-limit lockouts.
+
+### Fixed
+
+- After `/clear` or a resume, notices and the long-stretch reminder start
+  over and later hand-off commands and records carry the new session id.
+  Before, the plugin kept the previous conversation's state, because
+  Claude Code starts no new session for these.
+
 ## 0.1.1 - 2026-11-18
 
 ### Fixed
