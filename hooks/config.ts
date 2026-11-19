@@ -4,6 +4,7 @@ export type Config = {
   mode: Mode
   effort: string
   model: string
+  premiumFallback: string
   eligibleTypes: string[]
   stretchCalls: number
   codexStopPercent: number
@@ -14,6 +15,7 @@ export const DEFAULTS: Config = {
   mode: 'auto',
   effort: 'high',
   model: '',
+  premiumFallback: 'opus',
   eligibleTypes: ['general-purpose', 'claude'],
   stretchCalls: 12,
   codexStopPercent: 85,
@@ -29,6 +31,7 @@ export function toConfig(options: Record<string, unknown> | undefined): Config {
   return {
     mode: values.mode === 'auto' || values.mode === 'always' || values.mode === 'off' ? values.mode : DEFAULTS.mode,
     effort: typeof values.effort === 'string' ? values.effort : DEFAULTS.effort,
+    premiumFallback: typeof values.premiumFallback === 'string' ? values.premiumFallback : DEFAULTS.premiumFallback,
     model: typeof values.model === 'string' ? values.model : DEFAULTS.model,
     eligibleTypes: typeof values.eligibleTypes === 'string'
       ? values.eligibleTypes.split(',').map(type => type.trim()).filter(type => type.length > 0)

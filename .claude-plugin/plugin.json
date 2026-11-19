@@ -37,6 +37,12 @@
       "description": "Model for work handed to Codex. Leave empty to use Codex's own default.",
       "default": ""
     },
+    "premiumFallback": {
+      "type": "string",
+      "title": "Fallback model for scarce models",
+      "description": "Model for subagents moved off a model whose weekly limit is ahead of pace. Leave empty to turn this off.",
+      "default": "opus"
+    },
     "eligibleTypes": {
       "type": "string",
       "title": "Eligible agent types",

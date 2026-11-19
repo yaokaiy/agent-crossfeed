@@ -1,4 +1,5 @@
 import { expect, test } from 'claude-code/testing'
+import { toConfig } from '../../hooks/config'
 import * as textBuilders from '../../hooks/text'
 import { denyText, dispatchCommand, pressureNotice, reserveNotice, shellQuote, staticSection, statusLine, stretchReminder } from '../../hooks/text'
 
@@ -61,6 +62,7 @@ test('staticSection reproduces the fixed copy exactly', async () => {
     '- Start the command as a background Bash command. You are notified when it exits. Never poll, sleep, or read its output early.',
     '- Hand off only work the brief describes in full: goal, paths, constraints, the check command, the format of the answer. Codex sees none of this conversation.',
     '- Keep design, architecture and UX decisions, talking with the user, and edits under about 20 lines for yourself.',
+    "- When crossfeed says a model's weekly limit is ahead of pace, keep planning, decisions and review yourself and hand execution to Codex.",
     '- While a write job runs, do not edit files in its directory.',
     "- A Codex result is a claim. Read the change list, run the check as `python3 -I '/x/crossfeed.py' check <job> -- <command>`, then report.",
     '- Exit code 75 means Codex is out of quota: do the work yourself.',
@@ -182,4 +184,78 @@ test('heredoc delimiters avoid every substring collision, including repeated can
       brief += '\r\nprefix' + delimiter + 'suffix'
     }
   }
+})
+
+const limit = { label: 'Fable', family: 'fable', percent: 62, line: 33, resetsAt: Date.parse('2026-11-23T22:00:00Z'), state: 'ahead' as const }
+
+test('model limits appear after seven-day usage and omit unknown readings', async () => {
+  const input = { mode: 'auto' as const, u: 40, w: 55, codexPercent: 27, P: 0, reserve: false }
+  expect(statusLine({ ...input, limits: [limit] })).toBe('crossfeed auto · claude 5h 40% · 7d 55% · fable wk 62% ahead · codex wk 27% · pressure 0')
+  expect(statusLine({ ...input, limits: [{ ...limit, state: 'unknown' }] })).toBe(statusLine(input))
+  expect(statusLine({ ...input, limits: [{ ...limit, state: 'full' }] }).includes('fable wk 62% full')).toBe(true)
+})
+
+test('limit refusals explain the cause and place it immediately after kind', async () => {
+  const input = { tier: 'B' as const, reason: 'no check command', u: 10, command, saved: true, limit }
+  expect(denyText(input).includes('Fable weekly 62% used, ahead of an even pace (33%).')).toBe(true)
+  expect(denyText({ ...input, limit: { ...limit, state: 'full' } }).includes('Fable weekly 62% used, limit used up.')).toBe(true)
+  expect(denyText({ ...input, limit: { ...limit, line: undefined } }).includes('Fable weekly 62% used.')).toBe(true)
+  expect(dispatchCommand({ ...dispatch, cause: 'limit' }).includes('--kind subagent --cause limit --dir')).toBe(true)
+  expect(dispatchCommand({ ...dispatch, cause: 'x;$(echo y)' }).includes("--cause 'x;$(echo y)' --dir")).toBe(true)
+})
+
+test('ahead and full notices preserve labels and include reset and model advice', async () => {
+  for (const state of ['ahead', 'full'] as const) {
+    const note = textBuilders.limitNotice({ ...limit, state, fallback: 'opus' })
+    for (const part of ['Fable', '62%', '2026-11-23 22:00 UTC', '/model opus', '/advisor fable']) expect(note.includes(part)).toBe(true)
+    const unknown = textBuilders.limitNotice({ ...limit, state, resetsAt: undefined, line: undefined, fallback: 'opus' })
+    expect(unknown.includes('undefined')).toBe(false)
+    expect(unknown.includes('UTC')).toBe(false)
+  }
+  expect(textBuilders.limitNotice({ ...limit, label: 'Fable · beta', fallback: 'opus' }).includes('Fable · beta')).toBe(true)
+  for (const [label, family, advisor] of [['Sonnet only', 'sonnet', '/advisor sonnet'], ['Gizmo', undefined, undefined], ['Haiku', 'haiku', undefined]] as const) {
+    for (const state of ['ahead', 'full'] as const) {
+      const note = textBuilders.limitNotice({ ...limit, label, family, state, fallback: 'opus' })
+      expect(note.includes('/advisor sonnet only')).toBe(false)
+      expect(note.includes('/advisor')).toBe(advisor !== undefined)
+      if (advisor) expect(note.includes(advisor + ' keeps Sonnet only')).toBe(true)
+    }
+  }
+  expect(textBuilders.limitNotice({ ...limit, fallback: 'opus' }).includes('uses less')).toBe(false)
+  const disabled = textBuilders.limitNotice({ ...limit, fallback: '' })
+  expect(disabled.includes('run on .')).toBe(false)
+  expect(disabled.includes('/model ')).toBe(false)
+  expect(disabled.endsWith(' Subagents that stay on Claude keep their model.')).toBe(true)
+})
+
+test('limit stretch reminders work without a five-hour reading', async () => {
+  const note = stretchReminder({ calls: 12, limit, script: '/x/crossfeed.py' })
+  expect(note.startsWith('crossfeed: 12 main-loop tool calls since the last user prompt; Fable weekly 62% used, ahead of pace.')).toBe(true)
+  expect(note.includes('Claude 5h')).toBe(false)
+  expect(stretchReminder({ calls: 12, limit, u: 0, script: '' }).includes('Claude 5h 0%')).toBe(true)
+})
+
+test('model-limit static guidance appears exactly once after keep-design guidance', async () => {
+  const line = "- When crossfeed says a model's weekly limit is ahead of pace, keep planning, decisions and review yourself and hand execution to Codex."
+  const lines = staticSection('/x/crossfeed.py').split('\n')
+  expect(lines.filter(text => text === line).length).toBe(1)
+  expect(lines[lines.indexOf(line) - 1]?.startsWith('- Keep design')).toBe(true)
+})
+
+test('limitLines describes pace, state, age and routing', async () => {
+  expect(textBuilders.limitLines([{ ...limit, ageSeconds: 40, subagents: 'hand off or run on opus' }])).toEqual([
+    'Fable weekly: 62% used, even pace 33%, ahead, read 40 seconds ago; subagents on fable: hand off or run on opus',
+  ])
+  expect(textBuilders.limitLines([{ ...limit, line: undefined, ageSeconds: 0, subagents: 'unchanged' }])[0]?.includes('even pace unknown')).toBe(true)
+})
+
+test('limitLines names subagents by model family, not by bucket label', async () => {
+  const [line] = textBuilders.limitLines([{ label: 'Sonnet only', family: 'sonnet', percent: 85, line: 34, state: 'ahead', ageSeconds: 18, subagents: 'run on opus' }])
+  expect(line?.endsWith('subagents on sonnet: run on opus')).toBe(true)
+})
+
+test('premiumFallback defaults only non-string inputs', async () => {
+  expect(toConfig({ premiumFallback: 3 }).premiumFallback).toBe('opus')
+  expect(toConfig({ premiumFallback: '' }).premiumFallback).toBe('')
+  expect(toConfig({}).premiumFallback).toBe('opus')
 })

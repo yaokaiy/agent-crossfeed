@@ -309,3 +309,204 @@ test('describe remembers the last actual decision and preserves policy reasons',
   core.route(A, BASE)
   expect(last()).toBe('last subagent call: stayed on Claude (Codex headroom is low)')
 })
+
+const LIMIT_RESET = Date.parse('2026-11-23T22:00:00Z')
+const SPAWN = { subagentType: 'general-purpose', fork: false, parentModel: 'claude-fable-5-2' }
+function limitCore(percent = 62, main = 'claude-fable-5-2', age = 0, fiveHour: number | undefined = 10) {
+  const core = createCore(DEFAULTS, SCRIPT)
+  if (fiveHour !== undefined) measure(core, fiveHour)
+  core.setCodex(codex())
+  core.setMainModel(main, BASE)
+  core.setUsage({ readAt: BASE - age, buckets: [{ label: 'Fable', family: 'fable', usedPercent: percent, resetsAt: BASE + 4.5 * 1440 * MINUTE }] }, undefined, BASE)
+  return core
+}
+
+test('a tier B call on an ahead model is handed off at low pressure, including before five-hour data', async () => {
+  for (const fiveHour of [10, undefined, 80]) {
+    const core = limitCore(62, 'claude-fable-5-2', 0, fiveHour)
+    // Explicit undefined must remove the helper default's five-hour reading.
+    if (fiveHour === undefined) core.measure({}, BASE)
+    const route = core.route(B, BASE)
+    expect(route?.tier).toBe('B')
+    const denial = core.denial(route!, B, CWD, BASE)
+    expect(denial.includes('Fable weekly 62% used')).toBe(true)
+    expect(denial.includes('--cause limit')).toBe(fiveHour !== 80)
+  }
+  for (const [main, age] of [['claude-opus-5-5', 0], ['fable', 21 * MINUTE], ['fable', -6 * MINUTE]] as const) {
+    const core = limitCore(62, main, age)
+    expect(core.route(B, BASE)).toBe(undefined)
+    expect(core.lastDecision().includes('pressure is low')).toBe(true)
+  }
+  expect(limitCore(62, 'opus').route({ ...B, model: 'Fable 5.2' }, BASE)?.tier).toBe('B')
+  expect(limitCore().route({ ...B, model: 'opus' }, BASE)).toBe(undefined)
+})
+
+test('tier A keeps its headroom rule while Fable is ahead', async () => {
+  const core = limitCore()
+  core.setCodex({ ...codex(), windows: [{ minutes: 10080, usedPercent: 77, resetsAt: BASE + 7 * 1440 * MINUTE }] })
+  expect(core.route(A, BASE)).toBe(undefined)
+  expect(core.lastDecision().includes('headroom is low')).toBe(true)
+  expect(core.route(B, BASE)?.tier).toBe('B')
+})
+
+test('spawnModel uses the event parent and protects custom agent definitions', async () => {
+  const core = limitCore()
+  expect(core.spawnModel(SPAWN, BASE)).toEqual({ model: 'opus', from: 'claude-fable-5-2', bucket: 'Fable', percent: 62 })
+  expect(core.spawnModel({ ...SPAWN, subagentType: 'Explore' }, BASE)).toBe(undefined)
+  expect(core.spawnModel({ ...SPAWN, parentModel: 'opus' }, BASE)).toBe(undefined)
+  core.setMainModel('opus', BASE)
+  expect(core.spawnModel(SPAWN, BASE)?.model).toBe('opus')
+  expect(core.spawnModel(SPAWN, BASE + 21 * MINUTE)).toBe(undefined)
+})
+
+test('limit notices fire once per family and state, including a later main-model change', async () => {
+  const core = limitCore()
+  const usage = { readAt: BASE, buckets: [{ label: 'Fable', family: 'fable' as const, usedPercent: 62, resetsAt: LIMIT_RESET }] }
+  expect(core.takeNotices().length).toBe(1)
+  core.setUsage(usage, undefined, BASE)
+  expect(core.takeNotices()).toEqual([])
+  core.setUsage({ ...usage, buckets: [{ ...usage.buckets[0]!, usedPercent: 100 }] }, undefined, BASE)
+  expect(core.takeNotices()[0]?.includes('limit is used up')).toBe(true)
+  core.setMainModel('opus', BASE)
+  expect(core.takeNotices()).toEqual([])
+  const switched = limitCore(62, 'opus')
+  expect(switched.takeNotices()).toEqual([])
+  switched.setMainModel('fable', BASE)
+  expect(switched.takeNotices().length).toBe(1)
+  const off = createCore({ ...DEFAULTS, mode: 'off' }, SCRIPT)
+  off.setMainModel('fable', BASE)
+  off.setUsage(usage, undefined, BASE)
+  expect(off.takeNotices()).toEqual([])
+  expect(off.spawnModel(SPAWN, BASE)).toBe(undefined)
+})
+
+test('stretch reminder fires on an ahead limit once per stretch without five-hour pressure', async () => {
+  const core = limitCore()
+  core.takeNotices()
+  for (let i = 0; i < 11; i++) expect(core.toolCall('Read', false)).toBe(undefined)
+  expect(core.toolCall('Read', false)?.includes('Fable weekly 62% used')).toBe(true)
+  expect(core.toolCall('Read', false)).toBe(undefined)
+  core.userPrompt()
+  core.measure({}, BASE)
+  for (let i = 0; i < 11; i++) core.toolCall('Read', false)
+  expect(core.toolCall('Read', false)?.includes('Fable weekly 62% used')).toBe(true)
+})
+
+test('bucketLockout is separate from five-hour pressure and deduplicates bucket and reset', async () => {
+  const core = limitCore(100)
+  const usage = { readAt: BASE, buckets: [{ label: 'Fable', family: 'fable' as const, usedPercent: 100, resetsAt: LIMIT_RESET }] }
+  core.setUsage(usage, undefined, BASE)
+  expect(core.bucketLockout(BASE)).toEqual({ bucket: 'Fable', resetAt: '2026-11-23T22:00:00.000Z' })
+  expect(core.bucketLockout(BASE)).toBe(undefined)
+  core.setUsage({ ...usage, buckets: [{ ...usage.buckets[0]!, resetsAt: undefined }] }, undefined, BASE)
+  expect(core.bucketLockout(BASE)).toEqual({ bucket: 'Fable', resetAt: 'unknown' })
+  core.setMainModel('opus', BASE)
+  expect(core.bucketLockout(BASE)).toBe(undefined)
+  measure(core, 2, LIMIT_RESET, LIMIT_RESET + 300 * MINUTE)
+  expect(core.status(LIMIT_RESET).endsWith('pressure 0')).toBe(true)
+})
+
+test('limit status and description show state, fallback routing and bounded probe problems', async () => {
+  const core = limitCore()
+  expect(core.status(BASE).includes('fable wk 62% ahead')).toBe(true)
+  expect(core.describe(BASE).includes('subagents on fable: hand off or run on opus')).toBe(true)
+  expect(core.describe(BASE).includes('usage reading age: 0 seconds')).toBe(true)
+  core.setCodex(undefined)
+  expect(core.describe(BASE).includes('subagents on fable: run on opus')).toBe(true)
+  core.setUsage(undefined, 'broken\r\n检查', BASE)
+  expect(core.spawnModel(SPAWN, BASE)).toBe(undefined)
+  expect(core.takeNotices()).toEqual([])
+  expect(core.usageAge(BASE)).toBe(Infinity)
+  expect(core.describe(BASE).includes('usage reading age: never read (broken 检查)')).toBe(true)
+})
+
+test('bucket reset wins over seven-day reset and unknown families never steer', async () => {
+  const core = limitCore(40)
+  core.measure({ sevenDay: { percentUsed: 10, resetsAt: BASE + 7 * 1440 * MINUTE } }, BASE)
+  expect(core.spawnModel(SPAWN, BASE)).toBe(undefined)
+  core.setUsage({ readAt: BASE, buckets: [{ label: 'Fable', family: 'fable', usedPercent: 40 }] }, undefined, BASE)
+  expect(core.spawnModel(SPAWN, BASE)?.model).toBe('opus')
+  core.setUsage({ readAt: BASE, buckets: [{ label: 'Gizmo', usedPercent: 100 }] }, undefined, BASE)
+  expect(core.route(B, BASE)).toBe(undefined)
+  expect(core.spawnModel(SPAWN, BASE)).toBe(undefined)
+})
+
+test('stale limit notices and stretch reminders are not delivered later', async () => {
+  const core = limitCore()
+  expect(core.takeNotices(BASE + 21 * MINUTE)).toEqual([])
+  for (let i = 0; i < 12; i++) expect(core.toolCall('Read', false, BASE + 21 * MINUTE)).toBe(undefined)
+})
+
+test('a dropped full notice can be queued again and is marked only on delivery', async () => {
+  const core = limitCore(100)
+  const now = BASE + 21 * MINUTE
+  expect(core.takeNotices(now)).toEqual([])
+  const fresh = { readAt: now, buckets: [{ label: 'Fable', family: 'fable' as const, usedPercent: 100, resetsAt: LIMIT_RESET }] }
+  core.setUsage(fresh, undefined, now)
+  core.setUsage(fresh, undefined, now)
+  const notes = core.takeNotices(now)
+  expect(notes.length).toBe(1)
+  expect(notes[0]?.includes('Fable weekly limit is used up')).toBe(true)
+  expect(core.takeNotices(now)).toEqual([])
+  core.setUsage({ ...fresh, readAt: now + MINUTE }, undefined, now + MINUTE)
+  expect(core.takeNotices(now + MINUTE)).toEqual([])
+})
+
+test('newConversation resets notices and stretch while retaining readings, pressure, stays and bucket dedupe', async () => {
+  const core = createCore({ ...DEFAULTS, stretchCalls: 2 }, SCRIPT, 'first-session')
+  measure(core, 95)
+  core.setCodex(codex())
+  core.setMainModel('fable', BASE)
+  core.setUsage({ readAt: BASE, buckets: [{ label: 'Fable', family: 'fable', usedPercent: 100, resetsAt: LIMIT_RESET }] }, undefined, BASE)
+  expect(core.takeNotices(BASE).length).toBe(3)
+  expect(core.bucketLockout(BASE)?.bucket).toBe('Fable')
+  core.setCodex(undefined)
+  core.route(B, BASE)
+  core.setCodex(codex())
+  core.toolCall('Read', false, BASE)
+  expect(core.toolCall('Read', false, BASE)?.includes("--session 'first-session'")).toBe(true)
+  const status = core.status(BASE)
+  core.newConversation('second-session')
+  expect(core.status(BASE)).toBe(status)
+  expect(core.usageAge(BASE)).toBe(0)
+  expect(core.codexAge(BASE)).toBe(0)
+  expect(core.describe(BASE).includes('eligible calls stayed on Claude in 10 minutes: 1')).toBe(true)
+  expect(core.bucketLockout(BASE)).toBe(undefined)
+  measure(core, 95)
+  expect(core.takeNotices(BASE).length).toBe(3)
+  expect(core.takeNotices(BASE)).toEqual([])
+  expect(core.toolCall('Read', false, BASE)).toBe(undefined)
+  expect(core.toolCall('Read', false, BASE)?.includes("--session 'second-session'")).toBe(true)
+  expect(agentCall(core, B, CWD, BASE)?.deny.includes("--session 'second-session'")).toBe(true)
+  // Undelivered old pressure/reserve notices must also be discarded.
+  core.newConversation(undefined)
+  measure(core, 95)
+  core.newConversation(undefined)
+  core.setMainModel('opus', BASE)
+  expect(core.takeNotices(BASE)).toEqual([])
+  expect(agentCall(core, B, CWD, BASE)?.deny.includes('--session')).toBe(false)
+})
+
+for (const [family, percent, opusPercent, fallback] of [
+  ['fable', 100, 100, false], ['sonnet', 85, 0, false], ['fable', 62, 0, true],
+] as const) {
+  test(`limit notice recommends only a usable fallback: ${family} ${percent}, opus ${opusPercent}`, async () => {
+    const core = createCore(DEFAULTS, SCRIPT)
+    core.setMainModel(`claude-${family}-5-5`, BASE)
+    core.setUsage({ readAt: BASE, buckets: [
+      { label: family === 'fable' ? 'Fable' : 'Sonnet only', family, usedPercent: percent, resetsAt: LIMIT_RESET },
+      { label: 'Opus', family: 'opus', usedPercent: opusPercent, resetsAt: LIMIT_RESET },
+    ] }, undefined, BASE)
+    const notes = core.takeNotices(BASE)
+    expect(notes.length).toBe(1)
+    const note = notes[0]!
+    expect(note.includes('/model')).toBe(fallback)
+    expect(note.includes('run on opus')).toBe(fallback)
+    if (fallback) {
+      expect(note.includes('/model opus')).toBe(true)
+      expect(note.includes('/advisor fable')).toBe(true)
+    } else if (percent < 100) {
+      expect(note.endsWith(' Subagents that stay on Claude keep their model.')).toBe(true)
+    }
+  })
+}

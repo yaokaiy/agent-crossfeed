@@ -1,9 +1,10 @@
 import type { EngineInterface, HookFailure, Register, SessionRateLimit } from 'claude-code'
+import type { Mode } from './config'
 import { toConfig } from './config'
 import { createCore } from './core'
 import type { Core } from './core'
-import type { ClaudeReading, CodexReading } from './policy'
-import { shortProblem } from './policy'
+import type { ClaudeReading, CodexReading, UsageReading, Family } from './policy'
+import { familyOf, shortProblem } from './policy'
 import { staticSection } from './text'
 
 function logFailure($: EngineInterface, message: string): void {
@@ -36,7 +37,8 @@ function claudeReading(rateLimits: readonly SessionRateLimit[]): ClaudeReading {
       const reset = window.resetsAt === undefined ? undefined : Date.parse(window.resetsAt)
       reading.fiveHour = { percentUsed: window.percentUsed, resetsAt: reset !== undefined && Number.isFinite(reset) ? reset : undefined }
     } else if (window.kind === 'seven_day') {
-      reading.sevenDay = { percentUsed: window.percentUsed }
+      const reset = window.resetsAt === undefined ? undefined : Date.parse(window.resetsAt)
+      reading.sevenDay = { percentUsed: window.percentUsed, resetsAt: reset !== undefined && Number.isFinite(reset) ? reset : undefined }
     }
   }
   return reading
@@ -76,6 +78,45 @@ async function readCodex($: EngineInterface, script: string, now: number): Promi
   }
 }
 
+export async function readUsage($: EngineInterface, script: string, now: number, fresh: boolean): Promise<{ reading?: UsageReading; problem?: string }> {
+  try {
+    const result = await $.process.run(['python3', '-I', script, 'claude-usage', ...(fresh ? ['--fresh'] : [])], { timeoutMs: 25000 })
+    if (result.exitCode !== 0) return { problem: `usage probe exited with code ${result.exitCode}` }
+    if (result.isStdoutTruncated) return { problem: 'usage probe output was truncated' }
+    let value: unknown
+    try { value = JSON.parse(result.stdout.replace(/^\uFEFF/, '')) } catch { return { problem: 'usage probe returned invalid JSON' } }
+    if (!isRecord(value) || (value.source !== 'usage' && value.source !== 'none') || !Array.isArray(value.buckets)) return { problem: 'usage probe returned invalid data' }
+    const age = value.age_s
+    if (typeof age !== 'number' || !Number.isInteger(age) || age < -300 || !Number.isFinite(now - Math.max(0, age) * 1000)) return { problem: 'usage probe returned an invalid age' }
+    if (value.source === 'none') {
+      if (value.buckets.length !== 0 || typeof value.error !== 'string' || !shortProblem(value.error)) return { problem: 'usage probe returned invalid data' }
+      return { problem: shortProblem(value.error) }
+    }
+    if (value.error !== null) return { problem: 'usage probe returned invalid data' }
+    const buckets: UsageReading['buckets'] = []
+    for (const bucket of value.buckets) {
+      if (!isRecord(bucket) || typeof bucket.label !== 'string' || !bucket.label.trim() ||
+          typeof bucket.used_percent !== 'number' || !Number.isFinite(bucket.used_percent) || bucket.used_percent < 0 ||
+          (bucket.family !== null && bucket.family !== 'fable' && bucket.family !== 'opus' && bucket.family !== 'sonnet' && bucket.family !== 'haiku')) return { problem: 'usage probe returned an invalid bucket' }
+      const reset = bucket.resets_at
+      if (reset !== null && (typeof reset !== 'number' || !Number.isFinite(reset * 1000) || Math.abs(reset * 1000) > 8640000000000000)) return { problem: 'usage probe returned an invalid reset time' }
+      buckets.push({ label: bucket.label, family: bucket.family === null ? undefined : bucket.family as Family, usedPercent: bucket.used_percent, resetsAt: reset === null ? undefined : (reset as number) * 1000 })
+    }
+    return { reading: { buckets, readAt: now - Math.max(0, age) * 1000 } }
+  } catch (error) {
+    return { problem: shortProblem(`usage probe failed: ${String(error)}`) }
+  }
+}
+
+// An unknown main model only means no model-limit steering, never a skipped reading.
+async function mainModel($: EngineInterface): Promise<string | undefined> {
+  try { return await $.session.model() } catch { return undefined }
+}
+
+async function sessionId($: EngineInterface): Promise<string | undefined> {
+  try { return await $.session.id() } catch { return undefined }
+}
+
 async function readLockout($: EngineInterface, script: string): Promise<number | undefined> {
   try {
     const result = await $.process.run(['python3', '-I', script, 'lockout', '--last'], { timeoutMs: 5000 })
@@ -102,34 +143,66 @@ export const register: Register = (on, options) => {
   let core: Core | undefined
   let script = ''
   let session: string | undefined
+  let conversationChanged = false
   // Track attempts separately from reading age: an unavailable or stale reading
   // must not trigger another subprocess on every call.
   let lastProbeAt = -Infinity
+  let lastUsageProbeAt = -Infinity
+  let mode: Mode = 'auto'
+
+  function refreshConversation(id: string | undefined): void {
+    session = id
+    core?.newConversation(session)
+    conversationChanged = false
+  }
+
+  function needsUsage(now: number): boolean {
+    if (!core || mode === 'off' || core.usageAge(now) <= 10 * 60000 || Math.abs(now - lastUsageProbeAt) <= 10 * 60000) return false
+    lastUsageProbeAt = now
+    return true
+  }
 
   on('session.start', async ($, e, next) => {
     script = $.plugin.root + '/scripts/crossfeed.py'
     const config = toConfig(options)
+    mode = config.mode
     session = await $.session.id()
     core = createCore(config, script, session)
+    conversationChanged = false
     await $.command.register({ name: 'crossfeed', description: 'Show crossfeed status, report or change routing mode.', argumentHint: '[status|report|auto|always|off]' })
     const now = await clock($)
     lastProbeAt = -Infinity
-    if (config.mode !== 'off') lastProbeAt = now
-    const [quota, lockout] = await Promise.all([
+    lastUsageProbeAt = -Infinity
+    if (config.mode !== 'off') { lastProbeAt = now; lastUsageProbeAt = now }
+    const [quota, lockout, usage] = await Promise.all([
       config.mode === 'off' ? Promise.resolve({ reading: undefined, problem: undefined }) : readCodex($, script, now),
       readLockout($, script),
+      config.mode === 'off' ? Promise.resolve({ reading: undefined, problem: undefined }) : readUsage($, script, now, false),
     ])
     core.setCodex(quota.reading, quota.problem)
     core.setLockout(lockout)
     core.measure(claudeReading((await $.session.usage()).rateLimits), now)
+    core.setMainModel(await mainModel($), now)
+    if (mode !== 'off') core.setUsage(usage.reading, usage.problem, now)
     showStatus($, core, now)
     return next(e)
   }).catch(failOpen)
 
+  on('session.end', async (_$, e, next) => {
+    if (e.reason === 'clear' || e.reason === 'resume') conversationChanged = true
+    return next(e)
+  }).catch(failOpen)
+
   on('session.measure', async ($, e, next) => {
+    if (conversationChanged) refreshConversation(await sessionId($))
     if (core) {
       const now = await clock($)
       core.measure(claudeReading(e.rateLimits), now)
+      core.setMainModel(await mainModel($), now)
+      if (needsUsage(now)) {
+        const usage = await readUsage($, script, now, false)
+        core.setUsage(usage.reading, usage.problem, now)
+      }
       showStatus($, core, now)
     }
     return next(e)
@@ -141,12 +214,14 @@ export const register: Register = (on, options) => {
     return { sections: [...result.sections, { id: 'agent-crossfeed:policy', text: staticSection(script), scope: 'session' as const }] }
   }).catch(failOpen)
 
-  on('prompt.submit', (_$, e, next) => {
-    const notices = !e.isMeta && !e.command ? core?.userPrompt() ?? [] : []
+  on('prompt.submit', async ($, e, next) => {
+    if (conversationChanged) refreshConversation(await sessionId($))
+    const notices = !e.isMeta && !e.command ? core?.userPrompt(await clock($)) ?? [] : []
     return next(notices.length ? { ...e, context: [...(e.context ?? []), ...notices] } : e)
   }).catch(failOpen)
 
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
+    if (conversationChanged) refreshConversation(await sessionId($))
     if (!core) return next(e)
     const now = await clock($)
     if (core.needsCodex(e) && core.codexAge(now) > 5 * 60000 && Math.abs(now - lastProbeAt) > 5 * 60000) {
@@ -157,6 +232,11 @@ export const register: Register = (on, options) => {
     // A measure event may not have fired yet in a session's first turn: take the reading at decision time.
     const latest = claudeReading((await $.session.usage()).rateLimits)
     core.measure(latest, now)
+    core.setMainModel(await mainModel($), now)
+    if (needsUsage(now)) {
+      const usage = await readUsage($, script, now, false)
+      core.setUsage(usage.reading, usage.problem, now)
+    }
     const route = core.route(e, now)
     const stay = core.lastStay()
     // The decision may rest on readings newer than the ones the status line was drawn from.
@@ -174,19 +254,53 @@ export const register: Register = (on, options) => {
     return { deny }
   }).catch(failOpen)
 
-  on('tool.call', async (_$, e, next) => {
+  on('tool.call', async ($, e, next) => {
+    if (conversationChanged) refreshConversation(await sessionId($))
     const ran = await next(e)
     // A refused call is not a hands-on step and must not use up the one reminder.
     if (ran.deny !== undefined || e.agentId !== undefined) return ran
-    const note = core?.toolCall(String(e.tool), false)
-    const notices = core?.takeNotices() ?? []
+    let now: number
+    try { now = await clock($) } catch { return ran }
+    const note = core?.toolCall(String(e.tool), false, now)
+    const notices = core?.takeNotices(now) ?? []
     if (note) notices.push(note)
     return notices.length ? { ...ran, context: [...(ran.context ?? []), ...notices] } : ran
   }).catch(failOpen)
 
+  on('agent.spawn', async ($, e, next) => {
+    const change = core?.spawnModel(e, await clock($))
+    if (!change) return next(e)
+    const ran = await next({ ...e, model: change.model })
+    if (ran.deny !== undefined) return ran
+    if (familyOf(ran.model) !== familyOf(change.model)) {
+      logFailure($, `rewrite to ${change.model} not applied (ran on ${ran.model})`)
+      return ran
+    }
+    logFailure($, `subagent ran on ${change.model} instead of ${change.from} (${change.bucket} weekly ${change.percent}%, ${change.percent >= 100 ? 'full' : 'ahead'})`)
+    // Once next() has started the agent, ledger failures must never retry the spawn.
+    try {
+      const result = await $.process.run(['python3', '-I', script, 'downgrade', '--from', change.from, '--to', change.model, '--bucket', change.bucket, '--percent', String(change.percent), ...(session ? ['--session', session] : [])], { timeoutMs: 5000 })
+      if (result.exitCode !== 0) logFailure($, `downgrade record exited with code ${result.exitCode}`)
+    } catch (error) { logFailure($, `downgrade record failed: ${String(error)}`) }
+    return ran
+  }).catch(failOpen)
+
   on('classic.StopFailure', async ($, e, next) => {
-    const lockout = core?.stopFailure(e.error, await clock($))
-    if (lockout) await $.process.run(['python3', '-I', script, 'lockout', '--reset-at', lockout.resetAt, ...(session === undefined ? [] : ['--session', session])])
+    const now = await clock($)
+    const lockout = core?.stopFailure(e.error, now)
+    if (lockout) {
+      try { await $.process.run(['python3', '-I', script, 'lockout', '--reset-at', lockout.resetAt, ...(session === undefined ? [] : ['--session', session])]) }
+      catch (error) { logFailure($, `lockout record failed: ${String(error)}`) }
+    }
+    if (core && mode !== 'off' && e.error === 'rate_limit') {
+      core.setMainModel(await mainModel($), now)
+      lastUsageProbeAt = now
+      const usage = await readUsage($, script, now, true)
+      core.setUsage(usage.reading, usage.problem, now)
+      const bucket = core.bucketLockout(now)
+      if (bucket) await $.process.run(['python3', '-I', script, 'lockout', '--reset-at', bucket.resetAt, '--bucket', bucket.bucket, ...(session ? ['--session', session] : [])])
+      showStatus($, core, now)
+    }
     return next(e)
   }).catch(failOpen)
 
@@ -197,6 +311,7 @@ export const register: Register = (on, options) => {
     if (args === '' || args === 'status') return { text: core.describe(now) }
     if (args === 'report') return { text: (await $.process.run(['python3', '-I', script, 'report'])).stdout }
     if (args === 'auto' || args === 'always' || args === 'off') {
+      mode = args
       core.setMode(args)
       showStatus($, core, now)
       return { text: `crossfeed mode: ${args} (this session)` }

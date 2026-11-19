@@ -47,7 +47,7 @@ export function fit(call: AgentCall): { tier: Tier; reason: string } {
 
 export type ClaudeReading = {
   fiveHour?: { percentUsed: number; resetsAt?: number }
-  sevenDay?: { percentUsed: number }
+  sevenDay?: { percentUsed: number; resetsAt?: number }
 }
 export type CodexWindow = { minutes: number; usedPercent: number; resetsAt?: number }
 export type CodexReading = { windows: CodexWindow[]; limitReached: boolean; readAt: number; problem?: string }
@@ -152,10 +152,10 @@ export function headroomCause(codex: CodexReading | undefined, config: Config, n
   return `Codex ${label} use is ${Math.round(window.usedPercent)}%` + suffix
 }
 
-export function decide(input: { tier: Tier; P: number; g: number; mode: Mode; claudeKnown: boolean; headroomProblem?: string }): { handOff: boolean; reason: string } {
+export function decide(input: { tier: Tier; P: number; g: number; mode: Mode; claudeKnown: boolean; limitFloor?: boolean; headroomProblem?: string }): { handOff: boolean; reason: string } {
   const { tier, P, g, mode, claudeKnown } = input
   if (mode === 'off') return { handOff: false, reason: 'crossfeed is off' }
-  if (!claudeKnown) return { handOff: false, reason: 'no Claude reading yet' }
+  if (!claudeKnown && !input.limitFloor) return { handOff: false, reason: 'no Claude reading yet' }
   if (g <= 0) return { handOff: false, reason: input.headroomProblem ?? 'no Codex headroom' }
   if (tier === 'C') return { handOff: false, reason: 'tier C stays on Claude' }
   if (mode === 'always') return { handOff: true, reason: 'crossfeed is always on' }
@@ -167,4 +167,50 @@ export function decide(input: { tier: Tier; P: number; g: number; mode: Mode; cl
   return P >= 0.3
     ? { handOff: true, reason: 'pressure is high enough' }
     : { handOff: false, reason: 'pressure is low' }
+}
+
+
+export type Family = 'fable' | 'opus' | 'sonnet' | 'haiku'
+export type ModelBucket = { label: string; family?: Family; usedPercent: number; resetsAt?: number }
+export type UsageReading = { buckets: ModelBucket[]; readAt: number }
+export type BucketState = 'ok' | 'ahead' | 'full' | 'unknown'
+export type BucketView = { bucket: ModelBucket; state: BucketState; line?: number }
+
+export function familyOf(model: string | undefined): Family | undefined {
+  const name = model?.toLowerCase() ?? ''
+  return (['fable', 'opus', 'sonnet', 'haiku'] as const).find(family => name.includes(family))
+}
+
+export function bucketState(bucket: ModelBucket, readAt: number, now: number, sevenDayResetsAt?: number): { state: BucketState; line?: number } {
+  const reset = bucket.resetsAt ?? sevenDayResetsAt
+  const line = reset === undefined ? undefined : 100 * clamp(1 - (reset - now) / (7 * 1440 * MINUTE), 0, 1)
+  const state = now - readAt > 20 * MINUTE || readAt - now > 5 * MINUTE || (reset !== undefined && now >= reset) ? 'unknown'
+    : bucket.usedPercent >= 100 ? 'full'
+    : bucket.usedPercent >= 80 || (line !== undefined && bucket.usedPercent >= line + 5) ? 'ahead' : 'ok'
+  return { state, line }
+}
+
+export function subagentFamily(callModel: string | undefined, inheritedModel: string | undefined): Family | undefined {
+  return familyOf(!callModel || callModel === 'inherit' ? inheritedModel : callModel)
+}
+
+export const REWRITE_TYPES = ['general-purpose', 'claude'] as const
+
+export const MODEL_RANK: Record<Family, number> = { haiku: 0, sonnet: 1, opus: 2, fable: 3 }
+
+export function fallbackFor(from: Family, fallback: string, views: ReadonlyMap<Family, BucketView>): string | undefined {
+  const family = familyOf(fallback)
+  if (!fallback.trim() || !family || MODEL_RANK[family] >= MODEL_RANK[from]) return undefined
+  const state = views.get(family)?.state
+  return state === 'ahead' || state === 'full' ? undefined : fallback
+}
+
+export function rewriteModel(a: { mode: Mode; subagentType: string; model?: string; fork: boolean; parentModel: string; fallback: string; views: ReadonlyMap<Family, BucketView> }): { model: string; from: Family; view: BucketView } | undefined {
+  if (a.mode === 'off' || a.fork || !REWRITE_TYPES.some(type => type === a.subagentType) || !a.fallback.trim()) return undefined
+  const from = subagentFamily(a.model, a.parentModel)
+  const view = from === undefined ? undefined : a.views.get(from)
+  if (!from || !view || (view.state !== 'ahead' && view.state !== 'full')) return undefined
+  if (view.state === 'ahead' && a.model && a.model !== 'inherit') return undefined
+  const fallback = fallbackFor(from, a.fallback, a.views)
+  return fallback === undefined ? undefined : { model: fallback, from, view }
 }

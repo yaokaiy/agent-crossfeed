@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { On, ProcessRunResult, SessionRateLimit } from 'claude-code'
+import type { AgentSpawnInput, On, ProcessRunResult, SessionRateLimit } from 'claude-code'
 
 const BASE = 1794902400000
 const MINUTE = 60000
@@ -18,6 +18,11 @@ function processResult(stdout: string, exitCode = 0): ProcessRunResult {
 
 function setup(on: On) {
   const world = {
+    sessionId: 'test-session', failSessionId: false, sessionIdReads: 0,
+    model: 'opus', failModel: false, claudeUsage: processResult(JSON.stringify({ source: 'usage', age_s: 0, error: null, buckets: [] })),
+    usageProcesses: [] as { argv: readonly string[]; timeout?: number }[],
+    spawns: [] as AgentSpawnInput[], spawnModel: undefined as string | undefined, denySpawn: false,
+    failUsage: false, failDowngrade: false, downgradeExit: 0,
     now: BASE, quota: processResult(JSON.stringify(QUOTA)), rejectProcess: false, failClock: false,
     usage: [] as SessionRateLimit[], cwd: CWD,
     lockout: processResult('{"reset_at":null}'), processFailure: '',
@@ -31,10 +36,23 @@ function setup(on: On) {
     return { value: world.now }
   })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   on('session.measure', (_$, e) => ({ changed: e.changed }))
   on('session.usage', () => ({ value: { startedAt: BASE, context: { window: 200000 }, rateLimits: world.usage } }))
   on('session.cwd', () => ({ value: world.cwd }))
-  on('session.id', () => ({ value: 'test-session' }))
+  on('session.model', () => {
+    if (world.failModel) throw new Error('model unavailable')
+    return { value: world.model }
+  })
+  on('agent.spawn', (_$, e) => {
+    world.spawns.push(e)
+    return world.denySpawn ? { deny: 'engine denied spawn' } : { model: world.spawnModel ?? e.model ?? 'claude-fable-5-2', agentId: 'spawned' }
+  })
+  on('session.id', () => {
+    world.sessionIdReads += 1
+    if (world.failSessionId) throw new Error('session id unavailable')
+    return { value: world.sessionId }
+  })
   on('ui.status', (_$, e) => {
     if (world.failStatus) throw new Error('status unavailable')
     world.statuses.push(e.text)
@@ -44,7 +62,17 @@ function setup(on: On) {
   on('command.register', (_$, e) => { world.commands.push(e.name); return { value: { command: e.name } } })
   on('command.run', () => ({ text: 'engine command' }))
   on('process.run', (_$, e) => {
+    // Keep the legacy process trace intact; new usage probes have their own complete trace.
+    if (e.argv[3] === 'claude-usage') {
+      world.usageProcesses.push({ argv: e.argv, timeout: e.init?.timeoutMs })
+      if (world.failUsage) throw new Error('usage unavailable')
+      return { value: world.claudeUsage }
+    }
     world.processes.push({ argv: e.argv, timeout: e.init?.timeoutMs, stdin: e.init?.stdin })
+    if (e.argv[3] === 'downgrade') {
+      if (world.failDowngrade) throw new Error('ledger unavailable')
+      return { value: processResult('', world.downgradeExit) }
+    }
     if (e.argv[3] === 'stash') return world.rejectStash ? { deny: 'stash unavailable' } : { value: world.stash }
     if (world.processFailure) throw new Error(world.processFailure)
     if (world.rejectProcess) return { deny: 'process unavailable' }
@@ -547,4 +575,282 @@ test('a status line that cannot be drawn does not block commands, readings or ro
   expect((await $.tool.call(RESEARCH)).deny?.startsWith('crossfeed:')).toBe(true)
   expect((await command($, 'off')).text).toBe('crossfeed mode: off (this session)')
   expect((await $.tool.call(RESEARCH)).deny).toBe(undefined)
+})
+
+
+const MODEL_USAGE = { source: 'usage', age_s: 0, error: null, buckets: [{ label: 'Fable', family: 'fable', used_percent: 62, resets_at: (BASE + 4.5 * 1440 * MINUTE) / 1000 }] }
+const SPAWN: AgentSpawnInput = { tool_use_id: 'spawn-test', prompt: 'Research the protocol.', description: 'Research', subagentType: 'general-purpose', provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-fable-5-2', background: false, fork: false }
+function scarce(on: On) {
+  const world = setup(on)
+  world.model = 'claude-fable-5-2'
+  world.claudeUsage = processResult(JSON.stringify(MODEL_USAGE))
+  world.usage = [{ kind: 'five_hour', percentUsed: 10, resetsAt: RESET }]
+  return world
+}
+
+for (const reason of ['clear', 'resume', 'other'] as const) {
+  test(`session end ${reason} updates conversation notices and dispatch identity only when changed`, async ($, on) => {
+    const world = scarce(on)
+    await start($)
+    const prompt = { text: 'Continue', wait: false, origin: ORIGIN }
+    const first = await $.prompt.submit(prompt)
+    expect(first.context?.some(note => note.includes('Fable weekly'))).toBe(true)
+    await $.session.end({ reason, sessionId: 'test-session', resume: { id: 'test-session' } })
+    expect(world.sessionIdReads).toBe(1)
+    world.sessionId = 'second-session'
+    const second = await $.prompt.submit(prompt)
+    expect(second.context ?? []).toEqual(reason === 'other' ? [] : first.context)
+    const refusal = await $.tool.call(RESEARCH)
+    expect(refusal.deny?.includes(`--session '${reason === 'other' ? 'test-session' : 'second-session'}'`)).toBe(true)
+    expect((await $.prompt.submit(prompt)).context ?? []).toEqual([])
+    expect(world.sessionIdReads).toBe(reason === 'other' ? 1 : 2)
+    await $.agent.spawn(SPAWN)
+    const record = world.processes.find(p => p.argv[3] === 'downgrade')!
+    expect(record.argv.slice(-2)).toEqual(['--session', reason === 'other' ? 'test-session' : 'second-session'])
+  })
+}
+
+for (const event of ['tool', 'agent', 'measure'] as const) {
+  test(`conversation refresh runs before the first ${event} event`, async ($, on) => {
+    const world = scarce(on)
+    await start($)
+    await $.prompt.submit({ text: 'First', wait: false, origin: ORIGIN })
+    await $.session.end({ reason: 'clear', sessionId: 'test-session', resume: { id: 'test-session' } })
+    world.sessionId = 'second-session'
+    if (event === 'measure') await measure($, world, 10)
+    if (event === 'agent') expect((await $.tool.call(RESEARCH)).deny?.includes("--session 'second-session'")).toBe(true)
+    const result = await $.tool.call({ tool: 'Bash', command: 'true' })
+    expect(result.context?.filter(note => note.includes('Fable weekly')).length).toBe(1)
+    expect(world.sessionIdReads).toBe(2)
+    expect(world.usageProcesses.length).toBe(1)
+  })
+}
+
+test('conversation refresh drops the old identity when session.id fails', async ($, on) => {
+  const world = scarce(on)
+  await start($)
+  await $.session.end({ reason: 'clear', sessionId: 'test-session', resume: { id: 'test-session' } })
+  world.failSessionId = true
+  const refusal = await $.tool.call(RESEARCH)
+  expect(refusal.deny?.startsWith('crossfeed:')).toBe(true)
+  expect(refusal.deny?.includes('--session')).toBe(false)
+  await $.agent.spawn(SPAWN)
+  expect(world.processes.find(p => p.argv[3] === 'downgrade')?.argv.includes('--session')).toBe(false)
+})
+
+test('startup reads Claude usage once alongside Codex quota with the contracted argv', async ($, on) => {
+  const world = scarce(on)
+  await start($)
+  const script = world.processes[0]!.argv[2]!
+  expect(world.usageProcesses).toEqual([{ argv: ['python3', '-I', script, 'claude-usage'], timeout: 25000 }])
+  expect(world.processes.filter(p => p.argv[3] === 'quota').length).toBe(1)
+  expect(world.statuses[0]?.includes('fable wk 62% ahead')).toBe(true)
+  const section = (await $.prompt.compose(COMPOSE)).sections[1]?.text ?? ''
+  expect(section.includes("When crossfeed says a model's weekly limit is ahead of pace")).toBe(true)
+})
+
+test('an ahead Fable limit hands a tier B call to Codex', async ($, on) => {
+  scarce(on)
+  await start($)
+  const result = await $.tool.call(RESEARCH)
+  expect(result.deny?.startsWith('crossfeed:')).toBe(true)
+  expect(result.deny?.includes('Fable weekly 62% used')).toBe(true)
+  expect(result.deny?.includes('--kind subagent --cause limit')).toBe(true)
+})
+
+test('spawn rewrite records only the model the engine actually used', async ($, on) => {
+  const world = scarce(on)
+  await start($)
+  const result = await $.agent.spawn(SPAWN)
+  expect(result).toEqual({ model: 'opus', agentId: 'spawned' })
+  expect(world.spawns[0]?.model).toBe('opus')
+  expect(world.logs.some(log => log.includes('subagent ran on opus instead of claude-fable-5-2 (Fable weekly 62%, ahead)'))).toBe(true)
+  const script = world.processes[0]!.argv[2]!
+  expect(world.processes.filter(p => p.argv[3] === 'downgrade')).toEqual([{
+    argv: ['python3', '-I', script, 'downgrade', '--from', 'claude-fable-5-2', '--to', 'opus', '--bucket', 'Fable', '--percent', '62', '--session', 'test-session'], timeout: 5000, stdin: undefined,
+  }])
+  expect(world.usageProcesses.length).toBe(1)
+})
+
+for (const engineModel of ['claude-sonnet-5-5', 'claude-opus-5-5']) {
+  test(`spawn accounting compares families for engine model ${engineModel}`, async ($, on) => {
+    const world = scarce(on)
+    world.spawnModel = engineModel
+    await start($)
+    expect((await $.agent.spawn(SPAWN)).model).toBe(engineModel)
+    expect(world.processes.filter(p => p.argv[3] === 'downgrade').length).toBe(engineModel.includes('opus') ? 1 : 0)
+    if (engineModel.includes('sonnet')) expect(world.logs.some(log => log.includes('rewrite to opus not applied (ran on claude-sonnet-5-5)'))).toBe(true)
+  })
+}
+
+for (const overrides of [{ subagentType: 'Explore' }, { subagentType: 'web-fetch' }, { subagentType: 'plugin-agent' }, { fork: true }, { model: 'fable' }, { parentModel: 'opus' }]) {
+  test(`spawn keeps protected input ${JSON.stringify(overrides)}`, async ($, on) => {
+    const world = scarce(on)
+    await start($)
+    await $.agent.spawn({ ...SPAWN, ...overrides })
+    expect(world.spawns).toEqual([{ ...SPAWN, ...overrides }])
+    expect(world.processes.some(p => p.argv[3] === 'downgrade')).toBe(false)
+  })
+}
+
+test('spawn uses its parent model even when the main model differs, including workflows', async ($, on) => {
+  const world = scarce(on)
+  world.model = 'sonnet'
+  await start($)
+  await $.agent.spawn({ ...SPAWN, parentAgentId: 'parent-agent', workflow: { runId: 'wf_test', agentIndex: 1 } })
+  expect(world.spawns[0]?.model).toBe('opus')
+})
+
+test('denied spawns are returned unchanged and never recorded', async ($, on) => {
+  const world = scarce(on)
+  world.denySpawn = true
+  await start($)
+  expect(await $.agent.spawn(SPAWN)).toEqual({ deny: 'engine denied spawn' })
+  expect(world.processes.some(p => p.argv[3] === 'downgrade')).toBe(false)
+})
+
+for (const failure of ['throw', 'exit'] as const) {
+  test(`downgrade ledger ${failure} does not block or duplicate a spawn`, async ($, on) => {
+    const world = scarce(on)
+    world.failDowngrade = failure === 'throw'
+    world.downgradeExit = failure === 'exit' ? 1 : 0
+    await start($)
+    expect(await $.agent.spawn(SPAWN)).toEqual({ model: 'opus', agentId: 'spawned' })
+    expect(world.spawns.length).toBe(1)
+    expect(world.logs.some(log => log.includes('downgrade') && (log.includes('failed') || log.includes('exited')))).toBe(true)
+  })
+}
+
+test('usage probe throttle spans Agent and measure events, including a failed probe', async ($, on) => {
+  const world = scarce(on)
+  await start($)
+  for (let i = 1; i <= 20; i++) {
+    world.now = BASE + i * 9 * MINUTE / 20
+    await $.tool.call(RESEARCH)
+    await measure($, world, 10)
+  }
+  expect(world.usageProcesses.length).toBe(1)
+  world.now = BASE + 10 * MINUTE
+  await measure($, world, 10)
+  expect(world.usageProcesses.length).toBe(1)
+  world.now = BASE + 11 * MINUTE
+  world.claudeUsage = processResult('', 1)
+  await measure($, world, 10)
+  expect(world.usageProcesses.length).toBe(2)
+  world.now = BASE + 20 * MINUTE
+  await $.tool.call(RESEARCH)
+  await measure($, world, 10)
+  expect(world.usageProcesses.length).toBe(2)
+  world.now = BASE + 21 * MINUTE + 1
+  await $.tool.call(RESEARCH)
+  expect(world.usageProcesses.length).toBe(3)
+})
+
+const BAD_USAGE = [
+  '', 'not json', 'null', '[]', '{}',
+  JSON.stringify({ ...MODEL_USAGE, source: 'none', buckets: [], error: 'x' }),
+  JSON.stringify({ ...MODEL_USAGE, age_s: '0' }), JSON.stringify({ ...MODEL_USAGE, age_s: -400 }),
+  JSON.stringify({ ...MODEL_USAGE, age_s: null }), JSON.stringify({ ...MODEL_USAGE, age_s: 0.5 }),
+  JSON.stringify({ ...MODEL_USAGE, age_s: 21 * 60 }),
+  JSON.stringify({ ...MODEL_USAGE, buckets: [{ ...MODEL_USAGE.buckets[0], used_percent: '62' }] }),
+  JSON.stringify({ ...MODEL_USAGE, buckets: [{ ...MODEL_USAGE.buckets[0], used_percent: null }] }),
+  JSON.stringify({ ...MODEL_USAGE, buckets: [{ ...MODEL_USAGE.buckets[0], used_percent: -1 }] }),
+  JSON.stringify({ ...MODEL_USAGE, buckets: [{ ...MODEL_USAGE.buckets[0], resets_at: 'soon' }] }),
+  JSON.stringify({ ...MODEL_USAGE, buckets: [{ ...MODEL_USAGE.buckets[0], family: 'gizmo' }] }),
+  JSON.stringify({ ...MODEL_USAGE, buckets: [{ ...MODEL_USAGE.buckets[0], label: '' }] }),
+  JSON.stringify({ ...MODEL_USAGE, buckets: [{ ...MODEL_USAGE.buckets[0], label: null }] }),
+  JSON.stringify({ ...MODEL_USAGE, buckets: [{ ...MODEL_USAGE.buckets[0], resets_at: 1e100 }] }),
+  JSON.stringify(MODEL_USAGE).replace('62', '1e400'),
+]
+for (let index = 0; index < BAD_USAGE.length; index++) {
+  test(`bad usage output ${index} fails safe without changing 0.1 routing`, async ($, on) => {
+    const world = scarce(on)
+    world.claudeUsage = processResult(BAD_USAGE[index]!)
+    await start($)
+    await $.agent.spawn(SPAWN)
+    expect(world.spawns[0]?.model).toBe(undefined)
+    const call = await $.tool.call(RESEARCH)
+    expect(call.deny).toBe(undefined)
+    expect(call.context?.some(note => note.includes('weekly')) ?? false).toBe(false)
+    expect((await $.tool.call(AGENT)).deny?.startsWith('crossfeed:')).toBe(true)
+  })
+}
+
+for (const failure of ['throw', 'truncated', 'exit'] as const) {
+  test(`usage probe ${failure} fails open and is throttled`, async ($, on) => {
+    const world = scarce(on)
+    world.failUsage = failure === 'throw'
+    world.claudeUsage = { ...world.claudeUsage, isStdoutTruncated: failure === 'truncated', exitCode: failure === 'exit' ? 127 : 0 }
+    await start($)
+    await $.agent.spawn(SPAWN)
+    expect(world.spawns[0]?.model).toBe(undefined)
+    await $.tool.call(RESEARCH)
+    await measure($, world, 10)
+    expect(world.usageProcesses.length).toBe(1)
+  })
+}
+
+test('rate-limit stop records a fresh full bucket once without a five-hour lockout', async ($, on) => {
+  const world = scarce(on)
+  await start($)
+  world.claudeUsage = processResult(JSON.stringify({ ...MODEL_USAGE, buckets: [{ ...MODEL_USAGE.buckets[0], used_percent: 100, resets_at: Date.parse('2026-11-23T22:00:00Z') / 1000 }] }))
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  const script = world.processes[0]!.argv[2]!
+  expect(world.usageProcesses.slice(1).map(p => p.argv)).toEqual([
+    ['python3', '-I', script, 'claude-usage', '--fresh'], ['python3', '-I', script, 'claude-usage', '--fresh'],
+  ])
+  expect(world.processes.filter(p => p.argv[3] === 'lockout' && p.argv[4] !== '--last').map(p => p.argv)).toEqual([
+    ['python3', '-I', script, 'lockout', '--reset-at', '2026-11-23T22:00:00.000Z', '--bucket', 'Fable', '--session', 'test-session'],
+  ])
+  await $.agent.spawn({ ...SPAWN, model: 'fable' })
+  expect(world.spawns[0]?.model).toBe('opus')
+})
+
+test('session.model failure at startup still reads usage; spawns decide from their own parent model', async ($, on) => {
+  const world = scarce(on)
+  world.failModel = true
+  await start($)
+  expect(world.usageProcesses.length).toBe(1)
+  await $.agent.spawn(SPAWN)
+  expect(world.spawns[0]?.model).toBe('opus')
+  expect(world.spawns.length).toBe(1)
+})
+
+test('spawn clock failure goes ahead unchanged exactly once', async ($, on) => {
+  const world = scarce(on)
+  await start($)
+  world.failClock = true
+  await $.agent.spawn(SPAWN)
+  expect(world.spawns[0]?.model).toBe(undefined)
+  expect(world.spawns.length).toBe(1)
+})
+
+test('seven-day reset is retained as a fallback and seconds are converted to milliseconds', async ($, on) => {
+  const world = scarce(on)
+  world.claudeUsage = processResult(JSON.stringify({ ...MODEL_USAGE, buckets: [{ ...MODEL_USAGE.buckets[0], used_percent: 40, resets_at: null }] }))
+  world.usage.push({ kind: 'seven_day', percentUsed: 10, resetsAt: new Date(BASE + 7 * 1440 * MINUTE).toISOString() })
+  await start($)
+  expect((await $.agent.spawn(SPAWN)).model).toBe('opus')
+})
+
+test('usage readings accept BOM, CRLF, non-ASCII labels and slight clock skew', async ($, on) => {
+  const world = scarce(on)
+  world.claudeUsage = processResult('\ufeff' + JSON.stringify({ ...MODEL_USAGE, age_s: -300, buckets: [{ ...MODEL_USAGE.buckets[0], label: 'Fable · beta' }] }) + '\r\n')
+  await start($)
+  expect((await $.agent.spawn(SPAWN)).model).toBe('opus')
+  expect((await command($, 'status')).text?.includes('Fable · beta weekly')).toBe(true)
+})
+
+test('off mode stops usage probes, rewrites, notices and bucket lockouts', async ($, on) => {
+  const world = scarce(on)
+  await start($)
+  await command($, 'off')
+  world.now += 11 * MINUTE
+  await measure($, world, 10)
+  await $.tool.call(RESEARCH)
+  await $.agent.spawn(SPAWN)
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  expect(world.usageProcesses.length).toBe(1)
+  expect(world.spawns[0]?.model).toBe(undefined)
 })
