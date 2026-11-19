@@ -37,6 +37,35 @@ class JobDirectoryTests(CrossfeedCase):
 
 
 class RunTests(CrossfeedCase):
+    def test_run_records_cause(self):
+        for args, cause in ((["--cause", "limit"], "limit"), ([], None),
+                            (["--cause", "Ab9-" * 8], "Ab9-" * 8)):
+            with self.subTest(cause=cause):
+                result = self.run_job(args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.records()[-1]["cause"], cause)
+                self.assertEqual(json.loads((self.job_dir() / "state.json").read_text())["cause"], cause)
+        records = self.records()
+        argv = self.root / "must-not-start.json"
+        for cause in ("a b", "", "a" * 33, "a_b", "é", "limit\n"):
+            with self.subTest(cause=cause):
+                result = self.run_job(["--cause", cause], FAKE_CODEX_ARGV=str(argv))
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(self.records(), records)
+                self.assertFalse(argv.exists())
+
+    def test_resume_preserves_cause_and_rejects_override(self):
+        self.assertEqual(self.run_job(["--cause", "limit"]).returncode, 0)
+        first = self.records()[-1]
+        result = self.run_job(["--resume", first["id"]])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["cause"], "limit")
+        for cause in ("limit", "other"):
+            result = self.run_job(["--resume", first["id"], "--cause", cause])
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"--cause", result.stderr)
+        self.assertEqual(len(self.records()), 2)
+
     def run_job(self, args=(), brief=b"Implement the parser. Check: python3 -m unittest\n", mode="ok", **env):
         return run_crossfeed(["run", "--dir", str(self.root), *args], stdin=brief,
                          env=dict(self.env, FAKE_CODEX=mode, **env), cwd=self.root)
@@ -54,7 +83,7 @@ class RunTests(CrossfeedCase):
         record, = self.records()
         self.assertEqual(set(record), {
             "v", "type", "ts", "id", "session", "kind", "tier", "dir", "sandbox", "worktree",
-            "effort", "model", "started", "wall_s", "status", "exit", "tokens", "codex_thread",
+            "effort", "model", "cause", "started", "wall_s", "status", "exit", "tokens", "codex_thread",
             "changed", "head_moved", "resume_of",
         })
         self.assertEqual(record["type"], "job")

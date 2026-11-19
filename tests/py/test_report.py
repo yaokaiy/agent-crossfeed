@@ -11,6 +11,70 @@ UTC = datetime.timezone.utc
 
 
 class ReportTests(CrossfeedCase):
+    def test_report_separates_limits(self):
+        records = [
+            {"type": "lockout", "ts": self.stamp,
+             "reset_at": (self.now + datetime.timedelta(hours=2)).isoformat()},
+            {"type": "lockout", "ts": self.stamp, "bucket": "Opus",
+             "reset_at": (self.now + datetime.timedelta(hours=25, minutes=5)).isoformat()},
+            {"type": "lockout", "ts": self.stamp, "bucket": "Fable",
+             "reset_at": (self.now + datetime.timedelta(hours=112)).isoformat()},
+            {"type": "lockout", "ts": self.stamp, "bucket": "Fable", "reset_at": "unknown"},
+        ]
+        records += [{"type": "downgrade", "ts": self.stamp, "from": "fable", "to": "opus",
+                     "bucket": "Fable", "percent": 62.5, "session": None} for _ in range(3)]
+        records += [dict(self.job("one"), cause="limit"), dict(self.job("two"), cause="limit"), self.job("three")]
+        self.write_records(records)
+        result = run_crossfeed(["report"], env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.decode().splitlines()
+        self.assertEqual(lines[1:5], [
+            "lockouts: 1; locked: 2h00m; unknown resets: 0",
+            "model limits: Fable 2 lockouts, locked 112h00m; Opus 1 lockout, locked 25h05m",
+            "subagents moved to a cheaper model: 3 (Fable 3)",
+            "jobs handed off because of a model limit: 2",
+        ])
+        result = run_crossfeed(["report", "--json"], env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary, load_crossfeed().fold(records, self.now - datetime.timedelta(days=7)))
+        self.assertEqual((summary["lockouts"], summary["locked_s"], summary["unknown_resets"]), (1, 7200, 0))
+        self.assertEqual(summary["bucket_lockouts"], {
+            "Fable": {"lockouts": 2, "locked_s": 112 * 3600, "unknown_resets": 1},
+            "Opus": {"lockouts": 1, "locked_s": 25 * 3600 + 300, "unknown_resets": 0},
+        })
+        self.assertEqual(summary["downgrades"], {"total": 3, "by_bucket": {"Fable": 3}})
+        self.assertEqual(summary["limit_jobs"], 2)
+
+    def test_legacy_report_includes_zero_model_counts(self):
+        for records in ([], self.sample_records()):
+            with self.subTest(empty=not records):
+                self.write_records(records)
+                result = run_crossfeed(["report"], env=self.env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.decode().splitlines()[2:5], [
+                    "model limits: none", "subagents moved to a cheaper model: 0",
+                    "jobs handed off because of a model limit: 0",
+                ])
+
+    def test_limit_report_cutoff_and_malformed_buckets(self):
+        since = self.now - datetime.timedelta(days=7)
+        old = (since - datetime.timedelta(seconds=1)).isoformat()
+        records = [
+            {"type": "lockout", "ts": old, "bucket": "Fable", "reset_at": "unknown"},
+            {"type": "downgrade", "ts": old, "bucket": "Fable"},
+            dict(self.job("old", ts=old), cause="limit"),
+            {"type": "lockout", "ts": since.isoformat(), "bucket": "Fable", "reset_at": old},
+        ]
+        for bucket in (None, [], {}, "", 1):
+            records += [{"type": kind, "ts": self.stamp, "bucket": bucket, "reset_at": "unknown"}
+                        for kind in ("lockout", "downgrade")]
+        summary = load_crossfeed().fold(records, since)
+        self.assertEqual(summary["lockouts"], 0)
+        self.assertEqual(summary["bucket_lockouts"], {"Fable": {"lockouts": 1, "locked_s": 0, "unknown_resets": 0}})
+        self.assertEqual(summary["downgrades"], {"total": 0, "by_bucket": {}})
+        self.assertEqual(summary["limit_jobs"], 0)
+
     def setUp(self):
         super().setUp()
         self.now = datetime.datetime.now(UTC).replace(microsecond=0)
@@ -187,7 +251,10 @@ class ReportTests(CrossfeedCase):
         self.assertEqual(result.stdout.decode(),
                          "crossfeed report, last 7 days\n"
                          "lockouts: 1; locked: 0h52m; unknown resets: 0\n"
-                         "jobs: 14 (done 12, failed 1, limit 0, timeout 1, interrupted 0); codex tokens: 2900000; median: 6m05s\n"
+                         "model limits: none\n"
+                         "subagents moved to a cheaper model: 0\n"
+                         "jobs handed off because of a model limit: 0\n"
+"jobs: 14 (done 12, failed 1, limit 0, timeout 1, interrupted 0); codex tokens: 2900000; median: 6m05s\n"
                          "first-delivery checks: A 5/6, B 2/2; unchecked: 6\n")
 
     def test_report_json_and_fold(self):
@@ -199,6 +266,7 @@ class ReportTests(CrossfeedCase):
             "by_tier": {"A": {"jobs": 8, "checked": 6, "passed": 5},
                         "B": {"jobs": 6, "checked": 2, "passed": 2}},
             "tokens": 2900000, "median_wall_s": 365.0, "unchecked": 6,
+            "bucket_lockouts": {}, "downgrades": {"total": 0, "by_bucket": {}}, "limit_jobs": 0,
         }
         result = run_crossfeed(["report", "--json"], env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -217,7 +285,10 @@ class ReportTests(CrossfeedCase):
                 self.assertEqual(result.stdout.decode(),
                                  "crossfeed report, last 7 days\n"
                                  "lockouts: 0; locked: 0h00m; unknown resets: 0\n"
-                                 "jobs: 0 (done 0, failed 0, limit 0, timeout 0, interrupted 0); codex tokens: 0; median: n/a\n"
+                                 "model limits: none\n"
+                                 "subagents moved to a cheaper model: 0\n"
+                                 "jobs handed off because of a model limit: 0\n"
+"jobs: 0 (done 0, failed 0, limit 0, timeout 0, interrupted 0); codex tokens: 0; median: n/a\n"
                                  "first-delivery checks: A 0/0, B 0/0; unchecked: 0\n")
 
     def test_report_counts_interrupted_after_timeout(self):

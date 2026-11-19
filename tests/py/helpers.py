@@ -48,14 +48,23 @@ class CrossfeedCase(unittest.TestCase):
             encoding="utf-8",
         )
         self.shim.chmod(0o755)
+        self.claude_shim = self.bin / "claude"
+        self.claude_shim.write_text(
+            "#!/bin/sh\nexec {} -I {} \"$@\"\n".format(
+                shlex.quote(sys.executable),
+                shlex.quote(str(Path(__file__).with_name("fake_claude.py"))),
+            ), encoding="utf-8",
+        )
+        self.claude_shim.chmod(0o755)
         for program in ("git", "true", "false"):
             executable = shutil.which(program)
             if executable:
                 (self.bin / program).symlink_to(executable)
         self.env = os.environ.copy()
         self.env.pop("CROSSFEED_CODEX", None)
+        self.env.pop("CROSSFEED_CLAUDE", None)
         for name in list(self.env):
-            if name.startswith("FAKE_CODEX"):
+            if name.startswith(("FAKE_CODEX", "FAKE_CLAUDE")):
                 del self.env[name]
         self.env.update(
             CROSSFEED_HOME=str(self.home),

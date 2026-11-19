@@ -12,6 +12,85 @@ from helpers import CROSSFEED, CrossfeedCase, load_crossfeed, run_crossfeed
 
 
 class LedgerTests(CrossfeedCase):
+    def test_bucket_lockout_record(self):
+        reset = "2026-11-23T22:00:00Z"
+        args = ["lockout", "--reset-at", reset, "--bucket", "Fable", "--session", "s1"]
+        for _ in range(2):
+            result = run_crossfeed(args, env=self.env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        crossfeed = load_crossfeed()
+        record, = crossfeed.read_ledger()
+        self.assertEqual(record, {"v": 1, "type": "lockout", "ts": record["ts"],
+                                  "reset_at": reset, "bucket": "Fable", "session": "s1"})
+        for bucket in ("Opus", None):
+            result = run_crossfeed(["lockout", "--reset-at", reset] +
+                                  (["--bucket", bucket] if bucket else []), env=self.env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(crossfeed.read_ledger()), 3)
+        for label in ("", " \t"):
+            result = run_crossfeed(["lockout", "--reset-at", reset, "--bucket", label], env=self.env)
+            self.assertEqual(result.returncode, 2)
+        self.assertEqual(len(crossfeed.read_ledger()), 3)
+
+    def test_unknown_reset_is_never_deduplicated(self):
+        # A later week's lockout with an unknown reset is a new lockout, for buckets as for the five-hour window.
+        for bucket in ("Fable", "Fable", "Opus", None, None):
+            result = run_crossfeed(["lockout", "--reset-at", "unknown"] +
+                                  (["--bucket", bucket] if bucket else []), env=self.env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        records = load_crossfeed().read_ledger()
+        self.assertEqual([record.get("bucket") for record in records], ["Fable", "Fable", "Opus", None, None])
+
+    def test_last_ignores_bucket_lockouts(self):
+        crossfeed = load_crossfeed()
+        crossfeed.append_ledger({"type": "lockout", "reset_at": "2026-11-19T13:00:00Z"})
+        bucket = {"type": "lockout", "bucket": "Fable", "reset_at": "2026-11-19T22:00:00Z"}
+        crossfeed.append_ledger(bucket)
+        self.assertEqual(self.last_lockout(), {"reset_at": "2026-11-19T13:00:00Z"})
+        (self.home / "ledger.jsonl").write_text(json.dumps(bucket) + "\n")
+        self.assertEqual(self.last_lockout(), {"reset_at": None})
+        crossfeed.append_ledger(dict(bucket, bucket=None))
+        self.assertEqual(self.last_lockout(), {"reset_at": None})
+
+    def test_downgrade_record(self):
+        args = ["downgrade", "--from", "claude-fable-5-2", "--to", "opus", "--bucket", "Fable"]
+        result = run_crossfeed([*args, "--percent", "62.5"], env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record, = load_crossfeed().read_ledger()
+        self.assertEqual(record, {"v": 1, "ts": record["ts"], "type": "downgrade",
+                                  "from": "claude-fable-5-2", "to": "opus", "bucket": "Fable",
+                                  "percent": 62.5, "session": None})
+        for percent in ("nan", "inf", "-1", "1000.1", "abc"):
+            with self.subTest(percent=percent):
+                result = run_crossfeed([*args, "--percent", percent], env=self.env)
+                self.assertEqual(result.returncode, 2)
+        result = run_crossfeed(["downgrade", *args[3:], "--percent", "62.5"], env=self.env)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(load_crossfeed().read_ledger(), [record])
+        for percent in ("0", "1000"):
+            result = run_crossfeed([*args, "--percent", percent, "--session", "s2"], env=self.env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(load_crossfeed().read_ledger()[-1]["session"], "s2")
+
+    def test_concurrent_bucket_lockouts_are_deduplicated(self):
+        children = []
+        try:
+            for bucket in ("Fable", "Opus") * 4:
+                children.append(subprocess.Popen(
+                    [sys.executable, "-I", str(CROSSFEED), "lockout", "--reset-at",
+                     "2026-11-23T22:00:00Z", "--bucket", bucket],
+                    env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+            for child in children:
+                stdout, stderr = child.communicate(timeout=10)
+                self.assertEqual(child.returncode, 0, (stdout, stderr))
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate()
+        self.assertEqual(sorted(record["bucket"] for record in load_crossfeed().read_ledger()),
+                         ["Fable", "Opus"])
+
     def test_append_and_read_round_trip(self):
         crossfeed = load_crossfeed()
         record = {"type": "job", "kind": "检查 naïve", "note": "first\r\nsecond"}

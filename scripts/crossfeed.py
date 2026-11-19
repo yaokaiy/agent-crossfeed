@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import selectors
 import shlex
@@ -22,6 +23,7 @@ import sys
 import tempfile
 import time
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 PREAMBLE_READ = (
@@ -37,6 +39,206 @@ PREAMBLE_WRITE = PREAMBLE_READ + (
 # Returned by _execute_job in place of an exit status when codex was not found.
 # A started process that itself exits with 127 is an ordinary failure.
 CODEX_NOT_FOUND = -127
+
+CLAUDE_PATHS = ("~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude")
+MODEL_FAMILIES = ("fable", "opus", "sonnet", "haiku")
+USAGE_LINE = re.compile(
+    r"^\s*Current week \((?P<label>[^)]+)\):\s*(?P<pct><1|\d+(?:\.\d+)?)%\s*used\s*"
+    r"(?:[·|\-]\s*)?resets\s+(?P<when>.+?)\s*$", re.IGNORECASE)
+
+
+def resolve_claude() -> str:
+    explicit = os.environ.get("CROSSFEED_CLAUDE")
+    if explicit:
+        path = Path(explicit).expanduser().absolute()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+        raise FileNotFoundError("CROSSFEED_CLAUDE={!r} is not an executable file".format(explicit))
+    found = shutil.which("claude")
+    if found:
+        return os.path.abspath(found)
+    paths = [Path(path).expanduser() for path in CLAUDE_PATHS]
+    for path in paths:
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    raise FileNotFoundError("claude was not found; looked in PATH and {}".format(
+        ", ".join(str(path) for path in paths)))
+
+
+def parse_reset(when: str, now: datetime.datetime) -> Optional[int]:
+    match = re.fullmatch(
+        r"\s*(?:([A-Za-z]{3})\s+(\d{1,2})\s+at\s+)?(\d{1,2})(?::(\d{2}))?\s*"
+        r"(am|pm)\s*\(([^)]+)\)\s*", when, re.IGNORECASE)
+    if not match:
+        return None
+    month, day, hour, minute, meridiem, zone = match.groups()
+    hour, minute = int(hour), int(minute or 0)
+    if not 1 <= hour <= 12 or not 0 <= minute < 60:
+        return None
+    try:
+        timezone = ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
+    local = now.astimezone(timezone)
+    hour = hour % 12 + (12 if meridiem.lower() == "pm" else 0)
+    if month:
+        months = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+        if month.lower() not in months:
+            return None
+        for year in (local.year - 1, local.year, local.year + 1):
+            try:
+                reset = datetime.datetime(year, months.index(month.lower()) + 1, int(day),
+                                          hour, minute, tzinfo=timezone)
+            except ValueError:
+                continue
+            if now.timestamp() - 86400 <= reset.timestamp() <= now.timestamp() + 8 * 86400:
+                return int(reset.timestamp())
+        return None
+    reset = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    candidates = []
+    for days in (0, 1):
+        for fold in (0, 1):
+            candidate = (reset + datetime.timedelta(days=days)).replace(fold=fold).timestamp()
+            if candidate >= now.timestamp() - 60:
+                candidates.append(int(candidate))
+    return min(candidates) if candidates else None
+
+
+def _clean_usage_text(text):
+    # CSI (including colour) and OSC terminal escapes, plus the UTF-8 BOM.
+    return re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))", "", text).replace("\ufeff", "")
+
+
+def parse_usage_text(text: str, now: datetime.datetime) -> list:
+    buckets = []
+    for line in _clean_usage_text(text).splitlines():
+        match = USAGE_LINE.fullmatch(line)
+        if not match:
+            continue
+        label = match["label"].strip()
+        if not label or label.lower() == "all models":
+            continue
+        percent = 0.0 if match["pct"] == "<1" else float(match["pct"])
+        if not math.isfinite(percent):
+            continue
+        buckets.append({"label": label,
+                        "family": next((family for family in MODEL_FAMILIES if family in label.lower()), None),
+                        "used_percent": percent, "resets_at": parse_reset(match["when"], now)})
+    return buckets
+
+
+def _probe_claude_usage(directory, timeout_s):
+    command = [resolve_claude(), "-p", "/usage", "--output-format", "json",
+               "--no-session-persistence", "--setting-sources", "project"]
+    # Keep the PID: subprocess.run hides it, preventing group cleanup on timeout.
+    with subprocess.Popen(command, cwd=directory, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          start_new_session=True) as child:
+        try:
+            stdout, _ = child.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            _signal_group(child.pid, signal.SIGKILL)
+            child.communicate()
+            raise TimeoutError("claude usage timed out after {:g} seconds".format(timeout_s))
+    if child.returncode:
+        raise ValueError("claude usage exited {}".format(child.returncode))
+    text = _clean_usage_text(stdout.decode("utf-8"))
+    try:
+        value = json.loads(text)
+    except ValueError:
+        pass  # Older CLI versions may print the usage text directly.
+    else:
+        if not isinstance(value, dict) or not isinstance(value.get("result"), str):
+            raise ValueError("claude usage JSON has no result string")
+        text = _clean_usage_text(value["result"])
+    now = datetime.datetime.fromtimestamp(time.time(), datetime.timezone.utc)
+    buckets = parse_usage_text(text, now)
+    if not buckets and not re.search(r"^\s*Current session:\s*(?:<1|\d+(?:\.\d+)?)%\s*used\b",
+                                     text, re.IGNORECASE | re.MULTILINE):
+        raise ValueError("claude usage has no matching lines")
+    return {"source": "usage", "error": None, "buckets": buckets}
+
+
+def _cached_claude_usage(path, now):
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(cached, dict) or not _finite_number(cached.get("read_at")):
+            return None
+        result = cached.get("result")
+        if not isinstance(result, dict) or result.get("source") not in ("usage", "none"):
+            return None
+        buckets = result.get("buckets")
+        if not isinstance(buckets, list):
+            return None
+        if result["source"] == "none":
+            if buckets or not isinstance(result.get("error"), str) or not result["error"].strip():
+                return None
+            if len(result["error"].splitlines()) != 1:
+                return None
+        elif result.get("error") is not None:
+            return None
+        for bucket in buckets:
+            if (not isinstance(bucket, dict) or not isinstance(bucket.get("label"), str)
+                    or not bucket["label"].strip() or bucket.get("family") not in (*MODEL_FAMILIES, None)
+                    or not _finite_number(bucket.get("used_percent")) or bucket["used_percent"] < 0
+                    or (bucket.get("resets_at") is not None and type(bucket["resets_at"]) is not int)):
+                return None
+            if bucket.get("resets_at") is not None and bucket["resets_at"] <= now:
+                return None
+        age = now - cached["read_at"]
+        if 0 <= age < (300 if result["source"] == "usage" else 60):
+            return dict(result, age_s=int(age))
+    except (OSError, ValueError, UnicodeError):
+        pass
+    return None
+
+
+def read_claude_usage(fresh: bool = False, timeout_s: float = 20.0) -> dict:
+    if not _finite_number(timeout_s) or timeout_s <= 0:
+        raise ValueError("timeout must be a positive finite number")
+    try:
+        directory = home().resolve()
+        path = directory / "claude-usage.json"
+        with _private_open(directory / "claude-usage.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            # Another session may have refreshed the cache while we waited.
+            read_at = time.time()
+            cached = None if fresh else _cached_claude_usage(path, read_at)
+            if cached is not None:
+                return cached
+            try:
+                result = _probe_claude_usage(directory, timeout_s)
+            except (OSError, ValueError, UnicodeError) as error:
+                result = {"source": "none", "buckets": [], "error": " ".join(str(error).splitlines())}
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                                 delete=False) as stream:
+                    temporary = Path(stream.name)
+                    os.fchmod(stream.fileno(), 0o600)
+                    json.dump({"read_at": read_at, "result": result}, stream, ensure_ascii=False)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            except OSError:
+                pass  # Cache storage failure must not discard a usable live reading.
+            finally:
+                if temporary is not None:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+    except (OSError, ValueError, UnicodeError) as error:
+        result = {"source": "none", "buckets": [], "error": " ".join(str(error).splitlines())}
+    return dict(result, age_s=0)
+
+
+def _claude_usage(args) -> int:
+    print(json.dumps(read_claude_usage(args.fresh, args.timeout), ensure_ascii=False))
+    return 0
 
 
 def resolve_codex(codex_bin: Optional[str] = None) -> str:
@@ -655,11 +857,15 @@ def changes(before: dict, after: dict) -> dict:
 
 def _prepare_run(args):
     thread = None
+    if args.cause is not None and re.fullmatch(r"[A-Za-z0-9-]{1,32}", args.cause) is None:
+        raise ValueError("--cause must be 1 to 32 letters, digits or hyphens")
     if args.resume is not None:
         if args.worktree:
             raise ValueError("--resume cannot be combined with --worktree")
         if args.model is not None:
             raise ValueError("--model cannot be overridden with --resume")
+        if args.cause is not None:
+            raise ValueError("--cause cannot be overridden with --resume")
         prior = next((record for record in reversed(read_ledger()) if isinstance(record, dict)
                       and record.get("type") == "job" and record.get("id") == args.resume), None)
         if prior is None:
@@ -672,6 +878,7 @@ def _prepare_run(args):
         args.dir = prior["dir"]
         args.write = prior["sandbox"] == "workspace-write"
         args.model = prior.get("model")
+        args.cause = prior.get("cause")
     args.dir = str(Path(args.dir).resolve())
     if not Path(args.dir).is_dir():
         raise ValueError("directory does not exist: {}".format(args.dir))
@@ -700,7 +907,7 @@ def _run_allocated_job(args, job_dir, now, brief, resume_thread, interrupted):
     record = {
         "type": "job", "id": job_dir.name, "session": args.session, "kind": args.kind,
         "tier": args.tier, "dir": args.dir, "sandbox": "workspace-write" if args.write else "read-only",
-        "worktree": args.worktree, "effort": args.effort, "model": args.model,
+        "worktree": args.worktree, "effort": args.effort, "model": args.model, "cause": args.cause,
         "started": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "wall_s": 0,
         "status": "running", "exit": None,
         "tokens": {"input": 0, "cached": 0, "output": 0, "reasoning": 0},
@@ -827,9 +1034,12 @@ def _parse_timestamp(value):
 
 
 def _lockout(args) -> int:
+    if args.bucket is not None and not args.bucket.strip():
+        raise ValueError("--bucket must not be empty")
     if args.last:
         reset_at = next((record["reset_at"] for record in reversed(read_ledger())
                          if isinstance(record, dict) and record.get("type") == "lockout"
+                         and "bucket" not in record
                          and _parse_timestamp(record.get("reset_at")) is not None), None)
         print(json.dumps({"reset_at": reset_at}))
         return 0
@@ -840,10 +1050,24 @@ def _lockout(args) -> int:
         fcntl.flock(ledger, fcntl.LOCK_EX)
         if args.reset_at != "unknown" and any(
             isinstance(record, dict) and record.get("type") == "lockout"
+            and (("bucket" not in record) if args.bucket is None else record.get("bucket") == args.bucket)
             and record.get("reset_at") == args.reset_at for record in read_ledger()
         ):
             return 0
-        _write_ledger(ledger, {"type": "lockout", "reset_at": args.reset_at, "session": args.session})
+        record = {"type": "lockout", "reset_at": args.reset_at, "session": args.session}
+        if args.bucket is not None:
+            record["bucket"] = args.bucket
+        _write_ledger(ledger, record)
+    return 0
+
+
+def _downgrade(args) -> int:
+    if not _finite_number(args.percent) or not 0 <= args.percent <= 1000:
+        raise ValueError("--percent must be a finite number in [0, 1000]")
+    if not all(value.strip() for value in (args.from_model, args.to_model, args.bucket)):
+        raise ValueError("--from, --to and --bucket must not be empty")
+    append_ledger({"type": "downgrade", "from": args.from_model, "to": args.to_model,
+                   "bucket": args.bucket, "percent": args.percent, "session": args.session})
     return 0
 
 
@@ -858,6 +1082,7 @@ def _first_checks(records):
 
 def _fold_job(summary, record, checks, walls):
     summary["jobs"] += 1
+    summary["limit_jobs"] += int(record.get("cause") == "limit")
     summary["by_status"][record["status"]] += 1
     verdict = checks.get(record["id"])
     if verdict is None:
@@ -889,6 +1114,7 @@ def fold(records: list, since: datetime.datetime) -> dict:
         "by_tier": {"A": {"jobs": 0, "checked": 0, "passed": 0},
                     "B": {"jobs": 0, "checked": 0, "passed": 0}},
         "tokens": 0, "median_wall_s": None, "unchecked": 0,
+        "bucket_lockouts": {}, "downgrades": {"total": 0, "by_bucket": {}}, "limit_jobs": 0,
     }
     checks = _first_checks(records)
     walls = []
@@ -899,12 +1125,25 @@ def fold(records: list, since: datetime.datetime) -> dict:
         if timestamp is None or timestamp < since:
             continue
         if record.get("type") == "lockout":
-            summary["lockouts"] += 1
+            counts = summary
+            if "bucket" in record:
+                bucket = record["bucket"]
+                if not isinstance(bucket, str) or not bucket.strip():
+                    continue
+                counts = summary["bucket_lockouts"].setdefault(
+                    bucket, {"lockouts": 0, "locked_s": 0, "unknown_resets": 0})
+            counts["lockouts"] += 1
             reset = _parse_timestamp(record.get("reset_at"))
             if reset is None:
-                summary["unknown_resets"] += 1
+                counts["unknown_resets"] += 1
             else:
-                summary["locked_s"] += max(0, int((reset - timestamp).total_seconds()))
+                counts["locked_s"] += max(0, int((reset - timestamp).total_seconds()))
+        elif record.get("type") == "downgrade":
+            bucket = record.get("bucket")
+            if isinstance(bucket, str) and bucket.strip():
+                summary["downgrades"]["total"] += 1
+                counts = summary["downgrades"]["by_bucket"]
+                counts[bucket] = counts.get(bucket, 0) + 1
         elif (record.get("type") == "job" and isinstance(record.get("id"), str)
               and record.get("status") in ("done", "failed", "limit", "timeout", "interrupted")):
             _fold_job(summary, record, checks, walls)
@@ -915,6 +1154,17 @@ def fold(records: list, since: datetime.datetime) -> dict:
 
 def _report_text(summary, days):
     hours, minutes = divmod(summary["locked_s"] // 60, 60)
+    limits = []
+    for label, counts in sorted(summary["bucket_lockouts"].items()):
+        locked_hours, locked_minutes = divmod(counts["locked_s"] // 60, 60)
+        limits.append("{} {} {}, locked {}h{:02d}m".format(
+            label, counts["lockouts"], "lockout" if counts["lockouts"] == 1 else "lockouts",
+            locked_hours, locked_minutes))
+    downgrades = summary["downgrades"]
+    moved = "subagents moved to a cheaper model: {}".format(downgrades["total"])
+    if downgrades["total"]:
+        moved += " ({})".format("; ".join("{} {}".format(label, count)
+                                         for label, count in sorted(downgrades["by_bucket"].items())))
     median = summary["median_wall_s"]
     if median is None:
         median_text = "n/a"
@@ -927,6 +1177,9 @@ def _report_text(summary, days):
         "crossfeed report, last {} days".format(days),
         "lockouts: {}; locked: {}h{:02d}m; unknown resets: {}".format(
             summary["lockouts"], hours, minutes, summary["unknown_resets"]),
+        "model limits: " + ("; ".join(limits) if limits else "none"),
+        moved,
+        "jobs handed off because of a model limit: {}".format(summary["limit_jobs"]),
         "jobs: {} (done {}, failed {}, limit {}, timeout {}, interrupted {}); codex tokens: {}; median: {}".format(
             summary["jobs"], statuses["done"], statuses["failed"], statuses["limit"], statuses["timeout"],
             statuses["interrupted"], summary["tokens"], median_text),
@@ -951,6 +1204,10 @@ def main(argv) -> int:
     parser = argparse.ArgumentParser(prog="crossfeed")
     parser.add_argument("--version", action="version", version="crossfeed 0.1.1")
     subcommands = parser.add_subparsers(dest="command", required=True)
+    usage = subcommands.add_parser("claude-usage")
+    usage.add_argument("--fresh", action="store_true")
+    usage.add_argument("--timeout", type=float, default=20.0, metavar="SECONDS")
+    usage.set_defaults(handler=_claude_usage)
     stash = subcommands.add_parser("stash")
     stash.set_defaults(handler=_stash)
     check = subcommands.add_parser("check")
@@ -962,7 +1219,15 @@ def main(argv) -> int:
     lockout_action.add_argument("--reset-at")
     lockout_action.add_argument("--last", action="store_true")
     lockout.add_argument("--session")
+    lockout.add_argument("--bucket")
     lockout.set_defaults(handler=_lockout)
+    downgrade = subcommands.add_parser("downgrade")
+    downgrade.add_argument("--from", dest="from_model", required=True)
+    downgrade.add_argument("--to", dest="to_model", required=True)
+    downgrade.add_argument("--bucket", required=True)
+    downgrade.add_argument("--percent", type=float, required=True)
+    downgrade.add_argument("--session")
+    downgrade.set_defaults(handler=_downgrade)
     report = subcommands.add_parser("report")
     report.add_argument("--days", type=int, default=7)
     report.add_argument("--json", action="store_true")
@@ -975,6 +1240,7 @@ def main(argv) -> int:
     run.add_argument("--worktree", action="store_true")
     run.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), default="high")
     run.add_argument("--model", default=None)
+    run.add_argument("--cause")
     run.add_argument("--timeout", type=float, default=30)
     run.add_argument("--resume")
     run.add_argument("--session")
