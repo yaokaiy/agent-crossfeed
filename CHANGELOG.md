@@ -4,6 +4,17 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Fixed
+
+- On each usage update (after a turn, for example), unless the mode is
+  `off`, the plugin reads Codex's quota again when it has no reading or the
+  reading is more than 15 minutes old, at most every 5 minutes. Before,
+  only the start of a session and a subagent call that could be handed off
+  read it, so a session without such calls showed `codex wk N% stale` or
+  `codex unavailable` from then on.
+
 ## 0.2.0 - 2026-11-19
 
 ### Added

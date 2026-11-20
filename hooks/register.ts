@@ -3,8 +3,8 @@ import type { Mode } from './config'
 import { toConfig } from './config'
 import { createCore } from './core'
 import type { Core } from './core'
-import type { ClaudeReading, CodexReading, UsageReading, Family } from './policy'
-import { familyOf, shortProblem } from './policy'
+import type { AgentCall, ClaudeReading, CodexReading, UsageReading, Family } from './policy'
+import { CODEX_MAX_AGE, familyOf, shortProblem } from './policy'
 import { staticSection } from './text'
 
 function logFailure($: EngineInterface, message: string): void {
@@ -108,6 +108,15 @@ export async function readUsage($: EngineInterface, script: string, now: number,
   }
 }
 
+// Takes the readings that are due side by side and keeps each as soon as it arrives,
+// so neither probe delays the other or the other's result.
+async function refreshReadings($: EngineInterface, core: Core, script: string, now: number, due: { codex: boolean; usage: boolean }): Promise<void> {
+  await Promise.all([
+    due.codex ? readCodex($, script, now).then(quota => core.setCodex(quota.reading, quota.problem)) : undefined,
+    due.usage ? readUsage($, script, now, false).then(usage => core.setUsage(usage.reading, usage.problem, now)) : undefined,
+  ])
+}
+
 // An unknown main model only means no model-limit steering, never a skipped reading.
 async function mainModel($: EngineInterface): Promise<string | undefined> {
   try { return await $.session.model() } catch { return undefined }
@@ -156,6 +165,19 @@ export const register: Register = (on, options) => {
     conversationChanged = false
   }
 
+  // A call that could be handed off wants a reading under 5 minutes old. A usage update re-reads
+  // only a reading no call can use, so a stretch without such calls does not leave the status
+  // line stale, and a failed read there never replaces a usable one.
+  function needsCodex(now: number, call?: AgentCall): boolean {
+    if (!core) return false
+    const due = call === undefined
+      ? mode !== 'off' && core.codexAge(now) > CODEX_MAX_AGE
+      : core.needsCodex(call) && core.codexAge(now) > 5 * 60000
+    if (!due || Math.abs(now - lastProbeAt) <= 5 * 60000) return false
+    lastProbeAt = now
+    return true
+  }
+
   function needsUsage(now: number): boolean {
     if (!core || mode === 'off' || core.usageAge(now) <= 10 * 60000 || Math.abs(now - lastUsageProbeAt) <= 10 * 60000) return false
     lastUsageProbeAt = now
@@ -199,10 +221,7 @@ export const register: Register = (on, options) => {
       const now = await clock($)
       core.measure(claudeReading(e.rateLimits), now)
       core.setMainModel(await mainModel($), now)
-      if (needsUsage(now)) {
-        const usage = await readUsage($, script, now, false)
-        core.setUsage(usage.reading, usage.problem, now)
-      }
+      await refreshReadings($, core, script, now, { codex: needsCodex(now), usage: needsUsage(now) })
       showStatus($, core, now)
     }
     return next(e)
@@ -224,19 +243,13 @@ export const register: Register = (on, options) => {
     if (conversationChanged) refreshConversation(await sessionId($))
     if (!core) return next(e)
     const now = await clock($)
-    if (core.needsCodex(e) && core.codexAge(now) > 5 * 60000 && Math.abs(now - lastProbeAt) > 5 * 60000) {
-      lastProbeAt = now
-      const quota = await readCodex($, script, now)
-      core.setCodex(quota.reading, quota.problem)
-    }
-    // A measure event may not have fired yet in a session's first turn: take the reading at decision time.
-    const latest = claudeReading((await $.session.usage()).rateLimits)
-    core.measure(latest, now)
+    // A model-limit reading that arrives during the probes is judged against the main model.
     core.setMainModel(await mainModel($), now)
-    if (needsUsage(now)) {
-      const usage = await readUsage($, script, now, false)
-      core.setUsage(usage.reading, usage.problem, now)
-    }
+    await refreshReadings($, core, script, now, { codex: needsCodex(now, e), usage: needsUsage(now) })
+    // Take the session's own readings at decision time: a measure event may not have fired
+    // yet in a session's first turn, and the main model may have changed during the probes.
+    core.measure(claudeReading((await $.session.usage()).rateLimits), now)
+    core.setMainModel(await mainModel($), now)
     const route = core.route(e, now)
     const stay = core.lastStay()
     // The decision may rest on readings newer than the ones the status line was drawn from.

@@ -179,9 +179,15 @@ status line shows `codex unavailable` without a reading and marks one that
 is too old as `stale`.
 
 The Codex reading is refreshed when it is older than 5 minutes and a call
-could be handed off. After a failed read the plugin waits 5 minutes before
-trying again. A reading whose age is missing or not a number, or that is
-dated more than 5 minutes ahead of the clock, counts as no reading.
+could be handed off, and, unless the mode is `off`, on a usage update
+(Claude Code reports one after each turn and when a usage figure moves a
+whole point) when there is none or it is too old to use, so a stretch
+without such calls does not by itself leave the status line `stale`. A usage
+update never replaces a reading a call could still use, and nothing is
+read while the session is idle. The plugin waits 5 minutes after any
+attempt before the next, whichever event made it. A reading whose age is
+missing or not a number, or that is dated more than 5 minutes ahead of the
+clock, counts as no reading.
 
 ### 5. Model limits: is one model's weekly limit going too fast?
 

@@ -62,6 +62,9 @@ export const INITIAL_PRESSURE: PressureState = { p: 0, updatedAt: 0, samples: []
 
 const MINUTE = 60000
 
+// A Codex reading older than this, or dated this far ahead of the clock, gives no headroom and shows as stale.
+export const CODEX_MAX_AGE = 15 * MINUTE
+
 function usageRate(samples: PressureState['samples'], u: number, now: number): number | undefined {
   if (samples.length < 2) return undefined
   let ref = samples[0]!
@@ -124,7 +127,7 @@ export function pressure(state: PressureState, reading: ClaudeReading): number {
 }
 
 export function headroom(codex: CodexReading | undefined, config: Config, now: number): number {
-  if (!codex || !codex.windows.length || codex.limitReached || Math.abs(now - codex.readAt) > 15 * MINUTE) return 0
+  if (!codex || !codex.windows.length || codex.limitReached || Math.abs(now - codex.readAt) > CODEX_MAX_AGE) return 0
   return Math.min(...codex.windows.map(window => {
     if (window.minutes <= 360) return window.usedPercent >= 90 ? 0 : 1
     const days = window.resetsAt === undefined ? 7 : Math.max(0, (window.resetsAt - now) / (1440 * MINUTE))
@@ -144,8 +147,8 @@ export function headroomCause(codex: CodexReading | undefined, config: Config, n
   const suffix = detail ? ` (${detail})` : ''
   if (codex?.limitReached) return 'Codex reported its limit' + suffix
   if (!codex || !codex.windows.length) return 'no Codex reading' + suffix
-  if (now - codex.readAt > 15 * MINUTE) return `Codex reading is ${Math.round((now - codex.readAt) / MINUTE)} minutes old` + suffix
-  if (codex.readAt - now > 15 * MINUTE) return `Codex reading is dated ${Math.round((codex.readAt - now) / MINUTE)} minutes ahead of the clock` + suffix
+  if (now - codex.readAt > CODEX_MAX_AGE) return `Codex reading is ${Math.round((now - codex.readAt) / MINUTE)} minutes old` + suffix
+  if (codex.readAt - now > CODEX_MAX_AGE) return `Codex reading is dated ${Math.round((codex.readAt - now) / MINUTE)} minutes ahead of the clock` + suffix
   const window = codex.windows.find(window => window.usedPercent >= (window.minutes <= 360 ? 90 : config.codexStopPercent))
   if (!window) return 'no Codex headroom'
   const label = window.minutes === 10080 ? 'weekly' : `${window.minutes / 60}-hour`

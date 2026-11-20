@@ -1,5 +1,5 @@
 import type { Config, Mode } from './config'
-import { INITIAL_PRESSURE, bucketState, familyOf, fallbackFor, rewriteModel, subagentFamily, decide, eligible, fit, forecast, headroom, headroomCause, shortProblem, pressure, updatePressure } from './policy'
+import { CODEX_MAX_AGE, INITIAL_PRESSURE, bucketState, familyOf, fallbackFor, rewriteModel, subagentFamily, decide, eligible, fit, forecast, headroom, headroomCause, shortProblem, pressure, updatePressure } from './policy'
 import type { AgentCall, ClaudeReading, CodexReading, UsageReading, BucketView, Family } from './policy'
 import { limitLines, limitNotice, denyText, dispatchCommand, heredocDelimiter, pressureNotice, reserveNotice, statusLine, stretchReminder } from './text'
 
@@ -123,7 +123,7 @@ export function createCore(config: Config, script: string, session?: string): Co
       w: reading.sevenDay?.percentUsed,
       codexPercent: weeklyPercent(codex),
       codexAvailable: !!codex?.windows.length,
-      codexStale: codex !== undefined && codexAge(now) > 15 * 60000,
+      codexStale: codex !== undefined && codexAge(now) > CODEX_MAX_AGE,
       P: pressure(state, reading),
       reserve: (reading.fiveHour?.percentUsed ?? 0) >= 90,
     })

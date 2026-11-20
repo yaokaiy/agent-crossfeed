@@ -30,6 +30,8 @@ function setup(on: On) {
     processes: [] as { argv: readonly string[]; timeout?: number; stdin?: string }[],
     agents: [] as unknown[], statuses: [] as (string | undefined)[], logs: [] as string[], commands: [] as string[],
     bashCalls: 0, denyBash: false, denyAgent: false, failStatus: false,
+    holdProbes: false, openProbes: 0, mostOpenProbes: 0, duringQuota: undefined as (() => void) | undefined,
+    usageGate: undefined as Promise<void> | undefined,
   }
   on('clock.now', () => {
     if (world.failClock) { world.failClock = false; return { deny: 'clock unavailable' } }
@@ -61,10 +63,18 @@ function setup(on: On) {
   on('ui.log', (_$, e) => { world.logs.push(e.text); return { value: undefined } })
   on('command.register', (_$, e) => { world.commands.push(e.name); return { value: { command: e.name } } })
   on('command.run', () => ({ text: 'engine command' }))
-  on('process.run', (_$, e) => {
+  on('process.run', async (_$, e) => {
+    // A held probe waits a few turns of the event loop for the other probe to start, so a test can see them overlap.
+    if (world.holdProbes && (e.argv[3] === 'quota' || e.argv[3] === 'claude-usage')) {
+      world.openProbes += 1
+      world.mostOpenProbes = Math.max(world.mostOpenProbes, world.openProbes)
+      for (let i = 0; i < 100 && world.openProbes < 2; i++) await Promise.resolve()
+      world.openProbes -= 1
+    }
     // Keep the legacy process trace intact; new usage probes have their own complete trace.
     if (e.argv[3] === 'claude-usage') {
       world.usageProcesses.push({ argv: e.argv, timeout: e.init?.timeoutMs })
+      await world.usageGate
       if (world.failUsage) throw new Error('usage unavailable')
       return { value: world.claudeUsage }
     }
@@ -77,6 +87,7 @@ function setup(on: On) {
     if (world.processFailure) throw new Error(world.processFailure)
     if (world.rejectProcess) return { deny: 'process unavailable' }
     if (e.argv[3] === 'lockout') return { value: world.lockout }
+    if (e.argv[3] === 'quota') world.duringQuota?.()
     return { value: e.argv[3] === 'report' ? processResult('synthetic report\n') : world.quota }
   })
   on('tool.call', { tool: 'Agent' }, (_$, e) => { world.agents.push(e); return world.denyAgent ? { deny: 'engine denied' } : AGENT_RESULT })
@@ -374,6 +385,101 @@ for (const failed of ['reject', 'non-zero', 'bad JSON', 'none', 'empty windows']
   })
 }
 
+test('turns without subagent calls re-read Codex once its reading is too old to use', async ($, on) => {
+  const world = setup(on)
+  const probes = () => world.processes.filter(call => call.argv[3] === 'quota').length
+  await start($)
+  await measure($, world, 5)
+  // A reading that calls can still use is kept: a failed read on a usage update must not replace it.
+  world.quota = processResult('', 1)
+  world.now = BASE + 15 * MINUTE
+  await measure($, world, 6)
+  expect(probes()).toBe(1)
+  expect(world.statuses[world.statuses.length - 1]?.includes('codex wk 18% ·')).toBe(true)
+  world.quota = processResult(JSON.stringify({ ...QUOTA, windows: [{ ...QUOTA.windows[0]!, used_percent: 30 }] }))
+  world.now += 1
+  await measure($, world, 6)
+  expect(probes()).toBe(2)
+  expect(world.statuses[world.statuses.length - 1]?.includes('codex wk 30% ·')).toBe(true)
+  world.now += 15 * MINUTE
+  await measure($, world, 7)
+  expect(probes()).toBe(2)
+  world.now = BASE + 3 * 60 * MINUTE
+  await measure($, world, 8)
+  expect(probes()).toBe(3)
+  expect(world.statuses[world.statuses.length - 1]?.includes('stale')).toBe(false)
+})
+
+test('a subagent call is decided on the Claude reading taken after its Codex probe', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  world.now += 6 * MINUTE
+  world.duringQuota = () => { world.usage = [{ kind: 'five_hour', percentUsed: 5, resetsAt: RESET }] }
+  expect((await $.tool.call(AGENT)).deny?.startsWith('crossfeed:')).toBe(true)
+})
+
+test('a usage update takes the Codex and usage readings side by side', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  world.holdProbes = true
+  world.now = BASE + 20 * MINUTE
+  await measure($, world, 5)
+  expect(world.processes.filter(call => call.argv[3] === 'quota').length).toBe(2)
+  expect(world.usageProcesses.length).toBe(2)
+  expect(world.mostOpenProbes).toBe(2)
+})
+
+test('a Codex reading is kept as soon as it arrives, while the usage probe still runs', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  world.quota = processResult(JSON.stringify({ ...QUOTA, windows: [{ ...QUOTA.windows[0]!, used_percent: 30 }] }))
+  let release = () => {}
+  world.usageGate = new Promise<void>(resolve => { release = resolve })
+  world.now = BASE + 20 * MINUTE
+  const pending = measure($, world, 5)
+  let shown = ''
+  for (let i = 0; i < 20 && !shown.includes('codex wk 30% ·'); i++) shown = (await command($, 'status')).text ?? ''
+  release()
+  await pending
+  expect(shown.includes('codex wk 30% ·')).toBe(true)
+})
+
+test('a missing Codex reading is retried on usage updates under the same five-minute throttle as calls', async ($, on) => {
+  const world = setup(on)
+  const probes = () => world.processes.filter(call => call.argv[3] === 'quota').length
+  world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+  world.quota = processResult('', 1)
+  await start($)
+  expect(world.statuses[world.statuses.length - 1]?.includes('codex unavailable')).toBe(true)
+  world.now = BASE + 5 * MINUTE
+  await measure($, world, 2)
+  expect(probes()).toBe(1)
+  world.now += 1
+  await measure($, world, 2)
+  expect(probes()).toBe(2)
+  world.quota = processResult(JSON.stringify(QUOTA))
+  world.now += 5 * MINUTE
+  expect(await $.tool.call(AGENT)).toEqual(AGENT_RESULT)
+  expect(probes()).toBe(2)
+  world.now += 1
+  await measure($, world, 2)
+  expect(probes()).toBe(3)
+  expect(world.statuses[world.statuses.length - 1]?.includes('codex wk 18% ·')).toBe(true)
+  expect((await $.tool.call(AGENT)).deny?.startsWith('crossfeed:')).toBe(true)
+  expect(probes()).toBe(3)
+})
+
+test('off mode reads no Codex quota on usage updates', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await command($, 'off')
+  world.now += 20 * MINUTE
+  world.processes = []
+  await measure($, world, 5)
+  expect(world.processes.length).toBe(0)
+  expect(world.statuses[world.statuses.length - 1]).toBe('crossfeed off')
+})
+
 test('each routing decision is logged with the same sentence shown in status', async ($, on) => {
   const world = setup(on)
   await start($)
@@ -579,6 +685,15 @@ test('a status line that cannot be drawn does not block commands, readings or ro
 
 
 const MODEL_USAGE = { source: 'usage', age_s: 0, error: null, buckets: [{ label: 'Fable', family: 'fable', used_percent: 62, resets_at: (BASE + 4.5 * 1440 * MINUTE) / 1000 }] }
+test('a subagent call is decided on the main model in use after its Codex probe', async ($, on) => {
+  const world = scarce(on)
+  world.model = 'opus'
+  await start($)
+  world.now += 6 * MINUTE
+  world.duringQuota = () => { world.model = 'claude-fable-5-2' }
+  expect((await $.tool.call(RESEARCH)).deny?.startsWith('crossfeed:')).toBe(true)
+})
+
 const SPAWN: AgentSpawnInput = { tool_use_id: 'spawn-test', prompt: 'Research the protocol.', description: 'Research', subagentType: 'general-purpose', provider: { plugin: 'engine', tier: 'core' }, parentModel: 'claude-fable-5-2', background: false, fork: false }
 function scarce(on: On) {
   const world = setup(on)
