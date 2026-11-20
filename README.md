@@ -337,7 +337,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Status and limits
 
-Version 0.2.0 is an early release.
+Version 0.2.1 is an early release.
 
 - Hand-offs aim to make lockouts rarer and later. A before and after count
   is not in yet (see [Measured so far](#measured-so-far)), and what the
