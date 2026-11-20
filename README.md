@@ -4,27 +4,30 @@
 
 <h1 align="center">agent-crossfeed</h1>
 
-<p align="center"><strong>Dynamic subagent routing from Claude Code to Codex, paced by Claude's usage limits.</strong></p>
+<p align="center"><strong>Spend your Codex quota on subagent work before Claude's usage limit locks you out.</strong></p>
 
 <p align="center">
   <a href="https://github.com/yaokaiy/agent-crossfeed/actions/workflows/ci.yml"><img src="https://github.com/yaokaiy/agent-crossfeed/actions/workflows/ci.yml/badge.svg" alt="ci"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
 </p>
 
-agent-crossfeed is a Claude Code plugin for people who also have a Codex
-subscription. Each time Claude is about to start a subagent, crossfeed
-decides whether that work should stay on Claude or go to the Codex CLI. It
-decides from three signals: what kind of task the brief describes, how fast
-Claude's 5-hour window is filling, and how much Codex quota is left. When
-the work should move, crossfeed refuses the subagent call and hands Claude
-one command that runs the same brief on Codex. Claude keeps planning the
-work and talking to you, and is told to check what comes back.
+When Claude's 5-hour window fills, you are locked out of Claude until it
+resets. A model's weekly limit, such as Fable's, can run out days early. If
+you also pay for Codex, that quota may be sitting unused at the same moment.
+agent-crossfeed is a Claude Code plugin that hands suitable subagent work to
+the Codex CLI while Codex has room, more of it as Claude's limits fill
+faster. The aim is fewer and later lockouts.
 
-It also watches Claude's model-scoped weekly limits, such as the one
-Claude Code's `/usage` shows for Fable. While one is being used faster than
-an even pace, subagents that would run on that model go to Codex or run on
-a cheaper Claude model, and the main loop is asked to keep the scarce model
-for planning, decisions and review.
+- **Decides each subagent call as it starts**, from what the brief asks
+  for, how fast Claude's limits are filling and how much Codex quota is
+  left.
+- **Moves work off a scarce model.** While a model's weekly limit is ahead
+  of an even pace, research and review that would use it can go to Codex,
+  and subagents that only inherit it from your main loop can run on a
+  cheaper Claude model.
+- **Keeps you in one conversation.** A hand-off refuses the subagent call
+  and gives Claude one command that runs the same brief on Codex; Claude is
+  told to check what comes back.
 
 ```mermaid
 flowchart TD
@@ -45,10 +48,9 @@ to fill. [How it routes](#how-it-routes) has the numbers.
 
 ## Why
 
-Claude's 5-hour usage window stops every Claude session when it fills. Much
-of what fills it is execution: subagents, and long runs of commands and
-edits. Several subagents started together can fill a window within half an
-hour.
+Much of what fills Claude's 5-hour window is execution: subagents, and long
+runs of commands and edits. Several subagents started together can fill a
+window within half an hour.
 
 Some models also have a weekly limit of their own. In one heavy user's logs
 it ran out before its reset three weeks in a row, once 2.3 days into the
@@ -56,10 +58,9 @@ week while the all-model week was at 54%. In that week about 28% of the
 model's use (weighted by API prices) came from subagents that never asked
 for it and inherited it from the main loop.
 
-If you also pay for Codex, that quota may be sitting unused while Claude is
-locked. A usage meter shows you this, and a delegation command lets you
-move one task by hand. crossfeed decides for every subagent call at the
-moment it starts, and says why.
+A usage meter shows how fast you are using Claude, and a delegation
+command lets you move one task by hand. crossfeed decides for every
+subagent call at the moment it starts, and says why.
 
 The name comes from aviation, where crossfeed lets an engine draw fuel from
 the other side's tank so that neither runs dry first.
@@ -192,8 +193,10 @@ go to Codex too, while it has headroom. And a window that begins within two
 hours of a locked window's reset starts with pressure already raised; that
 start counts for the window's first 30 minutes.
 
-If either quota cannot be read, nothing is handed off, and `/crossfeed
-status` names the reason. By default a call is considered when it names no
+If Codex's quota cannot be read, nothing is handed off. Without a reading
+of Claude's 5-hour window, only calls that would run on a model whose
+weekly limit is ahead or used up can be. `/crossfeed status` names the
+reason. By default a call is considered when it names no
 agent type or one of the general-purpose types (the `eligibleTypes`
 option). Other agent types, calls pinned to the `haiku` model, named or
 remote agents, calls made by a subagent itself, and briefs that mention
