@@ -58,7 +58,7 @@ export function staticSection(script: string): string {
     '- Keep design, architecture and UX decisions, talking with the user, and edits under about 20 lines for yourself.',
     "- When crossfeed says a model's weekly limit is ahead of pace, keep planning, decisions and review yourself and hand execution to Codex.",
     '- While a write job runs, do not edit files in its directory.',
-    `- A Codex result is a claim. Read the change list, run the check as \`python3 -I ${shellQuote(script)} check <job> -- <command>\`, then report.`,
+    `- A Codex result is a claim. Check it before you report it: after a write job, read the change list and run the check as \`python3 -I ${shellQuote(script)} check <job> -- <command>\`; after a read-only job that succeeded, verify its claims and record whether you used it as \`python3 -I ${shellQuote(script)} used <job> <yes|partly|no>\`.`,
     '- Exit code 75 means Codex is out of quota: do the work yourself.',
     '- Exit code 127 means the codex CLI was not found: do the work yourself and tell the user.',
   ].join('\n')

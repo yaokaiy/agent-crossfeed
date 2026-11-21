@@ -2,7 +2,7 @@ import type { EngineInterface, HookFailure, Register, SessionRateLimit } from 'c
 import type { Mode } from './config'
 import { toConfig } from './config'
 import { createCore } from './core'
-import type { Core } from './core'
+import type { Core, DecisionRecord } from './core'
 import type { AgentCall, ClaudeReading, CodexReading, UsageReading, Family } from './policy'
 import { CODEX_MAX_AGE, familyOf, shortProblem } from './policy'
 import { staticSection } from './text'
@@ -78,9 +78,13 @@ async function readCodex($: EngineInterface, script: string, now: number): Promi
   }
 }
 
-export async function readUsage($: EngineInterface, script: string, now: number, fresh: boolean): Promise<{ reading?: UsageReading; problem?: string }> {
+// The reading's time is taken when the probe answers, less the age of its data, so of two
+// overlapping probes the one whose data is newer also has the later time, whichever started
+// first. `at` is that answer time, the clock to judge the reading by.
+export async function readUsage($: EngineInterface, script: string, fresh: boolean): Promise<{ reading?: UsageReading; problem?: string; at?: number }> {
   try {
     const result = await $.process.run(['python3', '-I', script, 'claude-usage', ...(fresh ? ['--fresh'] : [])], { timeoutMs: 25000 })
+    const now = await clock($)
     if (result.exitCode !== 0) return { problem: `usage probe exited with code ${result.exitCode}` }
     if (result.isStdoutTruncated) return { problem: 'usage probe output was truncated' }
     let value: unknown
@@ -102,7 +106,7 @@ export async function readUsage($: EngineInterface, script: string, now: number,
       if (reset !== null && (typeof reset !== 'number' || !Number.isFinite(reset * 1000) || Math.abs(reset * 1000) > 8640000000000000)) return { problem: 'usage probe returned an invalid reset time' }
       buckets.push({ label: bucket.label, family: bucket.family === null ? undefined : bucket.family as Family, usedPercent: bucket.used_percent, resetsAt: reset === null ? undefined : (reset as number) * 1000 })
     }
-    return { reading: { buckets, readAt: now - Math.max(0, age) * 1000 } }
+    return { reading: { buckets, readAt: now - Math.max(0, age) * 1000 }, at: now }
   } catch (error) {
     return { problem: shortProblem(`usage probe failed: ${String(error)}`) }
   }
@@ -113,7 +117,7 @@ export async function readUsage($: EngineInterface, script: string, now: number,
 async function refreshReadings($: EngineInterface, core: Core, script: string, now: number, due: { codex: boolean; usage: boolean }): Promise<void> {
   await Promise.all([
     due.codex ? readCodex($, script, now).then(quota => core.setCodex(quota.reading, quota.problem)) : undefined,
-    due.usage ? readUsage($, script, now, false).then(usage => core.setUsage(usage.reading, usage.problem, now)) : undefined,
+    due.usage ? readUsage($, script, false).then(usage => core.setUsage(usage.reading, usage.problem, usage.at ?? now)) : undefined,
   ])
 }
 
@@ -148,6 +152,20 @@ async function stashBrief($: EngineInterface, script: string, prompt: string): P
   return undefined
 }
 
+function errorText(error: unknown): string {
+  try { return String(error) } catch { return 'an error that cannot be shown' }
+}
+
+// Never throws: a failed record must not fail the hook, which would replay the call through failOpen.
+async function recordDecision($: EngineInterface, script: string, record: DecisionRecord): Promise<void> {
+  try {
+    const result = await $.process.run(['python3', '-I', script, 'decision'], { stdin: JSON.stringify(record), timeoutMs: 5000 })
+    if (result.exitCode !== 0) logFailure($, `decision record exited with code ${result.exitCode}`)
+  } catch (error) {
+    logFailure($, `decision record failed: ${errorText(error)}`)
+  }
+}
+
 export const register: Register = (on, options) => {
   let core: Core | undefined
   let script = ''
@@ -158,6 +176,29 @@ export const register: Register = (on, options) => {
   let lastProbeAt = -Infinity
   let lastUsageProbeAt = -Infinity
   let mode: Mode = 'auto'
+  // Readings of the session's usage and main model are applied in the order they were asked for:
+  // a reply that arrives after a newer reading was applied is dropped, whichever hook asked. A
+  // usage update's reading counts as asked for when its event came. Claude Code raises an update
+  // whenever a window moves a whole point, so once the updates already raised are handled, the
+  // reading held is at most under a point older than a dropped reply.
+  let usageAsked = 0
+  let usageApplied = 0
+  let modelAsked = 0
+  let modelApplied = 0
+
+  function applyUsage(asked: number, reading: ClaudeReading, now: number): void {
+    if (!core || asked <= usageApplied) return
+    usageApplied = asked
+    core.measure(reading, now)
+  }
+
+  // A failed model read (undefined) clears the model, as before, but does not count as applied,
+  // so an earlier read that answers later still sets it.
+  function applyModel(asked: number, model: string | undefined, now: number): void {
+    if (!core || asked <= modelApplied) return
+    if (model !== undefined) modelApplied = asked
+    core.setMainModel(model, now)
+  }
 
   function refreshConversation(id: string | undefined): void {
     session = id
@@ -199,13 +240,15 @@ export const register: Register = (on, options) => {
     const [quota, lockout, usage] = await Promise.all([
       config.mode === 'off' ? Promise.resolve({ reading: undefined, problem: undefined }) : readCodex($, script, now),
       readLockout($, script),
-      config.mode === 'off' ? Promise.resolve({ reading: undefined, problem: undefined }) : readUsage($, script, now, false),
+      config.mode === 'off' ? Promise.resolve({ reading: undefined, problem: undefined, at: undefined }) : readUsage($, script, false),
     ])
     core.setCodex(quota.reading, quota.problem)
     core.setLockout(lockout)
-    core.measure(claudeReading((await $.session.usage()).rateLimits), now)
-    core.setMainModel(await mainModel($), now)
-    if (mode !== 'off') core.setUsage(usage.reading, usage.problem, now)
+    const usageAsk = ++usageAsked
+    applyUsage(usageAsk, claudeReading((await $.session.usage()).rateLimits), now)
+    const modelAsk = ++modelAsked
+    applyModel(modelAsk, await mainModel($), now)
+    if (mode !== 'off') core.setUsage(usage.reading, usage.problem, usage.at ?? now)
     showStatus($, core, now)
     return next(e)
   }).catch(failOpen)
@@ -216,11 +259,13 @@ export const register: Register = (on, options) => {
   }).catch(failOpen)
 
   on('session.measure', async ($, e, next) => {
+    const usageAsk = ++usageAsked
     if (conversationChanged) refreshConversation(await sessionId($))
     if (core) {
       const now = await clock($)
-      core.measure(claudeReading(e.rateLimits), now)
-      core.setMainModel(await mainModel($), now)
+      applyUsage(usageAsk, claudeReading(e.rateLimits), now)
+      const modelAsk = ++modelAsked
+      applyModel(modelAsk, await mainModel($), now)
       await refreshReadings($, core, script, now, { codex: needsCodex(now), usage: needsUsage(now) })
       showStatus($, core, now)
     }
@@ -244,26 +289,42 @@ export const register: Register = (on, options) => {
     if (!core) return next(e)
     const now = await clock($)
     // A model-limit reading that arrives during the probes is judged against the main model.
-    core.setMainModel(await mainModel($), now)
+    const firstModelAsk = ++modelAsked
+    applyModel(firstModelAsk, await mainModel($), now)
     await refreshReadings($, core, script, now, { codex: needsCodex(now, e), usage: needsUsage(now) })
     // Take the session's own readings at decision time: a measure event may not have fired
     // yet in a session's first turn, and the main model may have changed during the probes.
-    core.measure(claudeReading((await $.session.usage()).rateLimits), now)
-    core.setMainModel(await mainModel($), now)
-    const route = core.route(e, now)
+    const usageAsk = ++usageAsked
+    applyUsage(usageAsk, claudeReading((await $.session.usage()).rateLimits), now)
+    const modelAsk = ++modelAsked
+    applyModel(modelAsk, await mainModel($), now)
+    // Decide at the time the decision is made, with no wait in between: a call that waited on
+    // its reads must not date itself before a later call that has already been decided.
+    const decidedAt = await clock($)
+    const route = core.route(e, decidedAt)
+    // Read before any await: an overlapping call may decide in the meantime.
     const stay = core.lastStay()
+    const record = core.lastRecord()
+    const decision = core.lastDecision()
     // The decision may rest on readings newer than the ones the status line was drawn from.
-    showStatus($, core, now)
+    showStatus($, core, decidedAt)
     if (!route) {
-      try { $.ui.log(core.lastDecision()) } catch { /* Logging must not block the call. */ }
-      const ran = await next(e)
-      if (ran.deny !== undefined && stay !== undefined) core.forgetStay(stay)
-      return ran
+      try { $.ui.log(decision) } catch { /* Logging must not block the call. */ }
+      // The record is written while the subagent starts, not before it.
+      const written = record ? recordDecision($, script, record) : undefined
+      try {
+        const ran = await next(e)
+        if (ran.deny !== undefined && stay !== undefined) core.forgetStay(stay)
+        return ran
+      } finally {
+        await written
+      }
     }
     const cwd = await $.session.cwd()
     const briefFile = await stashBrief($, script, e.prompt)
-    const deny = core.denial(route, e, cwd, now, briefFile)
-    try { $.ui.log(core.lastDecision()) } catch { /* Logging must not block the handoff. */ }
+    const deny = core.denial(route, e, cwd, decidedAt, briefFile, record)
+    try { $.ui.log(decision) } catch { /* Logging must not block the handoff. */ }
+    if (record) await recordDecision($, script, { ...record, brief_file: briefFile ?? null })
     return { deny }
   }).catch(failOpen)
 
@@ -306,10 +367,11 @@ export const register: Register = (on, options) => {
       catch (error) { logFailure($, `lockout record failed: ${String(error)}`) }
     }
     if (core && mode !== 'off' && e.error === 'rate_limit') {
-      core.setMainModel(await mainModel($), now)
+      const modelAsk = ++modelAsked
+      applyModel(modelAsk, await mainModel($), now)
       lastUsageProbeAt = now
-      const usage = await readUsage($, script, now, true)
-      core.setUsage(usage.reading, usage.problem, now)
+      const usage = await readUsage($, script, true)
+      core.setUsage(usage.reading, usage.problem, usage.at ?? now)
       const bucket = core.bucketLockout(now)
       if (bucket) await $.process.run(['python3', '-I', script, 'lockout', '--reset-at', bucket.resetAt, '--bucket', bucket.bucket, ...(session ? ['--session', session] : [])])
       showStatus($, core, now)

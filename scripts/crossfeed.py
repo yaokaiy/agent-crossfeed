@@ -359,6 +359,11 @@ def read_ledger() -> list:
     return records
 
 
+def _last_job(job_id):
+    return next((record for record in reversed(read_ledger()) if isinstance(record, dict)
+                 and record.get("type") == "job" and record.get("id") == job_id), None)
+
+
 def write_state(job_dir: Path, state: dict) -> None:
     temporary = None
     try:
@@ -759,8 +764,13 @@ def _print_job(record, job_dir, result, errors, timeout_minutes, change_list, ch
         _print_changes(change_list, change_error)
     if record["status"] == "done":
         print("[crossfeed] full result: {}".format(job_dir / "result.md"))
-        print("[crossfeed] record the outcome: python3 -I {} check {} -- <your check command>".format(
-            shlex.quote(str(Path(__file__).resolve())), record["id"]))
+        script = shlex.quote(str(Path(__file__).resolve()))
+        if record["sandbox"] == "read-only":
+            print("[crossfeed] once you have checked its claims, record whether you used this result: "
+                  "python3 -I {} used {} <yes|partly|no>".format(script, record["id"]))
+        else:
+            print("[crossfeed] record the outcome: python3 -I {} check {} -- <your check command>".format(
+                script, record["id"]))
     elif record["status"] == "failed":
         print("[crossfeed] last log lines:")
         for line in errors[-20:]:
@@ -866,8 +876,7 @@ def _prepare_run(args):
             raise ValueError("--model cannot be overridden with --resume")
         if args.cause is not None:
             raise ValueError("--cause cannot be overridden with --resume")
-        prior = next((record for record in reversed(read_ledger()) if isinstance(record, dict)
-                      and record.get("type") == "job" and record.get("id") == args.resume), None)
+        prior = _last_job(args.resume)
         if prior is None:
             raise ValueError("unknown job: {}".format(args.resume))
         thread = prior.get("codex_thread")
@@ -904,8 +913,10 @@ def _job_status(code, timed_out, result, errors):
 
 def _run_allocated_job(args, job_dir, now, brief, resume_thread, interrupted):
     start = time.monotonic()
+    session = args.session if args.session is not None else os.environ.get("CLAUDE_CODE_SESSION_ID")
     record = {
-        "type": "job", "id": job_dir.name, "session": args.session, "kind": args.kind,
+        "type": "job", "id": job_dir.name, "session": session or None, "kind": args.kind,
+        "brief_file": args.brief_file,
         "tier": args.tier, "dir": args.dir, "sandbox": "workspace-write" if args.write else "read-only",
         "worktree": args.worktree, "effort": args.effort, "model": args.model, "cause": args.cause,
         "started": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "wall_s": 0,
@@ -1001,6 +1012,40 @@ def _stash(args) -> int:
     raise FileExistsError("could not allocate a brief after 5 attempts")
 
 
+def _reject_json_constant(constant):
+    raise ValueError("invalid JSON constant: {}".format(constant))
+
+
+def _decision(args) -> int:
+    payload = sys.stdin.buffer.read(16385)
+    if len(payload) > 16384:
+        raise ValueError("decision input exceeds 16384 bytes")
+    try:
+        data = json.loads(payload.decode("utf-8-sig"), parse_constant=_reject_json_constant)
+    except UnicodeDecodeError as error:
+        raise ValueError("decision input must be UTF-8") from error
+    except RecursionError as error:
+        raise ValueError("decision input is nested too deeply") from error
+    if not isinstance(data, dict):
+        raise ValueError("decision input must be a JSON object")
+    for field in ("eligible", "handed_off"):
+        if not isinstance(data.get(field), bool):
+            raise ValueError("decision field {} must be a boolean".format(field))
+    if data["handed_off"] and not data["eligible"]:
+        raise ValueError("a decision cannot hand off a call that is not eligible")
+    try:
+        # A number too large for a float (1e400) parses as infinity and would be written as Infinity.
+        json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("decision text must be encodable as UTF-8") from error
+    except RecursionError as error:
+        raise ValueError("decision input is nested too deeply") from error
+    record = {"type": "decision"}
+    record.update((key, value) for key, value in data.items() if key not in ("type", "v", "ts"))
+    append_ledger(record)
+    return 0
+
+
 def _check(args) -> int:
     known = any(isinstance(record, dict) and record.get("type") == "job"
                 and record.get("id") == args.job for record in read_ledger())
@@ -1021,6 +1066,20 @@ def _check(args) -> int:
     append_ledger({"type": "check", "id": args.job, "verdict": "pass" if code == 0 else "fail",
                    "exit": code, "cmd": Path(command[0]).name})
     return code
+
+
+USE_VERDICTS = ("yes", "partly", "no")
+
+
+def _used(args) -> int:
+    job = _last_job(args.job)
+    if job is None:
+        raise ValueError("unknown job: {}".format(args.job))
+    status = job.get("status")
+    if status != "done":
+        raise ValueError("job {} did not finish (status {})".format(args.job, status))
+    append_ledger({"type": "use", "id": args.job, "verdict": args.verdict})
+    return 0
 
 
 def _parse_timestamp(value):
@@ -1080,6 +1139,39 @@ def _first_checks(records):
     return checks
 
 
+def _report_links(records):
+    briefs = set()
+    uses = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("type")
+        if kind == "job" and isinstance(record.get("id"), str):
+            brief = record.get("brief_file")
+            if isinstance(brief, str) and brief:
+                briefs.add(brief)
+        elif (kind == "use" and isinstance(record.get("id"), str)
+              and record.get("verdict") in USE_VERDICTS):
+            uses[record["id"]] = record["verdict"]
+    return briefs, uses
+
+
+def _fold_decision(counts, record, briefs):
+    eligible, handed_off = record.get("eligible"), record.get("handed_off")
+    if not (isinstance(eligible, bool) and isinstance(handed_off, bool)) or (handed_off and not eligible):
+        return
+    counts["total"] += 1
+    if not eligible:
+        counts["ineligible"] += 1
+    elif handed_off:
+        counts["handed_off"] += 1
+        brief = record.get("brief_file")
+        if isinstance(brief, str) and brief in briefs:
+            counts["run"] += 1
+    else:
+        counts["stayed"] += 1
+
+
 def _fold_job(summary, record, checks, walls):
     summary["jobs"] += 1
     summary["limit_jobs"] += int(record.get("cause") == "limit")
@@ -1105,7 +1197,7 @@ def _fold_job(summary, record, checks, walls):
 
 
 def fold(records: list, since: datetime.datetime) -> dict:
-    """Summarize jobs and lockouts since the cutoff, retaining each job's first verdict."""
+    """Summarize activity since the cutoff using first checks and latest use verdicts."""
     if since.tzinfo is None:
         since = since.replace(tzinfo=datetime.timezone.utc)
     summary = {
@@ -1115,8 +1207,11 @@ def fold(records: list, since: datetime.datetime) -> dict:
                     "B": {"jobs": 0, "checked": 0, "passed": 0}},
         "tokens": 0, "median_wall_s": None, "unchecked": 0,
         "bucket_lockouts": {}, "downgrades": {"total": 0, "by_bucket": {}}, "limit_jobs": 0,
+        "decisions": {"total": 0, "ineligible": 0, "handed_off": 0, "run": 0, "stayed": 0},
+        "used": {"yes": 0, "partly": 0, "no": 0, "unrated": 0},
     }
     checks = _first_checks(records)
+    briefs, uses = _report_links(records)
     walls = []
     for record in records:
         if not isinstance(record, dict):
@@ -1144,9 +1239,13 @@ def fold(records: list, since: datetime.datetime) -> dict:
                 summary["downgrades"]["total"] += 1
                 counts = summary["downgrades"]["by_bucket"]
                 counts[bucket] = counts.get(bucket, 0) + 1
+        elif record.get("type") == "decision":
+            _fold_decision(summary["decisions"], record, briefs)
         elif (record.get("type") == "job" and isinstance(record.get("id"), str)
               and record.get("status") in ("done", "failed", "limit", "timeout", "interrupted")):
             _fold_job(summary, record, checks, walls)
+            if record["status"] == "done" and record.get("sandbox") == "read-only":
+                summary["used"][uses.get(record["id"], "unrated")] += 1
     if walls:
         summary["median_wall_s"] = float(statistics.median(walls))
     return summary
@@ -1180,11 +1279,14 @@ def _report_text(summary, days):
         "model limits: " + ("; ".join(limits) if limits else "none"),
         moved,
         "jobs handed off because of a model limit: {}".format(summary["limit_jobs"]),
+        "subagent calls: {total}; not eligible: {ineligible}; handed to Codex: {handed_off} (run: {run}); "
+        "stayed on Claude: {stayed}".format(**summary["decisions"]),
         "jobs: {} (done {}, failed {}, limit {}, timeout {}, interrupted {}); codex tokens: {}; median: {}".format(
             summary["jobs"], statuses["done"], statuses["failed"], statuses["limit"], statuses["timeout"],
             statuses["interrupted"], summary["tokens"], median_text),
         "first-delivery checks: A {}/{}, B {}/{}; unchecked: {}".format(
             tier_a["passed"], tier_a["checked"], tier_b["passed"], tier_b["checked"], summary["unchecked"]),
+        "read-only results used: yes {yes}, partly {partly}, no {no}; not rated: {unrated}".format(**summary["used"]),
     ])
 
 
@@ -1210,10 +1312,16 @@ def main(argv) -> int:
     usage.set_defaults(handler=_claude_usage)
     stash = subcommands.add_parser("stash")
     stash.set_defaults(handler=_stash)
+    decision = subcommands.add_parser("decision")
+    decision.set_defaults(handler=_decision)
     check = subcommands.add_parser("check")
     check.add_argument("job")
     check.add_argument("check_command", nargs=argparse.REMAINDER)
     check.set_defaults(handler=_check)
+    used = subcommands.add_parser("used")
+    used.add_argument("job")
+    used.add_argument("verdict", choices=USE_VERDICTS)
+    used.set_defaults(handler=_used)
     lockout = subcommands.add_parser("lockout")
     lockout_action = lockout.add_mutually_exclusive_group(required=True)
     lockout_action.add_argument("--reset-at")

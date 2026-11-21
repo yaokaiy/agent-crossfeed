@@ -510,3 +510,146 @@ for (const [family, percent, opusPercent, fallback] of [
     }
   })
 }
+
+function decisionCore(session = 'session-1') {
+  const core = createCore(DEFAULTS, SCRIPT, session)
+  core.setCodex(codex())
+  measure(core, 5)
+  core.setMainModel('claude-opus-5-5', BASE)
+  return core
+}
+
+const RECORD_BASE = {
+  session: 'session-1', mode: 'auto', agent_type: null, model: null, main_model: 'claude-opus-5-5', from_subagent: false,
+  description: null, cause: null, burst: 0, pressure: 0, five_hour: 5, forecast: null, seven_day: null,
+  codex_headroom: 1, codex_weekly: 18, codex_age_s: 0, limit: null, brief_file: null,
+}
+
+test('a hand-off decision is recorded with its tier, policy reason and readings', async () => {
+  const core = decisionCore()
+  expect(core.route({ ...A, description: 'Implement parser' }, BASE)?.tier).toBe('A')
+  expect(core.lastRecord()).toEqual({
+    ...RECORD_BASE, description: 'Implement parser', brief_chars: A.prompt.length, eligible: true,
+    tier: 'A', tier_reason: 'has a check command and is implementation-type work', handed_off: true, reason: 'tier A has enough Codex headroom',
+  })
+})
+
+test('stays, bursts, tier C and ineligible calls each get their own record', async () => {
+  const core = decisionCore()
+  const records = []
+  for (let i = 0; i < 3; i++) {
+    core.route(B, BASE + i * 1000)
+    records.push(core.lastRecord())
+  }
+  expect(records.map(record => [record?.handed_off, record?.burst, record?.reason])).toEqual([
+    [false, 0, 'pressure is low'], [false, 1, 'pressure is low'], [true, 2, 'pressure is high enough'],
+  ])
+  expect(records[0]).toEqual({ ...RECORD_BASE, brief_chars: B.prompt.length, eligible: true, tier: 'B', tier_reason: 'no check command', handed_off: false, reason: 'pressure is low' })
+  core.route(C, BASE + 3000)
+  expect(core.lastRecord()).toEqual({ ...RECORD_BASE, burst: 2, codex_age_s: 3, brief_chars: C.prompt.length, eligible: true, tier: 'C', tier_reason: 'design or front-end judgment', handed_off: false, reason: 'tier C stays on Claude' })
+  core.route({ ...A, subagent_type: 'Explore', model: 'sonnet' }, BASE + 3000)
+  expect(core.lastRecord()).toEqual({ ...RECORD_BASE, burst: 2, codex_age_s: 3, agent_type: 'Explore', model: 'sonnet', brief_chars: A.prompt.length, eligible: false, tier: null, tier_reason: null, handed_off: false, reason: 'type Explore keeps its own setup' })
+  core.route({ ...A, agentId: 'child' }, BASE + 3000)
+  expect(core.lastRecord()?.from_subagent).toBe(true)
+  expect(core.lastRecord()?.reason).toBe('call belongs to a subagent')
+  // A record already read is not changed by later decisions.
+  expect(records[0]?.burst).toBe(0)
+})
+
+test('off mode records no decision and missing readings are null, not zero', async () => {
+  const core = decisionCore()
+  core.setMode('off')
+  core.route(A, BASE)
+  expect(core.lastRecord()).toBe(undefined)
+  const fresh = createCore(DEFAULTS, SCRIPT)
+  fresh.route(A, BASE)
+  expect(fresh.lastRecord()).toEqual({
+    ...RECORD_BASE, session: null, main_model: null, five_hour: null, codex_headroom: 0, codex_weekly: null, codex_age_s: null,
+    brief_chars: A.prompt.length, eligible: true, tier: 'A', tier_reason: 'has a check command and is implementation-type work',
+    handed_off: false, reason: 'no Claude reading yet',
+  })
+  heavy(fresh)
+  fresh.route(A, BASE + 20 * MINUTE)
+  const record = fresh.lastRecord()
+  expect(Number.isFinite(record?.forecast)).toBe(true)
+})
+
+test('a recorded description keeps whole characters and stops at 100', async () => {
+  const core = decisionCore()
+  core.route({ ...A, description: 'x'.repeat(99) + '😀 tail' }, BASE)
+  expect(core.lastRecord()?.description).toBe('x'.repeat(99) + '😀')
+  core.route({ ...A, description: '检查 naïve\r\n' }, BASE)
+  expect(core.lastRecord()?.description).toBe('检查 naïve\r\n')
+})
+
+test('a model-limit hand-off records the limit and its cause', async () => {
+  const core = limitCore()
+  core.route(B, BASE)
+  const record = core.lastRecord()
+  expect(record?.limit).toEqual({ label: 'Fable', percent: 62, state: 'ahead' })
+  expect(record?.cause).toBe('limit')
+  expect(record?.handed_off).toBe(true)
+  core.route({ ...B, model: 'opus' }, BASE)
+  expect(core.lastRecord()?.limit).toBe(null)
+})
+
+test('a record keeps the exact headroom the decision used', async () => {
+  const core = decisionCore()
+  // Weekly use that leaves headroom just under the tier A threshold of 0.5.
+  core.setCodex({ windows: [{ minutes: 10080, usedPercent: 76.4305, resetsAt: BASE + 5 * 1440 * MINUTE }], limitReached: false, readAt: BASE })
+  expect(core.route(A, BASE)).toBe(undefined)
+  const record = core.lastRecord()
+  expect(record?.reason).toBe('Codex headroom is low')
+  expect((record?.codex_headroom ?? 1) < 0.5).toBe(true)
+})
+
+test('a decision made out of order keeps the stays of later decisions', async () => {
+  const core = decisionCore()
+  core.route(B, BASE + 2000)
+  // A call that started earlier and waited on its probes is decided now, at its own earlier time.
+  core.route(B, BASE + 1000)
+  expect(core.describe(BASE + 1000).includes('eligible calls stayed on Claude in 10 minutes: 2')).toBe(true)
+  expect(core.route(B, BASE + 3000)?.tier).toBe('B')
+  expect(core.lastRecord()?.burst).toBe(2)
+  // A clock that went back by more than a minute still drops what it can no longer place.
+  expect(core.describe(BASE - 2 * MINUTE).includes('eligible calls stayed on Claude in 10 minutes: 0')).toBe(true)
+})
+
+test('a refusal built from the decision record states the readings of that decision', async () => {
+  const core = decisionCore()
+  const route = core.route(A, BASE)
+  const record = core.lastRecord()
+  measure(core, 65, BASE + 1000)
+  core.setCodex({ ...codex(BASE + 1000), windows: [{ minutes: 10080, usedPercent: 40, resetsAt: BASE + 5 * 1440 * MINUTE }] })
+  const deny = core.denial(route!, A, CWD, BASE + 1000, undefined, record)
+  expect(deny.includes('Claude 5h 5%; Codex weekly 18%.')).toBe(true)
+  expect(core.denial(route!, A, CWD, BASE + 1000).includes('Claude 5h 65%')).toBe(true)
+})
+
+test('a refusal built from the decision record states the forecast of that decision', async () => {
+  const core = createCore(DEFAULTS, SCRIPT)
+  heavy(core)
+  const decided = BASE + 20 * MINUTE
+  const route = core.route(A, decided)
+  const record = core.lastRecord()
+  const F = record?.forecast ?? NaN
+  expect(Number.isFinite(F)).toBe(true)
+  // A much faster rise afterwards changes the live forecast.
+  measure(core, 90, decided + MINUTE)
+  const deny = core.denial(route!, A, CWD, decided + MINUTE, undefined, record)
+  expect(deny.includes(`Claude 5h 20%, on pace for ${Math.round(F)}%`)).toBe(true)
+  expect(core.denial(route!, A, CWD, decided + MINUTE).includes(`on pace for ${Math.round(F)}%`)).toBe(false)
+})
+
+
+
+test('a weekly-limit reading taken before the one held is ignored, unless the held one is dated ahead of the clock', async () => {
+  const core = limitCore(62)
+  core.setUsage({ readAt: BASE - MINUTE, buckets: [{ label: 'Fable', family: 'fable', usedPercent: 40, resetsAt: BASE + 4.5 * 1440 * MINUTE }] }, undefined, BASE)
+  expect(core.status(BASE).includes('fable wk 62% ahead')).toBe(true)
+  const back = limitCore(62)
+  back.setUsage({ readAt: BASE + 60 * MINUTE, buckets: [{ label: 'Fable', family: 'fable', usedPercent: 62, resetsAt: BASE + 4.5 * 1440 * MINUTE }] }, undefined, BASE + 60 * MINUTE)
+  // The clock went back an hour: a reading taken now is older than the held one but must be used.
+  back.setUsage({ readAt: BASE, buckets: [{ label: 'Fable', family: 'fable', usedPercent: 30, resetsAt: BASE + 4.5 * 1440 * MINUTE }] }, undefined, BASE)
+  expect(back.status(BASE).includes('fable wk 30%')).toBe(true)
+})

@@ -143,8 +143,10 @@ output:
 [crossfeed] record the outcome: python3 -I .../scripts/crossfeed.py check 20260101-120000-ab12 -- <your check command>
 ```
 
-Claude is told to run the brief's check through `crossfeed.py check`, which
-records pass or fail, and then to report to you.
+After a write job, Claude is told to run the brief's check through
+`crossfeed.py check`, which records pass or fail, and then to report to you. After a read-only job
+that succeeded, such as a review, it is told to verify the job's claims and
+record through `crossfeed.py used` whether it used the result.
 
 ## How it routes
 
@@ -216,10 +218,12 @@ The exact rules and formulas are in [docs/design.md](docs/design.md).
   main loop's model limit is ahead.
 - Subagents moved off a model whose weekly limit is ahead, each one logged
   and recorded.
-- A local record of every finished job: how long it took, the Codex token
-  count it reported, and, when a check was run, whether it passed.
-  `/crossfeed report` sums up the last 7 days, including the lockouts it
-  saw.
+- A local record of each routing decision outside `off` mode (a decision
+  whose write fails is logged and left out), with its reason and the
+  readings it rested on, and of every finished job: how long it took, the
+  Codex token count it reported, and, when recorded, whether its check
+  passed or its result was used. `/crossfeed report` sums up the last 7
+  days, including the lockouts it saw.
 - It fails open. If the plugin itself errors, the subagent call goes ahead
   on Claude, unchanged.
 - A small footprint: no daemon, no database, no MCP server. The dispatcher
@@ -231,7 +235,7 @@ The exact rules and formulas are in [docs/design.md](docs/design.md).
 | Command | Effect |
 | --- | --- |
 | `/crossfeed` or `/crossfeed status` | readings, pressure, what would be handed off now, and why the last subagent call was or was not handed off |
-| `/crossfeed report` | the last 7 days: lockouts seen (5-hour and model limits), subagents moved to a cheaper model, jobs, tokens, results of the first check recorded for each job |
+| `/crossfeed report` | the last 7 days: lockouts seen (5-hour and model limits), subagents moved to a cheaper model, subagent calls by how they were routed, jobs, tokens, results of the first check recorded for each job, whether read-only results were used |
 | `/crossfeed always` | hand off every tier A and B call while Codex has room (this session) |
 | `/crossfeed auto` | back to the default (this session) |
 | `/crossfeed off` | stop steering, keep the record (this session) |
@@ -265,6 +269,8 @@ here `brief.md`, and use the job id that `run` prints:
 ```bash
 python3 -I scripts/crossfeed.py run --tier A --dir "$PWD" --write < brief.md
 python3 -I scripts/crossfeed.py check 20260101-120000-ab12 -- pytest -q
+python3 -I scripts/crossfeed.py run --dir "$PWD" < review.md
+python3 -I scripts/crossfeed.py used 20260101-120500-cd34 partly
 python3 -I scripts/crossfeed.py quota
 python3 -I scripts/crossfeed.py report
 ```
@@ -277,14 +283,20 @@ compares the modified and untracked files before and after, lists the ones
 that changed, and warns when `HEAD` moved. Jobs run with `--worktree` and
 directories outside git get no change list. `--brief-file PATH` reads the
 brief from a file instead of standard input, and `stash` saves standard
-input to such a file and prints its path; the plugin uses the pair.
+input to such a file and prints its path; the plugin uses the pair. Without
+`--session`, `run` records the session from `CLAUDE_CODE_SESSION_ID`, which
+Claude Code sets in the shells it starts.
 
 Exit codes of `run`: 0 done, 1 failed, 2 usage error, 75 Codex reported its
 usage limit, 124 timeout, 127 Codex not found, 130 interrupted. On a timeout
 or an interrupt the Codex process group is stopped.
 
 `check` runs your check command and records pass or fail for the job. The
-verdict comes from the command's exit status, not from the model.
+verdict comes from the command's exit status, not from the model. `used`
+records whether the result of a successful job was used: `yes`, `partly` or
+`no`. That one is the model's own rating, and a later rating replaces an
+earlier one. `decision` is how the plugin records a routing decision, as
+JSON on standard input.
 
 ## Install notes
 
@@ -332,9 +344,12 @@ To remove it: `claude plugin uninstall agent-crossfeed@agent-crossfeed`.
   handles it as your Codex configuration says.
 - What crossfeed stores stays on your machine, in `$CROSSFEED_HOME`, else
   `$CLAUDE_CONFIG_DIR/crossfeed`, else `~/.claude/crossfeed`: a ledger with
-  one line per finished job, check and lockout, the saved briefs, and each
-  job's event log and result. Files are created readable by you only. A
-  check is recorded by program name, without its arguments.
+  a line for each subagent routing decision it could record outside `off`
+  mode (the call's type and model, the first 100 characters of its
+  description and the brief's length, not the brief), finished job, check,
+  rating and lockout, the saved briefs, and each job's event log and
+  result. Files are created readable by you only. A check is recorded by
+  program name, without its arguments.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 

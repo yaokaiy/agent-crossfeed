@@ -32,19 +32,51 @@ function setup(on: On) {
     bashCalls: 0, denyBash: false, denyAgent: false, failStatus: false,
     holdProbes: false, openProbes: 0, mostOpenProbes: 0, duringQuota: undefined as (() => void) | undefined,
     usageGate: undefined as Promise<void> | undefined,
+    // Decision records have their own trace so the legacy process trace stays intact.
+    decisions: [] as { argv: readonly string[]; timeout?: number; stdin?: string }[], decisionsDone: 0,
+    decisionGate: undefined as Promise<void> | undefined, decisionFailure: '' as '' | 'throw' | 'deny' | 'nonzero' | 'opaque',
+    decisionsDoneAtAgent: [] as number[], atAgent: undefined as (() => void) | undefined,
+    stashGate: undefined as Promise<void> | undefined, sequence: [] as string[],
+    quotaGate: undefined as Promise<void> | undefined, throwAgent: false,
+    modelReads: 0, holdModelReadAt: 0, modelGate: undefined as Promise<void> | undefined, modelHeld: false,
+    usageReads: 0, holdUsageReadAt: 0, usageReadGate: undefined as Promise<void> | undefined, usageHeld: false,
+    clockReads: 0, holdClockReadAt: 0, clockGate: undefined as Promise<void> | undefined, clockHeld: false,
+    // Per-probe results for `claude-usage`, used in order before the default result.
+    usageQueue: [] as { result: ProcessRunResult; gate?: Promise<void> }[],
   }
-  on('clock.now', () => {
+  on('clock.now', async () => {
+    world.clockReads += 1
+    if (world.clockReads === world.holdClockReadAt) {
+      world.clockHeld = true
+      await world.clockGate
+    }
     if (world.failClock) { world.failClock = false; return { deny: 'clock unavailable' } }
     return { value: world.now }
   })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   on('session.measure', (_$, e) => ({ changed: e.changed }))
-  on('session.usage', () => ({ value: { startedAt: BASE, context: { window: 200000 }, rateLimits: world.usage } }))
+  on('session.usage', async () => {
+    // The reply carries the usage as it was when the read was asked for, even if it is held.
+    const rateLimits = world.usage
+    world.usageReads += 1
+    if (world.usageReads === world.holdUsageReadAt) {
+      world.usageHeld = true
+      await world.usageReadGate
+    }
+    return { value: { startedAt: BASE, context: { window: 200000 }, rateLimits } }
+  })
   on('session.cwd', () => ({ value: world.cwd }))
-  on('session.model', () => {
+  on('session.model', async () => {
+    // As for usage, a held reply carries the model in use when it was asked for.
+    const model = world.model
+    world.modelReads += 1
+    if (world.modelReads === world.holdModelReadAt) {
+      world.modelHeld = true
+      await world.modelGate
+    }
     if (world.failModel) throw new Error('model unavailable')
-    return { value: world.model }
+    return { value: model }
   })
   on('agent.spawn', (_$, e) => {
     world.spawns.push(e)
@@ -64,6 +96,17 @@ function setup(on: On) {
   on('command.register', (_$, e) => { world.commands.push(e.name); return { value: { command: e.name } } })
   on('command.run', () => ({ text: 'engine command' }))
   on('process.run', async (_$, e) => {
+    world.sequence.push(e.argv[3] ?? '')
+    if (e.argv[3] === 'decision') {
+      world.decisions.push({ argv: e.argv, timeout: e.init?.timeoutMs, stdin: e.init?.stdin })
+      await world.decisionGate
+      world.decisionsDone += 1
+      if (world.decisionFailure === 'throw') throw new Error('ledger unavailable')
+      // An error value that cannot be turned into a string.
+      if (world.decisionFailure === 'opaque') throw Object.create(null)
+      if (world.decisionFailure === 'deny') return { deny: 'ledger denied' }
+      return { value: processResult('', world.decisionFailure === 'nonzero' ? 2 : 0) }
+    }
     // A held probe waits a few turns of the event loop for the other probe to start, so a test can see them overlap.
     if (world.holdProbes && (e.argv[3] === 'quota' || e.argv[3] === 'claude-usage')) {
       world.openProbes += 1
@@ -74,6 +117,11 @@ function setup(on: On) {
     // Keep the legacy process trace intact; new usage probes have their own complete trace.
     if (e.argv[3] === 'claude-usage') {
       world.usageProcesses.push({ argv: e.argv, timeout: e.init?.timeoutMs })
+      const queued = world.usageQueue.shift()
+      if (queued) {
+        await queued.gate
+        return { value: queued.result }
+      }
       await world.usageGate
       if (world.failUsage) throw new Error('usage unavailable')
       return { value: world.claudeUsage }
@@ -83,14 +131,26 @@ function setup(on: On) {
       if (world.failDowngrade) throw new Error('ledger unavailable')
       return { value: processResult('', world.downgradeExit) }
     }
-    if (e.argv[3] === 'stash') return world.rejectStash ? { deny: 'stash unavailable' } : { value: world.stash }
+    if (e.argv[3] === 'stash') {
+      await world.stashGate
+      return world.rejectStash ? { deny: 'stash unavailable' } : { value: world.stash }
+    }
     if (world.processFailure) throw new Error(world.processFailure)
     if (world.rejectProcess) return { deny: 'process unavailable' }
     if (e.argv[3] === 'lockout') return { value: world.lockout }
-    if (e.argv[3] === 'quota') world.duringQuota?.()
+    if (e.argv[3] === 'quota') {
+      world.duringQuota?.()
+      await world.quotaGate
+    }
     return { value: e.argv[3] === 'report' ? processResult('synthetic report\n') : world.quota }
   })
-  on('tool.call', { tool: 'Agent' }, (_$, e) => { world.agents.push(e); return world.denyAgent ? { deny: 'engine denied' } : AGENT_RESULT })
+  on('tool.call', { tool: 'Agent' }, (_$, e) => {
+    world.agents.push(e)
+    world.decisionsDoneAtAgent.push(world.decisionsDone)
+    world.atAgent?.()
+    if (world.throwAgent) throw new Error('engine failed the call')
+    return world.denyAgent ? { deny: 'engine denied' } : AGENT_RESULT
+  })
   on('tool.call', { tool: 'Bash' }, () => {
     world.bashCalls += 1
     return world.denyBash ? { deny: 'engine denied' } : { result: { stdout: 'ok', stderr: '', interrupted: false }, context: ['existing tool context'] }
@@ -968,4 +1028,318 @@ test('off mode stops usage probes, rewrites, notices and bucket lockouts', async
   await $.classic.StopFailure({ error: 'rate_limit' })
   expect(world.usageProcesses.length).toBe(1)
   expect(world.spawns[0]?.model).toBe(undefined)
+})
+
+function decisions(world: ReturnType<typeof setup>): Record<string, unknown>[] {
+  return world.decisions.map(call => JSON.parse(call.stdin ?? 'null') as Record<string, unknown>)
+}
+
+test('a call that stays is recorded while the engine runs it, with no wait before the engine call', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 5)
+  let release: () => void = () => {}
+  world.decisionGate = new Promise(resolve => { release = resolve })
+  let settled = false
+  const pending = $.tool.call(RESEARCH).then(result => { settled = true; return result })
+  for (let i = 0; i < 1000 && world.agents.length === 0; i++) await Promise.resolve()
+  for (let i = 0; i < 100; i++) await Promise.resolve()
+  // The engine has run the call; the hook still waits for its record before it returns.
+  expect(world.agents.length).toBe(1)
+  expect(world.decisionsDoneAtAgent).toEqual([0])
+  expect(settled).toBe(false)
+  release()
+  const result = await pending
+  expect(result).toEqual(AGENT_RESULT)
+  expect(world.decisionsDone).toBe(1)
+  const script = world.processes[0]!.argv[2]!
+  expect(world.decisions.map(call => [call.argv, call.timeout])).toEqual([[['python3', '-I', script, 'decision'], 5000]])
+  expect(decisions(world)[0]).toEqual(expect.objectContaining({
+    session: 'test-session', mode: 'auto', main_model: 'opus', description: 'Research vendors', eligible: true, tier: 'B',
+    tier_reason: 'no check command', handed_off: false, reason: 'pressure is low', five_hour: 5, brief_file: null,
+  }))
+  expect(world.processes.some(call => call.argv[3] === 'decision')).toBe(false)
+})
+
+test('a hand-off is recorded after its brief is saved, with the saved path', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 5)
+  const result = await $.tool.call(AGENT)
+  expect(result.deny?.startsWith('crossfeed:')).toBe(true)
+  expect(world.sequence.indexOf('stash') < world.sequence.indexOf('decision')).toBe(true)
+  expect(decisions(world)).toEqual([expect.objectContaining({
+    description: 'Implement parser', tier: 'A', handed_off: true, reason: 'tier A has enough Codex headroom', brief_file: '/tmp/检查 brief.md',
+  })])
+  world.rejectStash = true
+  await $.tool.call(AGENT)
+  expect(decisions(world)[1]?.brief_file).toBe(null)
+  expect(decisions(world)[1]?.handed_off).toBe(true)
+})
+
+for (const failure of ['throw', 'deny', 'nonzero', 'opaque'] as const) {
+  test(`a decision record that fails (${failure}) is logged and changes neither path`, async ($, on) => {
+    const world = setup(on)
+    await start($)
+    await measure($, world, 5)
+    world.decisionFailure = failure
+    expect(await $.tool.call(RESEARCH)).toEqual(AGENT_RESULT)
+    expect(world.agents.length).toBe(1)
+    const handoff = await $.tool.call(AGENT)
+    expect(handoff.deny?.startsWith('crossfeed: run this on Codex')).toBe(true)
+    expect(world.agents.length).toBe(1)
+    const failures = world.logs.filter(line => line.startsWith('crossfeed: decision record'))
+    expect(failures.length).toBe(2)
+    expect(failures[0]).toBe(failure === 'nonzero' ? 'crossfeed: decision record exited with code 2' : failures[0])
+    expect(world.logs.filter(line => line.startsWith('last subagent call:')).length).toBe(2)
+  })
+}
+
+test('off mode writes no decision record', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 5)
+  await command($, 'off')
+  await $.tool.call(AGENT)
+  await $.tool.call(RESEARCH)
+  expect(world.decisions.length).toBe(0)
+  await command($, 'auto')
+  await $.tool.call(RESEARCH)
+  expect(world.decisions.length).toBe(1)
+})
+
+test('overlapping calls each record and log their own decision', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 5)
+  let release: () => void = () => {}
+  world.stashGate = new Promise(resolve => { release = resolve })
+  const first = $.tool.call(AGENT)
+  for (let i = 0; i < 1000 && !world.sequence.includes('stash'); i++) await Promise.resolve()
+  expect(world.sequence.includes('stash')).toBe(true)
+  expect(await $.tool.call(RESEARCH)).toEqual(AGENT_RESULT)
+  release()
+  expect((await first).deny?.startsWith('crossfeed:')).toBe(true)
+  expect(decisions(world).map(record => [record.description, record.handed_off])).toEqual([['Research vendors', false], ['Implement parser', true]])
+  expect(world.logs.filter(line => line.startsWith('last subagent call:'))).toEqual([
+    'last subagent call: stayed on Claude (pressure is low)',
+    'last subagent call: handed to Codex (has a check command and is implementation-type work)',
+  ])
+})
+
+test('a conversation change while the brief is saved leaves the record and the command on one session', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 5)
+  let release: () => void = () => {}
+  world.stashGate = new Promise(resolve => { release = resolve })
+  const first = $.tool.call(AGENT)
+  for (let i = 0; i < 1000 && !world.sequence.includes('stash'); i++) await Promise.resolve()
+  expect(world.sequence.includes('stash')).toBe(true)
+  // A /clear lands while the brief is being saved, and the next event adopts the new session.
+  await $.session.end({ reason: 'clear', sessionId: 'test-session', resume: { id: 'test-session' } })
+  world.sessionId = 'new-session'
+  await $.prompt.submit({ text: 'next', wait: false, origin: ORIGIN })
+  release()
+  const deny = (await first).deny ?? ''
+  const session = decisions(world)[0]?.session
+  expect(session).toBe('test-session')
+  expect(deny.includes(`--session '${String(session)}'`)).toBe(true)
+})
+
+test('a call whose engine run fails is not run a second time by the fail-open handler', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 5)
+  world.throwAgent = true
+  await $.tool.call(RESEARCH).catch(() => undefined)
+  expect(world.agents.length).toBe(1)
+  expect(world.decisions.length).toBe(1)
+})
+
+test('a call that finishes its Codex probe after a later call still counts that later stay', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+  await start($)
+  // The Codex reading is now old enough that the next eligible call probes again.
+  world.now += 6 * MINUTE
+  let release: () => void = () => {}
+  world.quotaGate = new Promise(resolve => { release = resolve })
+  const quotas = world.sequence.filter(name => name === 'quota').length
+  const first = $.tool.call(RESEARCH)
+  for (let i = 0; i < 1000 && world.sequence.filter(name => name === 'quota').length === quotas; i++) await Promise.resolve()
+  // More than the clock-skew allowance passes while the first call's probe runs.
+  world.now += 2 * MINUTE
+  // Inside the probe throttle, this call decides at once and stays.
+  expect(await $.tool.call(RESEARCH)).toEqual(AGENT_RESULT)
+  world.now += 1000
+  release()
+  expect(await first).toEqual(AGENT_RESULT)
+  world.now += 1000
+  const third = await $.tool.call(RESEARCH)
+  expect(third.deny?.startsWith('crossfeed:')).toBe(true)
+  expect(decisions(world).map(record => record.burst)).toEqual([0, 1, 2])
+})
+
+test('a refusal states the readings its call was decided on, not ones that arrived while the brief was saved', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 5)
+  let release: () => void = () => {}
+  world.stashGate = new Promise(resolve => { release = resolve })
+  const first = $.tool.call(AGENT)
+  for (let i = 0; i < 1000 && !world.sequence.includes('stash'); i++) await Promise.resolve()
+  await measure($, world, 65)
+  release()
+  const deny = (await first).deny ?? ''
+  expect(deny.includes('Claude 5h 5%')).toBe(true)
+  expect(decisions(world)[0]?.five_hour).toBe(5)
+})
+
+test('a usage update that lands while a call reads the main model is not overwritten by the older reading', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 5, resetsAt: RESET }]
+  await start($)
+  await measure($, world, 5)
+  let release: () => void = () => {}
+  world.modelGate = new Promise(resolve => { release = resolve })
+  // The second main-model read of the call: the one after the call took the session's usage.
+  world.holdModelReadAt = world.modelReads + 2
+  const call = $.tool.call(RESEARCH)
+  for (let i = 0; i < 1000 && !world.modelHeld; i++) await Promise.resolve()
+  expect(world.modelHeld).toBe(true)
+  await measure($, world, 95)
+  release()
+  expect((await call).deny?.startsWith('crossfeed:')).toBe(true)
+  expect(decisions(world)[0]?.five_hour).toBe(95)
+})
+
+test('a call that waits on its main-model read still counts a stay decided meanwhile', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 2, resetsAt: RESET }]
+  await start($)
+  let release: () => void = () => {}
+  world.modelGate = new Promise(resolve => { release = resolve })
+  world.holdModelReadAt = world.modelReads + 2
+  const first = $.tool.call(RESEARCH)
+  for (let i = 0; i < 1000 && !world.modelHeld; i++) await Promise.resolve()
+  expect(world.modelHeld).toBe(true)
+  world.now += 2 * MINUTE
+  expect(await $.tool.call(RESEARCH)).toEqual(AGENT_RESULT)
+  world.now += 1000
+  release()
+  expect(await first).toEqual(AGENT_RESULT)
+  world.now += 1000
+  expect((await $.tool.call(RESEARCH)).deny?.startsWith('crossfeed:')).toBe(true)
+  expect(decisions(world).map(record => record.burst)).toEqual([0, 1, 2])
+})
+
+test('a usage reply that arrives after a newer usage update is dropped', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 5)
+  let release: () => void = () => {}
+  world.usageReadGate = new Promise(resolve => { release = resolve })
+  world.holdUsageReadAt = world.usageReads + 1
+  const call = $.tool.call(RESEARCH)
+  for (let i = 0; i < 1000 && !world.usageHeld; i++) await Promise.resolve()
+  expect(world.usageHeld).toBe(true)
+  await measure($, world, 95)
+  release()
+  expect((await call).deny?.startsWith('crossfeed:')).toBe(true)
+  expect(decisions(world)[0]?.five_hour).toBe(95)
+})
+
+test('a main-model reply that arrives after a newer one is dropped', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 5)
+  world.model = 'claude-opus-5-5'
+  let release: () => void = () => {}
+  world.modelGate = new Promise(resolve => { release = resolve })
+  world.holdModelReadAt = world.modelReads + 2
+  const call = $.tool.call(RESEARCH)
+  for (let i = 0; i < 1000 && !world.modelHeld; i++) await Promise.resolve()
+  expect(world.modelHeld).toBe(true)
+  // The person switches models; the next usage update reads the new one.
+  world.model = 'claude-sonnet-5-5'
+  await measure($, world, 6)
+  release()
+  await call
+  expect(decisions(world)[0]?.main_model).toBe('claude-sonnet-5-5')
+})
+
+test('a usage update handled after a newer reading was taken does not replace it', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 5)
+  let release: () => void = () => {}
+  world.clockGate = new Promise(resolve => { release = resolve })
+  world.holdClockReadAt = world.clockReads + 1
+  // An update for 50% arrives and waits on the clock before it is applied.
+  world.usage = [{ kind: 'five_hour', percentUsed: 50, resetsAt: RESET }]
+  const update = $.session.measure({ context: { window: 200000 }, rateLimits: world.usage, changed: ['rateLimits'] })
+  for (let i = 0; i < 1000 && !world.clockHeld; i++) await Promise.resolve()
+  expect(world.clockHeld).toBe(true)
+  // Meanwhile usage moves on, and a subagent call reads 95%.
+  world.usage = [{ kind: 'five_hour', percentUsed: 95, resetsAt: RESET }]
+  await $.tool.call(RESEARCH)
+  expect(decisions(world)[0]?.five_hour).toBe(95)
+  release()
+  await update
+  expect((await command($, 'status')).text?.includes('claude 5h 95%')).toBe(true)
+})
+
+
+test('a failed main-model read does not discard an earlier read that answers later', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 5)
+  world.model = 'claude-opus-5-5'
+  let release: () => void = () => {}
+  world.modelGate = new Promise(resolve => { release = resolve })
+  world.holdModelReadAt = world.modelReads + 2
+  const call = $.tool.call(RESEARCH)
+  for (let i = 0; i < 1000 && !world.modelHeld; i++) await Promise.resolve()
+  world.failModel = true
+  await measure($, world, 6)
+  world.failModel = false
+  release()
+  await call
+  expect(decisions(world)[0]?.main_model).toBe('claude-opus-5-5')
+})
+
+test('of two overlapping limit probes, the reading taken last wins, whichever started first', async ($, on) => {
+  const world = scarce(on)
+  await start($)
+  const bucket = (used: number, age: number) => processResult(JSON.stringify({ ...MODEL_USAGE, age_s: age, buckets: [{ ...MODEL_USAGE.buckets[0], used_percent: used }] }))
+  let release: () => void = () => {}
+  // A slow probe that fetches fresh data, then a fast one that answers from a 5-second-old cache.
+  world.usageQueue = [{ result: bucket(95, 0), gate: new Promise(resolve => { release = resolve }) }, { result: bucket(62, 5) }]
+  world.now += 11 * MINUTE
+  const update = measure($, world, 10)
+  for (let i = 0; i < 1000 && world.usageProcesses.length < 2; i++) await Promise.resolve()
+  expect(world.usageProcesses.length).toBe(2)
+  world.now += 10000
+  await $.classic.StopFailure({ error: 'rate_limit' })
+  expect(world.usageProcesses.length).toBe(3)
+  world.now += 10000
+  release()
+  await update
+  expect((await command($, 'status')).text?.includes('fable wk 95%')).toBe(true)
+})
+
+test('a limit probe that answers after the clock went back an hour is still used', async ($, on) => {
+  const world = scarce(on)
+  await start($)
+  let release: () => void = () => {}
+  world.usageQueue = [{ result: processResult(JSON.stringify({ ...MODEL_USAGE, buckets: [{ ...MODEL_USAGE.buckets[0], used_percent: 70 }] })), gate: new Promise(resolve => { release = resolve }) }]
+  world.now += 11 * MINUTE
+  const update = measure($, world, 10)
+  for (let i = 0; i < 1000 && world.usageProcesses.length < 2; i++) await Promise.resolve()
+  expect(world.usageProcesses.length).toBe(2)
+  world.now -= 60 * MINUTE
+  release()
+  await update
+  expect((await command($, 'status')).text?.includes('fable wk 70%')).toBe(true)
 })

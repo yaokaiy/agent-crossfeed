@@ -11,6 +11,64 @@ from unittest.mock import patch
 from helpers import CROSSFEED, CrossfeedCase, load_crossfeed, run_crossfeed
 
 
+class DecisionTests(CrossfeedCase):
+    def test_decision_round_trip_replaces_metadata(self):
+        decision = {"eligible": True, "handed_off": False, "note": "检查 naïve",
+                    "detail": {"items": [None, 1, "first\r\nsecond"]}}
+        payload = json.dumps(dict(decision, type="job", v=7, ts="old"), ensure_ascii=False, indent=2)
+        payload = ("\ufeff \r\n" + payload.replace("\n", "\r\n") + "\r\n").encode("utf-8")
+        result = run_crossfeed(["decision"], stdin=payload, env=self.env)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
+        record, = load_crossfeed().read_ledger()
+        self.assertEqual(next(iter(record)), "type")
+        self.assertRegex(record["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual(record, dict(decision, type="decision", v=1, ts=record["ts"]))
+
+    def test_decision_accepts_exact_byte_limit(self):
+        payload = b'{"eligible":true,"handed_off":true}'.ljust(16384)
+        result = run_crossfeed(["decision"], stdin=payload, env=self.env)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
+        record, = load_crossfeed().read_ledger()
+        self.assertIs(record["eligible"], True)
+        self.assertIs(record["handed_off"], True)
+
+    def test_invalid_decisions_leave_the_ledger_unchanged(self):
+        prefix = b'{"eligible":true,"handed_off":false'
+        invalid = {
+            "empty": b"", "whitespace": b" \t\r\n", "syntax": b"{bad",
+            "array": b"[]", "string": b'"decision"',
+            "NaN": prefix + b',"note":NaN}', "Infinity": prefix + b',"note":[Infinity]}',
+            "-Infinity": prefix + b',"note":-Infinity}',
+            "overflow": prefix + b',"note":1e400}',
+            "negative overflow": prefix + b',"note":[-1e400]}',
+            "handed off but not eligible": b'{"eligible":false,"handed_off":true}',
+            "oversize": (prefix + b"}").ljust(16385),
+            "encoding": prefix + b',"note":"\xff"}',
+            "surrogate value": prefix + br',"note":["\ud800"]}',
+            "surrogate key": prefix + br',"\ud800":null}',
+        }
+        for field in ("eligible", "handed_off"):
+            decision = {"eligible": True, "handed_off": False}
+            del decision[field]
+            invalid["missing " + field] = json.dumps(decision).encode()
+            for value in (0, 1, None, "true"):
+                invalid[(field, value)] = json.dumps(dict(decision, **{field: value})).encode()
+        ledger = self.home / "ledger.jsonl"
+        for original in (None, b'{"type":"job","id":"existing"}\n'):
+            if original is not None:
+                ledger.write_bytes(original)
+            for case, payload in invalid.items():
+                with self.subTest(case=case, existing=original is not None):
+                    result = run_crossfeed(["decision"], stdin=payload, env=self.env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(result.stdout, b"")
+                    self.assertTrue(result.stderr.startswith(b"crossfeed: "), result.stderr)
+                    if original is None:
+                        self.assertFalse(ledger.exists())
+                    else:
+                        self.assertEqual(ledger.read_bytes(), original)
+
+
 class LedgerTests(CrossfeedCase):
     def test_bucket_lockout_record(self):
         reset = "2026-11-23T22:00:00Z"
@@ -126,6 +184,7 @@ class LedgerTests(CrossfeedCase):
         snippet = """
 import importlib.util
 import sys
+sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("crossfeed", sys.argv[1])
 crossfeed = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(crossfeed)

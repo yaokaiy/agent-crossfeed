@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -66,6 +67,33 @@ class RunTests(CrossfeedCase):
             self.assertIn(b"--cause", result.stderr)
         self.assertEqual(len(self.records()), 2)
 
+    def test_run_session_flag_and_environment(self):
+        for args, environment, session in (
+            ([], "environment-session", "environment-session"),
+            (["--session", "flag-session"], "environment-session", "flag-session"),
+            (["--session", ""], "environment-session", None),
+            ([], "", None),
+        ):
+            with self.subTest(args=args, environment=environment):
+                result = self.run_job(args, CLAUDE_CODE_SESSION_ID=environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.records()[-1]["session"], session)
+
+    def test_run_preserves_brief_file_argument(self):
+        (self.root / "brief ü.md").write_bytes(b"File brief\n")
+        path = "./brief ü.md"
+        result = self.run_job(["--brief-file", path])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[-1]["brief_file"], path)
+
+    def test_write_job_footer(self):
+        result = self.run_job(["--write"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record, = self.records()
+        self.assertEqual(result.stdout.decode().splitlines()[-1],
+                         "[crossfeed] record the outcome: python3 -I {} check {} -- <your check command>"
+                         .format(shlex.quote(str(CROSSFEED)), record["id"]))
+
     def run_job(self, args=(), brief=b"Implement the parser. Check: python3 -m unittest\n", mode="ok", **env):
         return run_crossfeed(["run", "--dir", str(self.root), *args], stdin=brief,
                          env=dict(self.env, FAKE_CODEX=mode, **env), cwd=self.root)
@@ -84,7 +112,7 @@ class RunTests(CrossfeedCase):
         self.assertEqual(set(record), {
             "v", "type", "ts", "id", "session", "kind", "tier", "dir", "sandbox", "worktree",
             "effort", "model", "cause", "started", "wall_s", "status", "exit", "tokens", "codex_thread",
-            "changed", "head_moved", "resume_of",
+            "changed", "head_moved", "resume_of", "brief_file",
         })
         self.assertEqual(record["type"], "job")
         self.assertEqual(record["status"], "done")
@@ -92,6 +120,7 @@ class RunTests(CrossfeedCase):
         self.assertEqual(record["tier"], "A")
         self.assertEqual(record["kind"], "subagent")
         self.assertEqual(record["session"], "session-1")
+        self.assertIsNone(record["brief_file"])
         self.assertEqual(record["tokens"], {"input": 12000, "cached": 500, "output": 321, "reasoning": 21})
         self.assertTrue(record["codex_thread"])
         self.assertEqual(record["effort"], "high")
@@ -107,8 +136,9 @@ class RunTests(CrossfeedCase):
         lines = result.stdout.decode().splitlines()
         self.assertIn("codex tokens 12321", lines[-3])
         self.assertTrue(lines[-2].startswith("[crossfeed] full result: "))
-        self.assertIn("[crossfeed] record the outcome: python3 -I", lines[-1])
-        self.assertIn(" check {} -- <your check command>".format(record["id"]), lines[-1])
+        self.assertEqual(lines[-1],
+                         "[crossfeed] once you have checked its claims, record whether you used this result: "
+                         "python3 -I {} used {} <yes|partly|no>".format(shlex.quote(str(CROSSFEED)), record["id"]))
 
     def test_argv_passed_to_codex(self):
         argv_file = self.root / "argv.json"

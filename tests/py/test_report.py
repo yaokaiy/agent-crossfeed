@@ -183,6 +183,38 @@ class ReportTests(CrossfeedCase):
             if path.is_file():
                 self.assertNotIn(b"SECRET", path.read_bytes(), str(path))
 
+    def test_used_appends_verdict_for_done_job(self):
+        self.write_records([self.job(status="failed"), self.job()])
+        for verdict in ("yes", "partly", "no"):
+            with self.subTest(verdict=verdict):
+                result = run_crossfeed(["used", "one", verdict], env=self.env)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
+                record = load_crossfeed().read_ledger()[-1]
+                self.assertRegex(record["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+                self.assertEqual(record, {"v": 1, "ts": record["ts"], "type": "use",
+                                          "id": "one", "verdict": verdict})
+        self.assertEqual(len(load_crossfeed().read_ledger()), 5)
+
+    def test_used_rejects_unknown_and_unfinished_jobs(self):
+        self.write_records([self.job(), self.job(status="failed"), self.check_record("unknown", "pass")])
+        ledger = self.home / "ledger.jsonl"
+        original = ledger.read_bytes()
+        for job_id, error in (("unknown", b"crossfeed: unknown job: unknown\n"),
+                              ("one", b"crossfeed: job one did not finish (status failed)\n")):
+            with self.subTest(job=job_id):
+                result = run_crossfeed(["used", job_id, "yes"], env=self.env)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (2, b"", error))
+                self.assertEqual(ledger.read_bytes(), original)
+
+    def test_used_rejects_invalid_verdict(self):
+        records = [self.job()]
+        self.write_records(records)
+        result = run_crossfeed(["used", "one", "maybe"], env=self.env)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"invalid choice", result.stderr)
+        self.assertEqual(load_crossfeed().read_ledger(), records)
+
     def test_first_check_wins(self):
         for verdicts, passed in ((("pass", "fail"), 1), (("fail", "pass"), 0)):
             with self.subTest(verdicts=verdicts):
@@ -254,8 +286,10 @@ class ReportTests(CrossfeedCase):
                          "model limits: none\n"
                          "subagents moved to a cheaper model: 0\n"
                          "jobs handed off because of a model limit: 0\n"
+                         "subagent calls: 0; not eligible: 0; handed to Codex: 0 (run: 0); stayed on Claude: 0\n"
 "jobs: 14 (done 12, failed 1, limit 0, timeout 1, interrupted 0); codex tokens: 2900000; median: 6m05s\n"
-                         "first-delivery checks: A 5/6, B 2/2; unchecked: 6\n")
+                         "first-delivery checks: A 5/6, B 2/2; unchecked: 6\n"
+                         "read-only results used: yes 0, partly 0, no 0; not rated: 12\n")
 
     def test_report_json_and_fold(self):
         records = self.sample_records()
@@ -267,6 +301,8 @@ class ReportTests(CrossfeedCase):
                         "B": {"jobs": 6, "checked": 2, "passed": 2}},
             "tokens": 2900000, "median_wall_s": 365.0, "unchecked": 6,
             "bucket_lockouts": {}, "downgrades": {"total": 0, "by_bucket": {}}, "limit_jobs": 0,
+            "decisions": {"total": 0, "ineligible": 0, "handed_off": 0, "run": 0, "stayed": 0},
+            "used": {"yes": 0, "partly": 0, "no": 0, "unrated": 12},
         }
         result = run_crossfeed(["report", "--json"], env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -288,8 +324,57 @@ class ReportTests(CrossfeedCase):
                                  "model limits: none\n"
                                  "subagents moved to a cheaper model: 0\n"
                                  "jobs handed off because of a model limit: 0\n"
+                                 "subagent calls: 0; not eligible: 0; handed to Codex: 0 (run: 0); stayed on Claude: 0\n"
 "jobs: 0 (done 0, failed 0, limit 0, timeout 0, interrupted 0); codex tokens: 0; median: n/a\n"
-                                 "first-delivery checks: A 0/0, B 0/0; unchecked: 0\n")
+                                 "first-delivery checks: A 0/0, B 0/0; unchecked: 0\n"
+                                 "read-only results used: yes 0, partly 0, no 0; not rated: 0\n")
+
+    def test_report_decisions_and_used(self):
+        old = (self.now - datetime.timedelta(days=8)).isoformat()
+        decision = {"type": "decision", "ts": self.stamp, "eligible": True, "handed_off": True}
+        self.write_records([
+            dict(decision, brief_file="old.md"),
+            dict(decision, brief_file="missing.md"),
+            dict(decision, brief_file=""),
+            dict(decision, brief_file=[]),
+            dict(decision, eligible=False, handed_off=False, brief_file="old.md"),
+            dict(decision, handed_off=False, brief_file="old.md"),
+            dict(decision, ts=old),
+            dict(decision, ts="invalid"),
+            dict(decision, eligible=1),
+            dict(decision, handed_off="true"),
+            dict(decision, eligible=False, handed_off=True),
+            {"type": "decision", "ts": self.stamp, "handed_off": False},
+            dict(self.job("old", status="failed", ts=old), brief_file="old.md"),
+            dict(self.job("revision"), brief_file=""),
+            {"type": "job", "brief_file": "missing.md", "status": "done"},
+            self.job("accepted"), self.job("declined"), self.job("unrated"),
+            self.job("old-done", ts=old),
+            dict(self.job("write"), sandbox="workspace-write"), self.job("failed", status="failed"),
+            dict(self.job("running"), status="running"),
+            {"type": "use", "id": "revision", "verdict": "no", "ts": self.stamp},
+            {"type": "use", "id": "revision", "verdict": "partly", "ts": old},
+            {"type": "use", "id": "revision", "verdict": "invalid", "ts": self.stamp},
+            {"type": "use", "id": "declined", "verdict": "no", "ts": self.stamp},
+            *({"type": "use", "id": job_id, "verdict": "yes", "ts": self.stamp}
+              for job_id in ("accepted", "write", "failed", "running", "old-done")),
+        ])
+        result = run_crossfeed(["report", "--json"], env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["decisions"], {"total": 6, "ineligible": 1, "handed_off": 4, "run": 1, "stayed": 1})
+        self.assertEqual(summary["used"], {"yes": 1, "partly": 1, "no": 1, "unrated": 1})
+        result = run_crossfeed(["report"], env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.decode().splitlines()
+        self.assertEqual(lines[4:6], [
+            "jobs handed off because of a model limit: 0",
+            "subagent calls: 6; not eligible: 1; handed to Codex: 4 (run: 1); stayed on Claude: 1",
+        ])
+        self.assertEqual(lines[-2:], [
+            "first-delivery checks: A 0/0, B 0/0; unchecked: 6",
+            "read-only results used: yes 1, partly 1, no 1; not rated: 1",
+        ])
 
     def test_report_counts_interrupted_after_timeout(self):
         self.write_records([self.job(status="interrupted")])

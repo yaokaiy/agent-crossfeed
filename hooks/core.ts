@@ -1,12 +1,40 @@
 import type { Config, Mode } from './config'
 import { CODEX_MAX_AGE, INITIAL_PRESSURE, bucketState, familyOf, fallbackFor, rewriteModel, subagentFamily, decide, eligible, fit, forecast, headroom, headroomCause, shortProblem, pressure, updatePressure } from './policy'
-import type { AgentCall, ClaudeReading, CodexReading, UsageReading, BucketView, Family } from './policy'
+import type { AgentCall, ClaudeReading, CodexReading, UsageReading, BucketView, Family, Tier } from './policy'
 import { limitLines, limitNotice, denyText, dispatchCommand, heredocDelimiter, pressureNotice, reserveNotice, statusLine, stretchReminder } from './text'
 
 import type { LimitFact } from './text'
 
 export type Route = { tier: 'A' | 'B'; reason: string; limit?: LimitFact; cause?: string }
 type Spawn = { subagentType: string; model?: string; fork: boolean; parentModel: string }
+
+// One ledger line per routing decision, built from plain values when the call is decided.
+export type DecisionRecord = {
+  session: string | null
+  mode: Mode
+  agent_type: string | null
+  model: string | null
+  main_model: string | null
+  from_subagent: boolean
+  description: string | null
+  brief_chars: number
+  eligible: boolean
+  tier: Tier | null
+  tier_reason: string | null
+  handed_off: boolean
+  reason: string
+  cause: string | null
+  burst: number
+  pressure: number
+  five_hour: number | null
+  forecast: number | null
+  seven_day: number | null
+  codex_headroom: number
+  codex_weekly: number | null
+  codex_age_s: number | null
+  limit: { label: string; percent: number; state: 'ahead' | 'full' } | null
+  brief_file: string | null
+}
 
 export type Core = {
   newConversation(session: string | undefined): void
@@ -22,8 +50,9 @@ export type Core = {
   needsCodex(call: AgentCall): boolean
   route(call: AgentCall, now: number): Route | undefined
   lastStay(): number | undefined
+  lastRecord(): DecisionRecord | undefined
   forgetStay(time: number): void
-  denial(route: Route, call: AgentCall, cwd: string, now: number, briefFile?: string): string
+  denial(route: Route, call: AgentCall, cwd: string, now: number, briefFile?: string, decided?: DecisionRecord): string
   lastDecision(): string
   toolCall(tool: string, isSubagent: boolean, now?: number): string | undefined
   takeNotices(now?: number): string[]
@@ -35,6 +64,14 @@ export type Core = {
 }
 
 const COUNTED_TOOLS = ['Bash', 'Edit', 'Write', 'Read', 'Grep', 'Glob', 'NotebookEdit']
+
+// Overlapping calls are decided in the order they finish their probes, so a stay can be dated
+// slightly after the call being decided. Only a clock that went back further drops it.
+const CLOCK_SKEW = 60000
+
+function recentStays(stays: number[], now: number): number[] {
+  return stays.filter(time => time >= now - 10 * 60000 && time <= now + CLOCK_SKEW)
+}
 
 function weeklyPercent(codex: CodexReading | undefined): number | undefined {
   const windows = codex?.windows.filter(window => window.minutes > 360) ?? []
@@ -57,6 +94,7 @@ export function createCore(config: Config, script: string, session?: string): Co
   let lockoutResetAt: number | undefined
   let stayedCalls: number[] = []
   let lastStay: number | undefined
+  let lastRecord: DecisionRecord | undefined
   let state = INITIAL_PRESSURE
   let pressureNotified = false
   let reserveNotified = false
@@ -151,7 +189,7 @@ export function createCore(config: Config, script: string, session?: string): Co
   }
 
   function burstCount(now: number): number {
-    return stayedCalls.filter(time => time >= now - 10 * 60000 && time <= now).length
+    return recentStays(stayedCalls, now).length
   }
 
   return {
@@ -168,6 +206,9 @@ export function createCore(config: Config, script: string, session?: string): Co
 
     setUsage(nextReading, problem, now) {
       usageAttempted = true
+      // A probe that finished after a newer one carries the older reading; a held reading dated
+      // ahead of the clock (the clock went back) is no reason to refuse a new one.
+      if (nextReading && usage && nextReading.readAt < usage.readAt && usage.readAt - now <= 5 * 60000) return
       usage = nextReading
       usageProblem = shortProblem(problem)
       if (!usage) limitNotices = []
@@ -231,37 +272,62 @@ export function createCore(config: Config, script: string, session?: string): Co
     },
 
     route(call, now) {
-      stayedCalls = stayedCalls.filter(time => time >= now - 10 * 60000 && time <= now)
+      stayedCalls = recentStays(stayedCalls, now)
       lastStay = undefined
       const eligibility = eligible(call, config)
+      const P = pressure(state, reading)
+      const g = headroom(codex, config, now)
+      const family = subagentFamily(call.model, mainModel)
+      const limit = family === undefined ? undefined : fact(familyViews(now).get(family))
+      const earlier = stayedCalls.length
+      const record = (outcome: { eligible: boolean; tier?: Tier; tierReason?: string; handedOff: boolean; reason: string; cause?: string }): void => {
+        const F = forecast(state, reading, now)
+        const age = codexAge(now)
+        lastRecord = mode === 'off' ? undefined : {
+          session: session ?? null, mode, agent_type: call.subagent_type ?? null, model: call.model ?? null,
+          main_model: mainModel ?? null, from_subagent: call.agentId !== undefined,
+          description: call.description === undefined ? null : Array.from(call.description).slice(0, 100).join(''),
+          brief_chars: call.prompt.length, eligible: outcome.eligible, tier: outcome.tier ?? null, tier_reason: outcome.tierReason ?? null,
+          handed_off: outcome.handedOff, reason: outcome.reason, cause: outcome.cause ?? null, burst: earlier,
+          pressure: P, five_hour: reading.fiveHour?.percentUsed ?? null,
+          forecast: F ?? null, seven_day: reading.sevenDay?.percentUsed ?? null,
+          codex_headroom: g, codex_weekly: weeklyPercent(codex) ?? null,
+          codex_age_s: age === Infinity ? null : Math.round(age / 1000),
+          limit: limit ? { label: limit.label, percent: limit.percent, state: limit.state } : null, brief_file: null,
+        }
+      }
       if (!eligibility.ok) {
         lastDecision = `last subagent call: stayed on Claude (${eligibility.reason})`
+        record({ eligible: false, handedOff: false, reason: eligibility.reason })
         return undefined
       }
       const { tier, reason } = fit(call)
-      const P = pressure(state, reading)
-      const burst = stayedCalls.length >= 2
+      const burst = earlier >= 2
       const basePressure = burst ? Math.max(P, 0.3) : P
-      const family = subagentFamily(call.model, mainModel)
-      const limit = family === undefined ? undefined : fact(familyViews(now).get(family))
-      const decision = decide({ tier, P: limit ? Math.max(basePressure, 0.3) : basePressure, limitFloor: !!limit, g: headroom(codex, config, now), headroomProblem: headroomCause(codex, config, now, codexProblem), mode, claudeKnown: reading.fiveHour !== undefined })
+      const decision = decide({ tier, P: limit ? Math.max(basePressure, 0.3) : basePressure, limitFloor: !!limit, g, headroomProblem: headroomCause(codex, config, now, codexProblem), mode, claudeKnown: reading.fiveHour !== undefined })
       if (!decision.handOff || tier === 'C') {
         if (tier !== 'C') {
           stayedCalls.push(now)
           lastStay = now
         }
         lastDecision = `last subagent call: stayed on Claude (${decision.reason})`
+        record({ eligible: true, tier, tierReason: reason, handedOff: false, reason: decision.reason })
         return undefined
       }
       const routeReason = tier === 'B' && mode === 'auto' && burst && P < 0.3
-        ? `${reason}; burst: ${stayedCalls.length} earlier subagent calls stayed on Claude in 10 minutes`
+        ? `${reason}; burst: ${earlier} earlier subagent calls stayed on Claude in 10 minutes`
         : reason
+      const cause = limit && tier === 'B' && mode === 'auto' && basePressure < 0.3 ? 'limit' : undefined
       lastDecision = `last subagent call: handed to Codex (${routeReason})`
-      return { tier, reason: routeReason, ...(limit ? { limit, ...(tier === 'B' && mode === 'auto' && basePressure < 0.3 ? { cause: 'limit' } : {}) } : {}) }
+      record({ eligible: true, tier, tierReason: reason, handedOff: true, reason: decision.reason, cause })
+      return { tier, reason: routeReason, ...(limit ? { limit, ...(cause ? { cause } : {}) } : {}) }
     },
 
     // Read right after route(): the time under which that call was counted as staying on Claude.
     lastStay: () => lastStay,
+
+    // Read right after route(), like lastStay(): the record of that call, or undefined in off mode.
+    lastRecord: () => lastRecord,
 
     // A call that was counted but then refused downstream started no subagent.
     forgetStay(time) {
@@ -269,13 +335,19 @@ export function createCore(config: Config, script: string, session?: string): Co
       if (index >= 0) stayedCalls.splice(index, 1)
     },
 
-    denial({ tier, reason, limit, cause }, call, cwd, now, briefFile) {
+    // decided, when given, is the call's decision record: the refusal then names the session and
+    // states the readings the call was decided on, even if newer ones arrived since.
+    denial({ tier, reason, limit, cause }, call, cwd, now, briefFile, decided) {
       const delimiter = briefFile === undefined ? heredocDelimiter(call.prompt, now) : undefined
+      const dispatchSession = decided === undefined ? session : decided.session ?? undefined
       const command = dispatchCommand({
-        script, tier, cause, dir: cwd, write: tier === 'A', worktree: call.isolation === 'worktree', session,
+        script, tier, cause, dir: cwd, write: tier === 'A', worktree: call.isolation === 'worktree', session: dispatchSession,
         effort: config.effort, model: config.model, timeoutMinutes: config.timeoutMinutes, briefFile, delimiter,
       })
-      return denyText({ tier, reason, limit, u: reading.fiveHour?.percentUsed ?? 0, F: forecast(state, reading, now), codexPercent: weeklyPercent(codex), command, saved: briefFile !== undefined, delimiter })
+      const readings = decided === undefined
+        ? { u: reading.fiveHour?.percentUsed ?? 0, F: forecast(state, reading, now), codexPercent: weeklyPercent(codex) }
+        : { u: decided.five_hour ?? 0, F: decided.forecast ?? undefined, codexPercent: decided.codex_weekly ?? undefined }
+      return denyText({ tier, reason, limit, ...readings, command, saved: briefFile !== undefined, delimiter })
     },
 
     lastDecision: () => lastDecision,

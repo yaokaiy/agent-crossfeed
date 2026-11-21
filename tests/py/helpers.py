@@ -63,6 +63,7 @@ class CrossfeedCase(unittest.TestCase):
         self.env = os.environ.copy()
         self.env.pop("CROSSFEED_CODEX", None)
         self.env.pop("CROSSFEED_CLAUDE", None)
+        self.env.pop("CLAUDE_CODE_SESSION_ID", None)
         for name in list(self.env):
             if name.startswith(("FAKE_CODEX", "FAKE_CLAUDE")):
                 del self.env[name]

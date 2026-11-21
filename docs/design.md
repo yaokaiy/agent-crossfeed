@@ -107,8 +107,10 @@ design and front-end quality matters, and that an executor does worst when
 the brief is not fixed. So work with a fixed brief and a check goes in tier
 A, and design work stays. This project did not re-verify the numbers in
 those sources, and it has not measured that Codex does tier A work as well
-as Claude on any user's tasks. The rules are heuristics: the ledger records
-each job's tier and check result so they can be corrected from outcomes.
+as Claude on any user's tasks. The rules are heuristics: outside `off` mode the
+ledger records decisions with their tier and reason, as far as the write
+succeeds, and jobs with the check results and ratings recorded for them, so
+the rules can be corrected from outcomes.
 
 ### 3. Pressure: how fast is Claude's window filling?
 
@@ -298,8 +300,10 @@ session id. Readings and the pressure state are kept.
 4. The dispatcher runs `codex exec` on the brief and prints the result,
    capped at 60 lines and 8 KB, with the job id and, where it can, the list
    of files that changed.
-5. The main agent runs the brief's check through `crossfeed.py check`,
-   which records pass or fail, and reports to the user.
+5. After a write job, the main agent runs the brief's check through
+   `crossfeed.py check`, which records pass or fail, and reports to the user. After a read-only
+   job that succeeded, it verifies the job's claims and records through
+   `crossfeed.py used` whether it used the result.
 
 The plugin enforces step 2. Steps 3 and 5 are instructions in the refusal
 text and in the section the plugin adds to the system prompt; the model
@@ -360,8 +364,18 @@ plugin.
   directories outside git get no change list.
 - **Ledger.** `ledger.jsonl` in the data directory, append-only, written
   under a file lock: one line when a job ends, one per check, one per
-  lockout, one per subagent moved to a cheaper model (`downgrade`). A check
-  records the program's name, not its arguments. A lockout written with
+  lockout, one per subagent moved to a cheaper model (`downgrade`), one per
+  subagent call the plugin decides unless the mode is `off` (`decision`: the
+  call's type and model, the first 100 characters of its description, the
+  brief's length, the tier, the outcome and its reason, and the readings it
+  rested on; best effort, a failed write is logged), and one per rating of a
+  successful job's result (`use`; the last one counts). A check records the
+  program's name, not its arguments. A job records the `--brief-file` it
+  was given, which links a hand-off's decision to the job started from it,
+  and, when `--session` is omitted, the session in `CLAUDE_CODE_SESSION_ID`.
+  A job's line is written when it ends, so a running job is not linked yet.
+  A hand-off whose brief could not be saved, or whose command `run` rejected
+  before it started a job, has no link. A lockout written with
   `--bucket <label>` is a model-limit lockout. `lockout --last` prints the
   reset time of the newest 5-hour lockout that has one. `run --cause
   <word>` stores why a job was handed off.
@@ -412,6 +426,12 @@ If a hook throws, it logs the failure and lets the original event continue.
 - **jobs** by outcome, Codex tokens, and median job time;
 - **checks**: for each tier, how many jobs' first recorded check passed, and
   how many jobs have no check;
+- **subagent calls**: how many were not eligible, how many were handed to
+  Codex and of those how many are linked by their saved brief to a job that
+  has ended, and how many stayed on Claude (eligible calls it did not hand
+  off, including any that another hook refused afterwards);
+- **read-only results**: how many successful read-only jobs the model
+  rated as used, partly used or not used, and how many it did not rate;
 - **model limits**: lockouts per limit and the time from each to its reset;
   subagents moved to a cheaper model; jobs handed off because of a model
   limit.

@@ -4,6 +4,51 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- A ledger line for each subagent call the plugin decides, unless the mode
+  is `off`: the call's type and model, the first 100 characters of its
+  description, the brief's length, the tier, whether it was handed off and
+  why, and the Claude and Codex readings at that moment. The line holds the
+  brief's length, not its text; a hand-off's brief is saved separately when
+  saving it works, as before. Writing it is best effort: a failure is logged
+  and the call goes on as decided.
+- `crossfeed.py used <job> yes|partly|no` records whether a successful
+  job's result was used. When a read-only job succeeds, Claude is now told
+  to verify the job's claims and record this, and the job's last output line
+  asks for it instead of a check.
+- `/crossfeed report` shows subagent calls by how they were routed,
+  including how many hand-offs are linked by their saved brief to a job that
+  has ended, and the ratings of successful read-only jobs.
+
+### Changed
+
+- `crossfeed.py run` records the session from `CLAUDE_CODE_SESSION_ID` when
+  `--session` is omitted, and records the `--brief-file` it was given.
+
+### Fixed
+
+- A subagent call that waited for its readings was decided at the time it
+  arrived. If a later call had been decided in the meantime and stayed on
+  Claude, that stay was dropped from the count the burst rule uses, so a
+  following call could stay on Claude where it should have been handed off.
+  A call is now decided at the time the decision is made, and a stay dated
+  up to a minute after a decision still counts.
+- A reading that arrived late, after a newer one, replaced the newer one, so
+  a decision or the status line could rest on the older value until the
+  next update. Readings of Claude's usage and of the main model now take
+  effect in the order they were asked for. A model-limit reading from
+  `/usage` is dated by when its probe answered, less the age of its cached
+  data, and is ignored if it is older than the one held, unless the held one
+  is dated more than five minutes ahead of the clock (the clock went back).
+- The refusal for a handed-off call is now built from its decision: the
+  command uses the session the call was decided in, and any readings the
+  refusal quotes are the ones the decision used. Before, both came from the
+  moment the refusal was written, which could differ if a usage update or a
+  `/clear` came in while the brief was being saved.
+
 ## 0.2.1 - 2026-11-19
 
 ### Fixed
