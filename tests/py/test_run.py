@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+from pathlib import Path
 import shlex
 import signal
 import subprocess
@@ -40,6 +41,8 @@ class JobDirectoryTests(CrossfeedCase):
 class RunTests(CrossfeedCase):
     def test_run_records_cause(self):
         for args, cause in ((["--cause", "limit"], "limit"), ([], None),
+                            (["--cause", "account-week"], "account-week"),
+                            (["--cause", "codex-surplus"], "codex-surplus"),
                             (["--cause", "Ab9-" * 8], "Ab9-" * 8)):
             with self.subTest(cause=cause):
                 result = self.run_job(args)
@@ -111,7 +114,7 @@ class RunTests(CrossfeedCase):
         record, = self.records()
         self.assertEqual(set(record), {
             "v", "type", "ts", "id", "session", "kind", "tier", "dir", "sandbox", "worktree",
-            "effort", "model", "cause", "started", "wall_s", "status", "exit", "tokens", "codex_thread",
+            "effort", "model", "model_source", "cause", "started", "wall_s", "status", "exit", "tokens", "codex_thread",
             "changed", "head_moved", "resume_of", "brief_file",
         })
         self.assertEqual(record["type"], "job")
@@ -159,6 +162,59 @@ class RunTests(CrossfeedCase):
                 else:
                     self.assertIn('model_reasoning_effort="high"', argv)
                     self.assertNotIn("-m", argv)
+
+    def assert_run_model(self, args, model, source, **env):
+        argv_file = self.root / "model-argv.json"
+        result = self.run_job(args, FAKE_CODEX_ARGV=str(argv_file), **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = json.loads(argv_file.read_text())
+        if model is None or source == "resume":
+            self.assertNotIn("-m", argv)
+        else:
+            self.assertEqual(argv[argv.index("-m") + 1], model)
+        record = self.records()[-1]
+        self.assertEqual((record["model"], record["model_source"]), (model, source))
+        return record
+
+    def test_model_precedence_by_kind_and_tier(self):
+        astra = "gpt-6.2-astra"
+        cache = Path(self.env["CODEX_HOME"]) / "models_cache.json"
+        cache.parent.mkdir()
+        cache.write_text(json.dumps({"models": [{"slug": astra}]}), encoding="utf-8-sig")
+        for kind, tier, model, source in (
+            ("task", "B", None, "codex-default"), ("custom", "B", None, "codex-default"),
+            ("review", "A", astra, "judgment"), ("research", "A", astra, "judgment"),
+            ("subagent", "B", astra, "judgment"), ("subagent", "A", None, "codex-default"),
+        ):
+            with self.subTest(kind=kind, tier=tier):
+                self.assert_run_model(["--kind", kind, "--tier", tier, "--model", ""], model, source)
+        self.assert_run_model(["--kind", "review", "--model", "unlisted"], "unlisted", "flag")
+
+    def test_judgment_model_requires_a_readable_cache_and_listed_slug(self):
+        cache = Path(self.env["CODEX_HOME"]) / "models_cache.json"
+        cache.parent.mkdir()
+        for content in (None, b"", b"{", b"\xff", b"[]", b"{}", b'{"models":[]}',
+                        b'{"models":{"slug":"gpt-6.2-astra"}}',
+                        b'{"models":["gpt-6.2-astra",{},{"slug":"other"}]}'):
+            with self.subTest(content=content):
+                if content is not None:
+                    cache.write_bytes(content)
+                self.assert_run_model(["--kind", "review"], None, "codex-default")
+        cache.unlink()
+        cache.mkdir()  # An unreadable cache even when tests run as root.
+        self.assert_run_model(["--kind", "research"], None, "codex-default")
+
+    def test_judgment_model_override_disable_and_resume(self):
+        cache = self.root / ".codex" / "models_cache.json"
+        cache.parent.mkdir()
+        cache.write_text('{"models":[{"slug":"override"},{"slug":"gpt-6.2-astra"}]}')
+        env = {"CODEX_HOME": "", "HOME": str(self.root)}
+        args = ["--kind", "review"]
+        first = self.assert_run_model(args, "override", "judgment", CROSSFEED_JUDGMENT_MODEL="override", **env)
+        self.assert_run_model(args, None, "codex-default", CROSSFEED_JUDGMENT_MODEL="", **env)
+        self.assert_run_model(args, None, "codex-default", CROSSFEED_JUDGMENT_MODEL="missing", **env)
+        cache.unlink()
+        self.assert_run_model(["--resume", first["id"]], "override", "resume", **env)
 
     def test_empty_brief_is_usage_error(self):
         for brief in (b"", b"  \r\n"):

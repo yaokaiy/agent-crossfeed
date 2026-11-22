@@ -59,13 +59,13 @@ test('staticSection reproduces the fixed copy exactly', async () => {
     '# crossfeed: handing work to Codex',
     'This session can hand self-contained work to the Codex CLI, which runs on a separate subscription. crossfeed watches both quotas and tells you when to use it.',
     '- When a subagent call is refused with a message that starts with "crossfeed:", run the command in that message. Do not retry the subagent.',
-    '- Start the command as a background Bash command. You are notified when it exits. Never poll, sleep, or read its output early.',
-    '- Hand off only work the brief describes in full: goal, paths, constraints, the check command, the format of the answer. Codex sees none of this conversation.',
-    '- Keep design, architecture and UX decisions, talking with the user, and edits under about 20 lines for yourself.',
-    "- When crossfeed says a model's weekly limit is ahead of pace, keep planning, decisions and review yourself and hand execution to Codex.",
+    '- When a crossfeed notice says hand-offs are on, decide at the start of each task, before your first command: if its core is execution with a result you can check (run the tests and fix until they pass, a change across several files, three or more dependent shell steps, a search or data analysis over many files), write a full brief and run it on Codex. Keep talking with the user, design, architecture and UX decisions, steps that need tools only you have, and edits under about 20 lines for yourself.',
+    `- Start a job as a background Bash command: \`python3 -I '/x/crossfeed.py' run --kind task|review|research [--write]\` with the brief on stdin. \`task\` is execution; \`review\` and \`research\` are judgment, and crossfeed gives them its strongest Codex model. You are notified when it exits. Never poll, sleep, or read its output early.`,
+    '- A brief states the goal, the decisions already made, paths, constraints, the check command and the format of the answer. Codex sees none of this conversation.',
+    `- To fix or extend the same work, continue its thread with \`run --resume <job>\` and only the new instructions.`,
     '- While a write job runs, do not edit files in its directory.',
     "- A Codex result is a claim. Check it before you report it: after a write job, read the change list and run the check as `python3 -I '/x/crossfeed.py' check <job> -- <command>`; after a read-only job that succeeded, verify its claims and record whether you used it as `python3 -I '/x/crossfeed.py' used <job> <yes|partly|no>`.",
-    '- Exit code 75 means Codex is out of quota: do the work yourself.',
+    "- Exit code 75 means Codex is out of quota or at crossfeed's stop: do the work yourself.",
     '- Exit code 127 means the codex CLI was not found: do the work yourself and tell the user.',
   ].join('\n'))
   expect(text.split('\n').length <= 12).toBe(true)
@@ -98,7 +98,7 @@ test('staticSection quotes script paths containing spaces and apostrophes', asyn
 })
 
 test('notices explain pressure, reserve and how to hand off a long stretch', async () => {
-  const reminder = stretchReminder({ calls: 12, u: 62, script: '/x/crossfeed.py' })
+  const reminder = stretchReminder({ reasons: ['pressure'], calls: 12, u: 62, script: '/x/crossfeed.py' })
   expect(reminder.includes('12')).toBe(true)
   expect(reminder.includes('62%')).toBe(true)
   expect(reminder.includes("python3 -I '/x/crossfeed.py' run")).toBe(true)
@@ -118,7 +118,7 @@ test('all builders produce clean text without a trailing newline', async () => {
     denyText({ saved: false, tier: 'A', reason: '', u: 0, command }),
     staticSection('/tmp/检查 naïve/crossfeed.py'),
     statusLine({ mode: 'auto', P: 0, reserve: false }),
-    stretchReminder({ calls: 0, u: 0, script: '' }),
+    stretchReminder({ reasons: ['pressure'], calls: 0, u: 0, script: '' }),
     pressureNotice({ u: 0, P: 0 }), reserveNotice(0),
   ]
   for (const output of outputs) {
@@ -229,17 +229,10 @@ test('ahead and full notices preserve labels and include reset and model advice'
 })
 
 test('limit stretch reminders work without a five-hour reading', async () => {
-  const note = stretchReminder({ calls: 12, limit, script: '/x/crossfeed.py' })
+  const note = stretchReminder({ reasons: ['limit'], calls: 12, limit, script: '/x/crossfeed.py' })
   expect(note.startsWith('crossfeed: 12 main-loop tool calls since the last user prompt; Fable weekly 62% used, ahead of pace.')).toBe(true)
   expect(note.includes('Claude 5h')).toBe(false)
-  expect(stretchReminder({ calls: 12, limit, u: 0, script: '' }).includes('Claude 5h 0%')).toBe(true)
-})
-
-test('model-limit static guidance appears exactly once after keep-design guidance', async () => {
-  const line = "- When crossfeed says a model's weekly limit is ahead of pace, keep planning, decisions and review yourself and hand execution to Codex."
-  const lines = staticSection('/x/crossfeed.py').split('\n')
-  expect(lines.filter(text => text === line).length).toBe(1)
-  expect(lines[lines.indexOf(line) - 1]?.startsWith('- Keep design')).toBe(true)
+  expect(stretchReminder({ reasons: ['limit'], calls: 12, limit, u: 0, script: '' }).includes('Claude 5h 0%')).toBe(true)
 })
 
 test('limitLines describes pace, state, age and routing', async () => {
@@ -258,4 +251,13 @@ test('premiumFallback defaults only non-string inputs', async () => {
   expect(toConfig({ premiumFallback: 3 }).premiumFallback).toBe('opus')
   expect(toConfig({ premiumFallback: '' }).premiumFallback).toBe('')
   expect(toConfig({}).premiumFallback).toBe('opus')
+})
+
+test('both refusal command forms carry the same custom stop before the input argument', async () => {
+  for (const briefFile of [undefined, '/brief']) {
+    const options = { ...dispatch, cause: 'codex-surplus', model: 'my model', briefFile }
+    const input = briefFile ? "--brief-file '/brief'" : "<<'CROSSFEED_BRIEF_EOF'"
+    expect(dispatchCommand({ ...options, codexStopPercent: 91.5 }).endsWith("--model 'my model' --codex-stop 91.5 " + input)).toBe(true)
+    expect(dispatchCommand({ ...options, codexStopPercent: 85 })).toBe(dispatchCommand(options))
+  }
 })

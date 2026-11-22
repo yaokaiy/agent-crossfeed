@@ -1,5 +1,6 @@
+import { DEFAULTS } from './config'
 import type { Mode } from './config'
-import type { BucketState } from './policy'
+import type { AccountWeek, BucketState, CodexWindow, FloorCause, HandOffReason } from './policy'
 
 export type LimitFact = { label: string; family?: string; percent: number; line?: number; resetsAt?: number; state: 'ahead' | 'full' }
 
@@ -18,7 +19,11 @@ export function heredocDelimiter(brief: string, now: number): string {
   return delimiter
 }
 
-export function dispatchCommand(a: { script: string; tier: 'A' | 'B'; dir: string; write: boolean; worktree: boolean; session?: string; effort?: string; model?: string; timeoutMinutes?: number; briefFile?: string; delimiter?: string; cause?: string }): string {
+function stopFlag(stop = DEFAULTS.codexStopPercent): string {
+  return stop === DEFAULTS.codexStopPercent ? '' : ` --codex-stop ${stop}`
+}
+
+export function dispatchCommand(a: { script: string; tier: 'A' | 'B'; dir: string; write: boolean; worktree: boolean; session?: string; effort?: string; model?: string; timeoutMinutes?: number; briefFile?: string; delimiter?: string; cause?: string; codexStopPercent?: number }): string {
   const parts = ['python3', '-I', shellQuote(a.script), 'run', '--tier', a.tier, '--kind', 'subagent']
   if (a.cause !== undefined) parts.push('--cause', /^[A-Za-z0-9-]{1,32}$/.test(a.cause) ? a.cause : shellQuote(a.cause))
   parts.push('--dir', shellQuote(a.dir))
@@ -28,18 +33,30 @@ export function dispatchCommand(a: { script: string; tier: 'A' | 'B'; dir: strin
   if (a.effort !== undefined && a.effort !== 'high') parts.push('--effort', shellQuote(a.effort))
   if (a.model !== undefined && a.model !== '') parts.push('--model', shellQuote(a.model))
   if (a.timeoutMinutes !== undefined && a.timeoutMinutes !== 30) parts.push('--timeout', String(a.timeoutMinutes))
-  if (a.briefFile !== undefined) parts.push('--brief-file', shellQuote(a.briefFile))
-  else parts.push('<<' + shellQuote(a.delimiter ?? 'CROSSFEED_BRIEF_EOF'))
-  return parts.join(' ')
+  const brief = a.briefFile !== undefined ? '--brief-file ' + shellQuote(a.briefFile) : '<<' + shellQuote(a.delimiter ?? 'CROSSFEED_BRIEF_EOF')
+  return `${parts.join(' ')}${stopFlag(a.codexStopPercent)} ${brief}`
 }
 
-export function denyText(a: { tier: 'A' | 'B'; reason: string; u: number; F?: number; codexPercent?: number; command: string; saved: boolean; delimiter?: string; limit?: LimitFact }): string {
+function surplusFact(percent: number, points: number, stop: number): string {
+  return `Codex weekly ${Math.round(percent)}% used, ${Math.floor(points)} points under an even pace to its ${stop}% stop`
+}
+
+export function denyText(a: { tier: 'A' | 'B'; reason: string; u: number; F?: number; codexPercent?: number; command: string; saved: boolean; delimiter?: string; limit?: LimitFact; cause?: FloorCause; account?: AccountWeek; surplus?: number; codexStopPercent?: number }): string {
   const pace = a.F === undefined ? '' : `, on pace for ${Math.round(a.F)}%`
   const codex = a.codexPercent === undefined ? '' : `; Codex weekly ${Math.round(a.codexPercent)}%`
+  let why = `Why: tier ${a.tier} (${a.reason}). Claude 5h ${Math.round(a.u)}%${pace}${codex}.`
+  if (a.cause === 'codex-surplus' && a.surplus !== undefined && a.codexPercent !== undefined) {
+    why = `Why: tier ${a.tier}; ${surplusFact(a.codexPercent, a.surplus, a.codexStopPercent ?? DEFAULTS.codexStopPercent)}.`
+  } else {
+    const limit = a.cause === 'account-week' && a.account ? { ...a.account, label: 'Claude all-models' } : a.limit
+    if (limit?.percent !== undefined) {
+      const detail = limit.state === 'full' ? ', limit used up' : limit.line === undefined ? '' : `, ahead of an even pace (${Math.round(limit.line)}%)`
+      why = `Why: tier ${a.tier}; ${limit.label} weekly ${Math.round(limit.percent)}% used${detail}.`
+    }
+  }
   return [
     'crossfeed: run this on Codex instead of a Claude subagent.',
-    a.limit ? `Why: tier ${a.tier}; ${a.limit.label} weekly ${Math.round(a.limit.percent)}% used${a.limit.state === 'full' ? ', limit used up' : a.limit.line === undefined ? '' : `, ahead of an even pace (${Math.round(a.limit.line)}%)`}.`
-      : `Why: tier ${a.tier} (${a.reason}). Claude 5h ${Math.round(a.u)}%${pace}${codex}.`,
+    why,
     a.saved ? 'The brief you just wrote is saved. Start this as a background Bash command:'
       : 'Start it as a background Bash command with the brief you just wrote, unchanged, as stdin:',
     a.command,
@@ -48,36 +65,37 @@ export function denyText(a: { tier: 'A' | 'B'; reason: string; u: number; F?: nu
   ].join('\n')
 }
 
-export function staticSection(script: string): string {
+export function staticSection(script: string, codexStopPercent = DEFAULTS.codexStopPercent): string {
+  const stop = stopFlag(codexStopPercent)
   return [
     '# crossfeed: handing work to Codex',
     'This session can hand self-contained work to the Codex CLI, which runs on a separate subscription. crossfeed watches both quotas and tells you when to use it.',
     '- When a subagent call is refused with a message that starts with "crossfeed:", run the command in that message. Do not retry the subagent.',
-    '- Start the command as a background Bash command. You are notified when it exits. Never poll, sleep, or read its output early.',
-    '- Hand off only work the brief describes in full: goal, paths, constraints, the check command, the format of the answer. Codex sees none of this conversation.',
-    '- Keep design, architecture and UX decisions, talking with the user, and edits under about 20 lines for yourself.',
-    "- When crossfeed says a model's weekly limit is ahead of pace, keep planning, decisions and review yourself and hand execution to Codex.",
+    '- When a crossfeed notice says hand-offs are on, decide at the start of each task, before your first command: if its core is execution with a result you can check (run the tests and fix until they pass, a change across several files, three or more dependent shell steps, a search or data analysis over many files), write a full brief and run it on Codex. Keep talking with the user, design, architecture and UX decisions, steps that need tools only you have, and edits under about 20 lines for yourself.',
+    `- Start a job as a background Bash command: \`python3 -I ${shellQuote(script)} run --kind task|review|research [--write]${stop}\` with the brief on stdin. \`task\` is execution; \`review\` and \`research\` are judgment, and crossfeed gives them its strongest Codex model. You are notified when it exits. Never poll, sleep, or read its output early.`,
+    '- A brief states the goal, the decisions already made, paths, constraints, the check command and the format of the answer. Codex sees none of this conversation.',
+    `- To fix or extend the same work, continue its thread with \`run --resume <job>${stop}\` and only the new instructions.`,
     '- While a write job runs, do not edit files in its directory.',
     `- A Codex result is a claim. Check it before you report it: after a write job, read the change list and run the check as \`python3 -I ${shellQuote(script)} check <job> -- <command>\`; after a read-only job that succeeded, verify its claims and record whether you used it as \`python3 -I ${shellQuote(script)} used <job> <yes|partly|no>\`.`,
-    '- Exit code 75 means Codex is out of quota: do the work yourself.',
+    "- Exit code 75 means Codex is out of quota or at crossfeed's stop: do the work yourself.",
     '- Exit code 127 means the codex CLI was not found: do the work yourself and tell the user.',
   ].join('\n')
 }
 
-export function statusLine(a: { mode: Mode; u?: number; F?: number; w?: number; codexPercent?: number; codexAvailable?: boolean; codexStale?: boolean; P: number; reserve: boolean; limits?: { label: string; percent: number; state: BucketState }[] }): string {
+export function statusLine(a: { mode: Mode; u?: number; F?: number; w?: number; accountAhead?: boolean; activeSurplus?: number; codexPercent?: number; codexAvailable?: boolean; codexStale?: boolean; P: number; reserve: boolean; limits?: { label: string; percent: number; state: BucketState }[] }): string {
   if (a.mode === 'off') return 'crossfeed off'
   const parts = [`crossfeed ${a.mode}`]
   if (a.u !== undefined) {
     const pace = a.F === undefined ? '' : ` (pace ${Math.round(a.F)}%)`
     parts.push(`claude 5h ${Math.round(a.u)}%${pace}`)
   }
-  if (a.w !== undefined) parts.push(`7d ${Math.round(a.w)}%`)
+  if (a.w !== undefined) parts.push(`7d ${Math.round(a.w)}%${a.accountAhead ? ' ahead' : ''}`)
   for (const limit of a.limits ?? []) {
     if (limit.state === 'unknown') continue
     parts.push(`${limit.label.toLowerCase()} wk ${Math.round(limit.percent)}%${limit.state === 'ahead' || limit.state === 'full' ? ' ' + limit.state : ''}`)
   }
   const waiting = parts.length === 1 && a.codexPercent === undefined
-  if (a.codexPercent !== undefined) parts.push(`codex wk ${Math.round(a.codexPercent)}%${a.codexStale ? ' stale' : ''}`)
+  if (a.codexPercent !== undefined) parts.push(`codex wk ${Math.round(a.codexPercent)}%${a.codexStale ? ' stale' : ''}${a.activeSurplus === undefined ? '' : ` +${Math.floor(a.activeSurplus)}`}`)
   else if (!a.codexAvailable) parts.push('codex unavailable')
   else if (a.codexStale) parts.push('codex stale')
   parts.push(waiting ? 'waiting for a reading' : `pressure ${Math.round(a.P * 100) / 100}`)
@@ -85,11 +103,32 @@ export function statusLine(a: { mode: Mode; u?: number; F?: number; w?: number; 
   return parts.join(' · ')
 }
 
-export function stretchReminder(a: { calls: number; u?: number; script: string; session?: string; limit?: LimitFact }): string {
+function resetSuffix(resetsAt: number | undefined): string {
+  return resetsAt === undefined ? '' : ` (resets ${new Date(resetsAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`
+}
+
+export function balanceOnText(account: AccountWeek, week: CodexWindow | undefined, activeSurplus: number | undefined, stop: number, always: boolean): string {
+  const facts = []
+  if ((account.state === 'ahead' || account.state === 'full') && account.percent !== undefined && account.line !== undefined) {
+    facts.push(`Claude all-models weekly ${Math.round(account.percent)}% used, an even pace would be ${Math.round(account.line)}%${resetSuffix(account.resetsAt)}`)
+  }
+  if (week && activeSurplus !== undefined) facts.push(surplusFact(week.usedPercent, activeSurplus, stop) + resetSuffix(week.resetsAt))
+  if (always) facts.push('crossfeed is set to always')
+  return `crossfeed: hand-offs are on. ${facts.join('; ')}. Before you start execution with a result you can check, hand it to Codex; keep talking with the user, decisions and review here.`
+}
+
+export function balanceOffText(closeToStop: boolean): string {
+  const why = closeToStop ? 'Codex is close to its stop' : 'the Claude week is on pace and the Codex surplus is under 10 points'
+  return `crossfeed: hand-offs are off (${why}). Do execution yourself; hand work to Codex only when a subagent call is refused.`
+}
+
+export function stretchReminder(a: { calls: number; u?: number; script: string; session?: string; limit?: LimitFact; reasons: HandOffReason[]; codexStopPercent?: number }): string {
   const usage = a.limit
     ? `${a.limit.label} weekly ${Math.round(a.limit.percent)}% used, ${a.limit.state === 'full' ? 'limit used up' : 'ahead of pace'}.${a.u === undefined ? '' : ` Claude 5h ${Math.round(a.u)}%.`}`
-    : a.u === undefined ? 'usage unknown.' : `Claude 5h ${Math.round(a.u)}%.`
-  return `crossfeed: ${a.calls} main-loop tool calls since the last user prompt; ${usage} Hand self-contained work to Codex with python3 -I ${shellQuote(a.script)} run${a.session === undefined ? '' : ' --session ' + shellQuote(a.session)} and the full brief on stdin. The job is read-only unless --write is added. Start it as a background Bash command, wait for the exit notification, and check the result.`
+    : a.u === undefined ? 'Claude 5h usage unknown.' : `Claude 5h ${Math.round(a.u)}%.`
+  const session = a.session === undefined ? '' : ' --session ' + shellQuote(a.session)
+  const command = `python3 -I ${shellQuote(a.script)} run --kind task${stopFlag(a.codexStopPercent)}${session}`
+  return `crossfeed: ${a.calls} main-loop tool calls since the last user prompt; ${usage} Hand-offs are on (${a.reasons.join(', ')}). Hand self-contained work to Codex with ${command} and the full brief on stdin. The job is read-only unless --write is added. Start it as a background Bash command, wait for the exit notification, and check the result.`
 }
 
 export function pressureNotice(a: { u: number; F?: number; P: number }): string {

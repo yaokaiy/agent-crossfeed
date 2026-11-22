@@ -35,6 +35,8 @@ function setup(on: On) {
     // Decision records have their own trace so the legacy process trace stays intact.
     decisions: [] as { argv: readonly string[]; timeout?: number; stdin?: string }[], decisionsDone: 0,
     decisionGate: undefined as Promise<void> | undefined, decisionFailure: '' as '' | 'throw' | 'deny' | 'nonzero' | 'opaque',
+    nudges: [] as { argv: readonly string[]; timeout?: number; stdin?: string }[],
+    nudgeGate: undefined as Promise<void> | undefined, nudgeFailure: '' as '' | 'throw' | 'nonzero' | 'deny',
     decisionsDoneAtAgent: [] as number[], atAgent: undefined as (() => void) | undefined,
     stashGate: undefined as Promise<void> | undefined, sequence: [] as string[],
     quotaGate: undefined as Promise<void> | undefined, throwAgent: false,
@@ -97,6 +99,13 @@ function setup(on: On) {
   on('command.run', () => ({ text: 'engine command' }))
   on('process.run', async (_$, e) => {
     world.sequence.push(e.argv[3] ?? '')
+    if (e.argv[3] === 'nudge') {
+      world.nudges.push({ argv: e.argv, timeout: e.init?.timeoutMs, stdin: e.init?.stdin })
+      await world.nudgeGate
+      if (world.nudgeFailure === 'throw') throw Object.create(null)
+      if (world.nudgeFailure === 'deny') return { deny: 'ledger unavailable' }
+      return { value: processResult('', world.nudgeFailure === 'nonzero' ? 2 : 0) }
+    }
     if (e.argv[3] === 'decision') {
       world.decisions.push({ argv: e.argv, timeout: e.init?.timeoutMs, stdin: e.init?.stdin })
       await world.decisionGate
@@ -139,8 +148,10 @@ function setup(on: On) {
     if (world.rejectProcess) return { deny: 'process unavailable' }
     if (e.argv[3] === 'lockout') return { value: world.lockout }
     if (e.argv[3] === 'quota') {
+      const quota = world.quota
       world.duringQuota?.()
       await world.quotaGate
+      return { value: quota }
     }
     return { value: e.argv[3] === 'report' ? processResult('synthetic report\n') : world.quota }
   })
@@ -312,14 +323,14 @@ test('prompt notices preserve context and skip meta and command submissions', as
   const result = await $.prompt.submit(prompt)
   expect(result.text).toBe(prompt.text)
   expect(result.context?.[0]).toBe('existing prompt context')
-  expect(result.context?.length).toBe(3)
+  expect(result.context?.length).toBe(2)
   expect((await $.prompt.submit(prompt)).context).toEqual(prompt.context)
 })
 
 test('tool reminders preserve results and context and never replace engine denials', async ($, on) => {
   const world = setup(on)
   await start($)
-  await measure($, world, 95)
+  await measure($, world, 85)
   for (let i = 0; i < 11; i++) await $.tool.call({ tool: 'Bash', command: 'true' })
   const result = await $.tool.call({ tool: 'Bash', command: 'true' })
   expect(result.result).toEqual({ stdout: 'ok', stderr: '', interrupted: false })
@@ -641,10 +652,9 @@ test('notices wait through subagent calls and denials, reach main-loop tool once
   expect(await $.tool.call(bash)).toEqual({ deny: 'engine denied' })
   world.denyBash = false
   const result = await $.tool.call(bash)
-  expect(result.context?.length).toBe(3)
+  expect(result.context?.length).toBe(2)
   expect(result.context?.[0]).toBe('existing tool context')
-  expect(result.context?.[1]?.includes('pressure')).toBe(true)
-  expect(result.context?.[2]?.includes('reserve')).toBe(true)
+  expect(result.context?.[1]?.includes('reserve')).toBe(true)
   expect((await $.tool.call(bash)).context).toEqual(['existing tool context'])
   expect((await $.prompt.submit({ text: 'next', context: [], wait: false, origin: ORIGIN })).context).toEqual([])
 })
@@ -721,7 +731,7 @@ for (const bad of [NaN, Infinity, undefined, null, '1794902400000'] as const) {
 test('a refused tool call is not counted and does not use up the stretch reminder', async ($, on) => {
   const world = setup(on)
   await start($)
-  await measure($, world, 95)
+  await measure($, world, 85)
   for (let i = 0; i < 11; i++) await $.tool.call({ tool: 'Bash', command: 'true' })
   world.denyBash = true
   for (let i = 0; i < 3; i++) expect(await $.tool.call({ tool: 'Bash', command: 'true' })).toEqual({ deny: 'engine denied' })
@@ -821,7 +831,7 @@ test('startup reads Claude usage once alongside Codex quota with the contracted 
   expect(world.processes.filter(p => p.argv[3] === 'quota').length).toBe(1)
   expect(world.statuses[0]?.includes('fable wk 62% ahead')).toBe(true)
   const section = (await $.prompt.compose(COMPOSE)).sections[1]?.text ?? ''
-  expect(section.includes("When crossfeed says a model's weekly limit is ahead of pace")).toBe(true)
+  expect(section.includes('When a crossfeed notice says hand-offs are on')).toBe(true)
 })
 
 test('an ahead Fable limit hands a tier B call to Codex', async ($, on) => {
@@ -1342,4 +1352,179 @@ test('a limit probe that answers after the clock went back an hour is still used
   release()
   await update
   expect((await command($, 'status')).text?.includes('fable wk 70%')).toBe(true)
+})
+
+test('off suppresses the static section on each compose and auto restores the same text', { options: { mode: 'off' } }, async ($, on) => {
+  const world = setup(on)
+  await start($)
+  const engine = [{ id: 'engine', text: 'engine section', scope: 'shared' }]
+  expect((await $.prompt.compose(COMPOSE)).sections).toEqual(engine)
+  await command($, 'auto')
+  const active = await $.prompt.compose(COMPOSE)
+  expect(active.sections[1]?.text.includes('before your first command')).toBe(true)
+  await command($, 'always')
+  expect(await $.prompt.compose(COMPOSE)).toEqual(active)
+  await command($, 'off')
+  expect((await $.prompt.compose(COMPOSE)).sections).toEqual(engine)
+  expect(world.nudges).toEqual([])
+})
+
+for (const stop of [75.5, 85]) {
+  test(`the configured stop ${stop} reaches fresh, resumed, stretch and refusal commands`, { options: { mode: 'always', codexStopPercent: stop, stretchCalls: 1, model: 'explicit-model' } }, async ($, on) => {
+    const world = setup(on)
+    world.usage = [{ kind: 'five_hour', percentUsed: 5, resetsAt: RESET }]
+    await start($)
+    const lines = (await $.prompt.compose(COMPOSE)).sections[1]!.text.split('\n')
+    const result = await $.tool.call({ tool: 'Bash', command: 'true' })
+    const refusal = await $.tool.call(AGENT)
+    const commands = [lines.find(line => line.includes('run --kind task|review|research')), lines.find(line => line.includes('run --resume <job>')),
+      result.context?.find(text => text.includes('run --kind task')), refusal.deny?.split('\n')[3]]
+    expect(refusal.deny?.includes("--model 'explicit-model'")).toBe(true)
+    for (const cmd of commands) {
+      expect(cmd?.includes('run ')).toBe(true)
+      expect(cmd?.includes('--codex-stop')).toBe(stop !== 85)
+      if (stop !== 85) expect(cmd?.includes('--codex-stop 75.5')).toBe(true)
+    }
+  })
+}
+
+test('tool and prompt notices await their own nudge records and retain their session across clear', { options: { mode: 'always', stretchCalls: 1 } }, async ($, on) => {
+  const world = setup(on)
+  await start($)
+  let release = () => {}
+  world.nudgeGate = new Promise<void>(resolve => { release = resolve })
+  let toolDone = false
+  const tool = $.tool.call({ tool: 'Bash', command: 'true' }).then(result => { toolDone = true; return result })
+  for (let i = 0; i < 1000 && !world.nudges.length; i++) await Promise.resolve()
+  expect(world.nudges.length).toBe(1)
+  expect(toolDone).toBe(false)
+  await $.session.end({ reason: 'clear', sessionId: 'test-session', resume: { id: 'test-session' } })
+  world.sessionId = 'new-session'
+  let promptDone = false
+  const prompt = $.prompt.submit({ text: 'Next', wait: false, origin: ORIGIN }).then(result => { promptDone = true; return result })
+  for (let i = 0; i < 1000 && world.nudges.length < 2; i++) await Promise.resolve()
+  expect(world.nudges.length).toBe(2)
+  expect(promptDone).toBe(false)
+  release()
+  const context = (await tool).context
+  expect(context?.length).toBe(3)
+  expect(context?.[0]).toBe('existing tool context')
+  expect(context?.[1]?.includes('hand-offs are on')).toBe(true)
+  expect(context?.[2]?.includes('1 main-loop tool calls')).toBe(true)
+  expect((await prompt).context?.[0]?.includes('crossfeed is set to always')).toBe(true)
+  expect(world.bashCalls).toBe(1)
+  const script = world.processes[0]!.argv[2]!
+  for (const call of world.nudges) {
+    expect(call.argv).toEqual(['python3', '-I', script, 'nudge'])
+    expect(call.timeout).toBe(5000)
+  }
+  expect(world.nudges.map(call => JSON.parse(call.stdin!))).toEqual([
+    { session: 'test-session', kind: 'balance-on', reasons: ['always'], calls: null },
+    { session: 'new-session', kind: 'balance-on', reasons: ['always'], calls: null },
+    { session: 'test-session', kind: 'stretch', reasons: ['always'], calls: 1 },
+  ])
+})
+
+test('both weekly fields and the account-week refusal survive a newer measure during stash', async ($, on) => {
+  const world = setup(on)
+  const week = { kind: 'seven_day' as const, percentUsed: 79, resetsAt: new Date(BASE + 3.5 * 1440 * MINUTE).toISOString() }
+  world.usage = [{ kind: 'five_hour', percentUsed: 5, resetsAt: RESET }, week]
+  await start($)
+  let release = () => {}
+  world.stashGate = new Promise<void>(resolve => { release = resolve })
+  const call = $.tool.call(RESEARCH)
+  for (let i = 0; i < 1000 && !world.sequence.includes('stash'); i++) await Promise.resolve()
+  expect(world.sequence.includes('stash')).toBe(true)
+  await measure($, world, 10)
+  release()
+  const deny = (await call).deny ?? ''
+  expect(deny.split('\n')[1]).toBe('Why: tier B; Claude all-models weekly 79% used, ahead of an even pace (50%).')
+  expect(deny.includes('--kind subagent --cause account-week')).toBe(true)
+  expect(decisions(world)[0]).toEqual(expect.objectContaining({
+    cause: 'account-week', account_week: { percent: 79, line: 50, state: 'ahead' }, codex_surplus: -18,
+  }))
+})
+
+test('prompt submission records balance-off only after a known recovery and never probes', async ($, on) => {
+  const world = setup(on)
+  const week = { kind: 'seven_day' as const, percentUsed: 79, resetsAt: new Date(BASE + 3.5 * 1440 * MINUTE).toISOString() }
+  world.usage = [week]
+  await start($)
+  const prompt = { text: 'Next', wait: false, origin: ORIGIN }
+  expect((await $.prompt.submit(prompt)).context?.[0]?.includes('hand-offs are on')).toBe(true)
+  world.now += 16 * MINUTE
+  expect((await $.prompt.submit(prompt)).context ?? []).toEqual([])
+  expect(world.processes.filter(call => call.argv[3] === 'quota').length).toBe(1)
+  expect(world.usageProcesses.length).toBe(1)
+  world.usage = [{ ...week, percentUsed: 10 }]
+  await $.session.measure({ context: { window: 200000 }, rateLimits: world.usage, changed: ['rateLimits'] })
+  expect((await $.prompt.submit(prompt)).context?.[0]?.includes('hand-offs are off')).toBe(true)
+  expect((await $.prompt.submit(prompt)).context ?? []).toEqual([])
+  expect(world.nudges.map(call => JSON.parse(call.stdin!))).toEqual([
+    { session: 'test-session', kind: 'balance-on', reasons: ['account-week'], calls: null },
+    { session: 'test-session', kind: 'balance-off', reasons: [], calls: null },
+  ])
+})
+
+for (const failure of ['throw', 'deny', 'nonzero'] as const) {
+  test(`a failed nudge write (${failure}) still delivers the notice and never replays the tool`, async ($, on) => {
+    const world = setup(on)
+    await start($)
+    await command($, 'always')
+    world.nudgeFailure = failure
+    const result = await $.tool.call({ tool: 'Bash', command: 'true' })
+    expect(result.context?.[1]?.includes('hand-offs are on')).toBe(true)
+    expect(world.bashCalls).toBe(1)
+    expect(world.nudges.length).toBe(1)
+    expect(world.logs.some(line => line.startsWith('crossfeed: nudge record'))).toBe(true)
+    expect((await $.prompt.submit({ text: 'Next', wait: false, origin: ORIGIN })).context ?? []).toEqual([])
+  })
+}
+
+for (const [age, kept] of [[0, 30], [60, 40]] as const) {
+  test(`overlapping quota replies use answer time less log age (${age}s)`, async ($, on) => {
+    const world = setup(on)
+    await start($)
+    const quota = (used_percent: number, age_s: number) => processResult(JSON.stringify({ ...QUOTA, age_s, windows: [{ ...QUOTA.windows[0], used_percent }] }))
+    world.now += 20 * MINUTE
+    world.quota = quota(30, age)
+    let release = () => {}
+    world.quotaGate = new Promise<void>(resolve => { release = resolve })
+    const first = measure($, world, 5)
+    for (let i = 0; i < 1000 && world.sequence.filter(name => name === 'quota').length < 2; i++) await Promise.resolve()
+    expect(world.sequence.filter(name => name === 'quota').length).toBe(2)
+    world.now += 6 * MINUTE
+    world.quota = quota(40, 0)
+    world.quotaGate = undefined
+    await measure($, world, 5)
+    world.now += 10 * 1000
+    release()
+    await first
+    const status = (await command($, 'status')).text ?? ''
+    expect(status.includes(`codex wk ${kept}%`)).toBe(true)
+    expect(status.includes(`Codex reading age: ${age === 0 ? 0 : 10} seconds`)).toBe(true)
+  })
+}
+
+test('a tool finishing after clear leaves the new conversation’s notices and count for its own calls', { options: { mode: 'always', stretchCalls: 1 } }, async ($, on) => {
+  const world = setup(on)
+  await start($)
+  let release = () => {}
+  world.clockGate = new Promise<void>(resolve => { release = resolve })
+  world.holdClockReadAt = world.clockReads + 1
+  const bash = { tool: 'Bash' as const, command: 'true' }
+  const old = $.tool.call(bash)
+  for (let i = 0; i < 1000 && !world.clockHeld; i++) await Promise.resolve()
+  expect(world.clockHeld).toBe(true)
+  await $.session.end({ reason: 'clear', sessionId: 'test-session', resume: { id: 'test-session' } })
+  world.sessionId = 'new-session'
+  await measure($, world, 5)
+  release()
+  expect((await old).context).toEqual(['existing tool context'])
+  expect(world.nudges.length).toBe(0)
+  await $.tool.call(bash)
+  expect(world.nudges.map(call => JSON.parse(call.stdin!))).toEqual([
+    { session: 'new-session', kind: 'balance-on', reasons: ['always'], calls: null },
+    { session: 'new-session', kind: 'stretch', reasons: ['always'], calls: 1 },
+  ])
 })

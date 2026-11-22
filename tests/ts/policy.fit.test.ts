@@ -99,3 +99,8 @@ test('fit recognises the spellings the documentation lists', async () => {
   expect(fit({ prompt: 'We are brainstorming names for the new module.' + pad }).tier).toBe('C')
   expect(fit({ prompt: 'Make pass the suite in tests/test_parser.py again.' + pad + ' Check: pytest tests/test_parser.py' }).tier).toBe('A')
 })
+
+test('the Codex stop accepts a fractional percentage through 100 inclusive', async () => {
+  for (const stop of [0.1, 85, 99.9, 100]) expect(toConfig({ codexStopPercent: stop }).codexStopPercent).toBe(stop)
+  for (const stop of [0, -1, 100.1, 101, NaN, Infinity, '85']) expect(toConfig({ codexStopPercent: stop }).codexStopPercent).toBe(85)
+})

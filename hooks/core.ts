@@ -1,11 +1,13 @@
 import type { Config, Mode } from './config'
-import { CODEX_MAX_AGE, INITIAL_PRESSURE, bucketState, familyOf, fallbackFor, rewriteModel, subagentFamily, decide, eligible, fit, forecast, headroom, headroomCause, shortProblem, pressure, updatePressure } from './policy'
-import type { AgentCall, ClaudeReading, CodexReading, UsageReading, BucketView, Family, Tier } from './policy'
-import { limitLines, limitNotice, denyText, dispatchCommand, heredocDelimiter, pressureNotice, reserveNotice, statusLine, stretchReminder } from './text'
+import { CODEX_MAX_AGE, INITIAL_PRESSURE, accountWeekState, bucketState, codexSurplus, familyOf, fallbackFor, rewriteModel, subagentFamily, decide, eligible, fit, forecast, headroomCause, knownHeadroom, shortProblem, pressure, updatePressure, weeklyWindow } from './policy'
+import type { AgentCall, BucketState, ClaudeReading, CodexReading, UsageReading, BucketView, Family, FloorCause, HandOffReason, Tier } from './policy'
+import { balanceOffText, balanceOnText, limitLines, limitNotice, denyText, dispatchCommand, heredocDelimiter, pressureNotice, reserveNotice, statusLine, stretchReminder } from './text'
 
 import type { LimitFact } from './text'
 
-export type Route = { tier: 'A' | 'B'; reason: string; limit?: LimitFact; cause?: string }
+export type Route = { tier: 'A' | 'B'; reason: string; limit?: LimitFact; cause?: FloorCause }
+export type Nudge = { session: string | null; kind: 'balance-on' | 'balance-off' | 'stretch'; reasons: HandOffReason[]; calls: number | null }
+export type Notice = { text: string; nudge?: Nudge }
 type Spawn = { subagentType: string; model?: string; fork: boolean; parentModel: string }
 
 // One ledger line per routing decision, built from plain values when the call is decided.
@@ -23,12 +25,14 @@ export type DecisionRecord = {
   tier_reason: string | null
   handed_off: boolean
   reason: string
-  cause: string | null
+  cause: FloorCause | null
   burst: number
   pressure: number
   five_hour: number | null
   forecast: number | null
   seven_day: number | null
+  account_week: { percent: number; line: number | null; state: BucketState } | null
+  codex_surplus: number | null
   codex_headroom: number
   codex_weekly: number | null
   codex_age_s: number | null
@@ -44,7 +48,7 @@ export type Core = {
   spawnModel(e: Spawn, now: number): { model: string; from: string; bucket: string; percent: number } | undefined
   bucketLockout(now: number): { bucket: string; resetAt: string } | undefined
   measure(reading: ClaudeReading, now: number): void
-  setCodex(reading: CodexReading | undefined, problem?: string): void
+  setCodex(reading: CodexReading | undefined, problem?: string, now?: number): void
   setLockout(resetAtMs: number | undefined): void
   codexAge(now: number): number
   needsCodex(call: AgentCall): boolean
@@ -54,9 +58,9 @@ export type Core = {
   forgetStay(time: number): void
   denial(route: Route, call: AgentCall, cwd: string, now: number, briefFile?: string, decided?: DecisionRecord): string
   lastDecision(): string
-  toolCall(tool: string, isSubagent: boolean, now?: number): string | undefined
-  takeNotices(now?: number): string[]
-  userPrompt(now?: number): string[]
+  toolCall(tool: string, isSubagent: boolean, now?: number): Notice | undefined
+  takeNotices(now?: number): Notice[]
+  userPrompt(now?: number): Notice[]
   stopFailure(error: string, now: number): { resetAt: string } | undefined
   setMode(mode: Mode): void
   status(now: number): string
@@ -73,22 +77,18 @@ function recentStays(stays: number[], now: number): number[] {
   return stays.filter(time => time >= now - 10 * 60000 && time <= now + CLOCK_SKEW)
 }
 
-function weeklyPercent(codex: CodexReading | undefined): number | undefined {
-  const windows = codex?.windows.filter(window => window.minutes > 360) ?? []
-  return windows.sort((a, b) => b.minutes - a.minutes)[0]?.usedPercent
-}
-
 export function createCore(config: Config, script: string, session?: string): Core {
   let mode = config.mode
   let usage: UsageReading | undefined
   let usageProblem: string | undefined
   let usageAttempted = false
   let mainModel: string | undefined
-  let latestNow = 0
+  let latestNow: number | undefined
   const limitNotified = new Set<string>()
   const lockedBuckets = new Set<string>()
   let limitNotices: { family: Family; state: 'ahead' | 'full' }[] = []
   let reading: ClaudeReading = {}
+  let sevenDayReadAt = 0
   let codex: CodexReading | undefined
   let codexProblem: string | undefined
   let lockoutResetAt: number | undefined
@@ -98,7 +98,9 @@ export function createCore(config: Config, script: string, session?: string): Co
   let state = INITIAL_PRESSURE
   let pressureNotified = false
   let reserveNotified = false
-  let notices: string[] = []
+  let pendingPressure: string | undefined
+  let pendingReserve: string | undefined
+  let lastBalance: 'on' | 'off' | undefined
   let calls = 0
   let stretchNotified = false
   let lastDecision = 'last subagent call: none yet'
@@ -151,7 +153,45 @@ export function createCore(config: Config, script: string, session?: string): Co
     return codex === undefined ? Infinity : Math.abs(now - codex.readAt)
   }
 
+  function balance(now: number) {
+    const account = accountWeekState(reading.sevenDay, sevenDayReadAt, now)
+    const accountAhead = account.state === 'ahead' || account.state === 'full'
+    const availableHeadroom = knownHeadroom(codex, config, now)
+    const g = availableHeadroom ?? 0
+    const surplus = codexSurplus(codex, config, now)
+    const activeSurplus = surplus !== undefined && surplus >= 15 && g >= 0.5 ? surplus : undefined
+    return { account, accountAhead, g, availableHeadroom, surplus, activeSurplus }
+  }
+
+  function mainLoop(now: number, quotas = balance(now)) {
+    const steeringEnabled = mode !== 'off' && (reading.fiveHour?.percentUsed ?? 0) < 90
+    const open = steeringEnabled && quotas.g >= 0.5
+    const limit = familyFact(mainModel, now)
+    const balanceReasons: HandOffReason[] = []
+    const reasons: HandOffReason[] = []
+    if (open) {
+      if (quotas.accountAhead) balanceReasons.push('account-week')
+      if (quotas.activeSurplus !== undefined) balanceReasons.push('codex-surplus')
+      if (mode === 'always') balanceReasons.push('always')
+      if (reading.fiveHour && pressure(state, reading) >= 0.3) reasons.push('pressure')
+      if (limit) reasons.push('limit')
+      reasons.push(...balanceReasons)
+    }
+    return { steeringEnabled, open, limit, balanceReasons, reasons }
+  }
+
+  function routingPolicy(now: number, earlier: number, limit: LimitFact | undefined, quotas: ReturnType<typeof balance>) {
+    const P = pressure(state, reading)
+    const basePressure = earlier >= 2 ? Math.max(P, 0.3) : P
+    const floor: FloorCause | undefined = limit ? 'limit' : quotas.accountAhead ? 'account-week'
+      : quotas.activeSurplus !== undefined ? 'codex-surplus' : undefined
+    const input = { mode, g: quotas.g, P: floor ? Math.max(basePressure, 0.3) : basePressure, limitFloor: !!limit,
+      claudeKnown: reading.fiveHour !== undefined, headroomProblem: headroomCause(codex, config, now, codexProblem) }
+    return { input, basePressure, floor }
+  }
+
   function status(now: number): string {
+    const quotas = balance(now)
     return statusLine({
       mode,
       limits: views(now).filter(view => view.bucket.family === familyOf(mainModel) && view.bucket.family !== undefined || view.state === 'ahead' || view.state === 'full')
@@ -159,7 +199,8 @@ export function createCore(config: Config, script: string, session?: string): Co
       u: reading.fiveHour?.percentUsed,
       F: forecast(state, reading, now),
       w: reading.sevenDay?.percentUsed,
-      codexPercent: weeklyPercent(codex),
+      accountAhead: quotas.accountAhead, activeSurplus: quotas.activeSurplus,
+      codexPercent: weeklyWindow(codex)?.usedPercent,
       codexAvailable: !!codex?.windows.length,
       codexStale: codex !== undefined && codexAge(now) > CODEX_MAX_AGE,
       P: pressure(state, reading),
@@ -167,18 +208,43 @@ export function createCore(config: Config, script: string, session?: string): Co
     })
   }
 
-  function takeNotices(now = latestNow): string[] {
+  function takeNotices(now = latestNow ?? 0): Notice[] {
     notifyLimit(now)
-    const queued = notices
-    notices = []
+    const quotas = balance(now)
+    const { steeringEnabled, open, limit, balanceReasons, reasons } = mainLoop(now, quotas)
+    const queued: Notice[] = []
+    if (pendingPressure && reasons.includes('pressure')) {
+      queued.push({ text: pendingPressure })
+      pendingPressure = undefined
+      pressureNotified = true
+    }
+    if (pendingReserve) {
+      queued.push({ text: pendingReserve })
+      pendingReserve = undefined
+    }
     for (const note of limitNotices) {
-      const limit = familyFact(mainModel, now)
-      if (mode !== 'off' && familyOf(mainModel) === note.family && limit?.state === note.state) {
-        queued.push(limitNotice({ ...limit, fallback: fallbackFor(note.family, config.premiumFallback, familyViews(now)) ?? '' }))
+      if (open && familyOf(mainModel) === note.family && limit?.state === note.state) {
+        queued.push({ text: limitNotice({ ...limit, fallback: fallbackFor(note.family, config.premiumFallback, familyViews(now)) ?? '' }) })
         limitNotified.add(note.family + ':' + note.state)
       }
     }
     limitNotices = []
+    if (balanceReasons.length && lastBalance !== 'on') {
+      lastBalance = 'on'
+      queued.push({ text: balanceOnText(quotas.account, weeklyWindow(codex), quotas.activeSurplus, config.codexStopPercent, mode === 'always'),
+        nudge: { session: session ?? null, kind: 'balance-on', reasons: balanceReasons, calls: null } })
+    } else if (lastBalance === 'on' && steeringEnabled) {
+      const { account, availableHeadroom, surplus } = quotas
+      const closeToStop = availableHeadroom !== undefined && availableHeadroom < 0.5
+      // The lower thresholds apply only to withdrawing advice already delivered.
+      const backOnPace = open && !reasons.length && account.state === 'ok' &&
+        account.percent !== undefined && account.line !== undefined && account.percent < account.line + 2 &&
+        surplus !== undefined && surplus < 10
+      if (closeToStop || backOnPace) {
+        lastBalance = 'off'
+        queued.push({ text: balanceOffText(closeToStop), nudge: { session: session ?? null, kind: 'balance-off', reasons: [], calls: null } })
+      }
+    }
     return queued
   }
 
@@ -195,7 +261,9 @@ export function createCore(config: Config, script: string, session?: string): Co
   return {
     newConversation(nextSession) {
       session = nextSession
-      notices = []
+      pendingPressure = undefined
+      pendingReserve = undefined
+      lastBalance = undefined
       pressureNotified = false
       reserveNotified = false
       limitNotified.clear()
@@ -240,25 +308,32 @@ export function createCore(config: Config, script: string, session?: string): Co
       if (nextState.windowResetsAt !== state.windowResetsAt) {
         pressureNotified = false
         reserveNotified = false
-        notices = []
+        pendingPressure = undefined
+        pendingReserve = undefined
       }
       reading = nextReading
+      sevenDayReadAt = now
       state = nextState
       notifyLimit(now)
+      if ((reading.fiveHour?.percentUsed ?? 0) < 90 && pendingReserve) {
+        pendingReserve = undefined
+        reserveNotified = false
+      }
       if (mode === 'off' || !reading.fiveHour) return
       const u = reading.fiveHour.percentUsed
       const P = pressure(state, reading)
       if (P >= 0.3 && !pressureNotified) {
-        notices.push(pressureNotice({ u, F: forecast(state, reading, now), P }))
-        pressureNotified = true
+        pendingPressure = pressureNotice({ u, F: forecast(state, reading, now), P })
       }
       if (u >= 90 && !reserveNotified) {
-        notices.push(reserveNotice(u))
+        pendingReserve = reserveNotice(u)
         reserveNotified = true
       }
     },
 
-    setCodex(nextReading, problem) {
+    setCodex(nextReading, problem, now = latestNow ?? nextReading?.readAt ?? 0) {
+      latestNow = now
+      if (nextReading && codex && nextReading.readAt < codex.readAt && codex.readAt - now <= 5 * 60000) return
       codexProblem = shortProblem(problem ?? nextReading?.problem)
       codex = nextReading === undefined ? undefined : { ...nextReading, problem: codexProblem }
     },
@@ -276,11 +351,11 @@ export function createCore(config: Config, script: string, session?: string): Co
       lastStay = undefined
       const eligibility = eligible(call, config)
       const P = pressure(state, reading)
-      const g = headroom(codex, config, now)
+      const quotas = balance(now)
       const family = subagentFamily(call.model, mainModel)
       const limit = family === undefined ? undefined : fact(familyViews(now).get(family))
       const earlier = stayedCalls.length
-      const record = (outcome: { eligible: boolean; tier?: Tier; tierReason?: string; handedOff: boolean; reason: string; cause?: string }): void => {
+      const record = (outcome: { eligible: boolean; tier?: Tier; tierReason?: string; handedOff: boolean; reason: string; cause?: FloorCause }): void => {
         const F = forecast(state, reading, now)
         const age = codexAge(now)
         lastRecord = mode === 'off' ? undefined : {
@@ -291,7 +366,9 @@ export function createCore(config: Config, script: string, session?: string): Co
           handed_off: outcome.handedOff, reason: outcome.reason, cause: outcome.cause ?? null, burst: earlier,
           pressure: P, five_hour: reading.fiveHour?.percentUsed ?? null,
           forecast: F ?? null, seven_day: reading.sevenDay?.percentUsed ?? null,
-          codex_headroom: g, codex_weekly: weeklyPercent(codex) ?? null,
+          account_week: quotas.account.percent === undefined ? null : { percent: quotas.account.percent, line: quotas.account.line ?? null, state: quotas.account.state },
+          codex_surplus: quotas.surplus === undefined ? null : Number(quotas.surplus.toFixed(1)),
+          codex_headroom: quotas.g, codex_weekly: weeklyWindow(codex)?.usedPercent ?? null,
           codex_age_s: age === Infinity ? null : Math.round(age / 1000),
           limit: limit ? { label: limit.label, percent: limit.percent, state: limit.state } : null, brief_file: null,
         }
@@ -303,8 +380,8 @@ export function createCore(config: Config, script: string, session?: string): Co
       }
       const { tier, reason } = fit(call)
       const burst = earlier >= 2
-      const basePressure = burst ? Math.max(P, 0.3) : P
-      const decision = decide({ tier, P: limit ? Math.max(basePressure, 0.3) : basePressure, limitFloor: !!limit, g, headroomProblem: headroomCause(codex, config, now, codexProblem), mode, claudeKnown: reading.fiveHour !== undefined })
+      const { input, basePressure, floor } = routingPolicy(now, earlier, limit, quotas)
+      const decision = decide({ tier, ...input })
       if (!decision.handOff || tier === 'C') {
         if (tier !== 'C') {
           stayedCalls.push(now)
@@ -314,13 +391,14 @@ export function createCore(config: Config, script: string, session?: string): Co
         record({ eligible: true, tier, tierReason: reason, handedOff: false, reason: decision.reason })
         return undefined
       }
-      const routeReason = tier === 'B' && mode === 'auto' && burst && P < 0.3
+      const cause = tier === 'B' && mode === 'auto' && floor &&
+        !decide({ ...input, tier, P: basePressure, limitFloor: false }).handOff ? floor : undefined
+      const routeReason = !cause && tier === 'B' && mode === 'auto' && burst && P < 0.3
         ? `${reason}; burst: ${earlier} earlier subagent calls stayed on Claude in 10 minutes`
         : reason
-      const cause = limit && tier === 'B' && mode === 'auto' && basePressure < 0.3 ? 'limit' : undefined
       lastDecision = `last subagent call: handed to Codex (${routeReason})`
       record({ eligible: true, tier, tierReason: reason, handedOff: true, reason: decision.reason, cause })
-      return { tier, reason: routeReason, ...(limit ? { limit, ...(cause ? { cause } : {}) } : {}) }
+      return { tier, reason: routeReason, ...(limit ? { limit } : {}), ...(cause ? { cause } : {}) }
     },
 
     // Read right after route(): the time under which that call was counted as staying on Claude.
@@ -337,28 +415,36 @@ export function createCore(config: Config, script: string, session?: string): Co
 
     // decided, when given, is the call's decision record: the refusal then names the session and
     // states the readings the call was decided on, even if newer ones arrived since.
-    denial({ tier, reason, limit, cause }, call, cwd, now, briefFile, decided) {
+    denial(route, call, cwd, now, briefFile, decided) {
+      const { tier, reason } = route
+      const limit = decided ? decided.limit && { ...decided.limit, line: route.limit?.line } : route.limit
+      const cause = decided ? decided.cause ?? undefined : route.cause
       const delimiter = briefFile === undefined ? heredocDelimiter(call.prompt, now) : undefined
       const dispatchSession = decided === undefined ? session : decided.session ?? undefined
       const command = dispatchCommand({
         script, tier, cause, dir: cwd, write: tier === 'A', worktree: call.isolation === 'worktree', session: dispatchSession,
-        effort: config.effort, model: config.model, timeoutMinutes: config.timeoutMinutes, briefFile, delimiter,
+        effort: config.effort, model: config.model, codexStopPercent: config.codexStopPercent, timeoutMinutes: config.timeoutMinutes, briefFile, delimiter,
       })
       const readings = decided === undefined
-        ? { u: reading.fiveHour?.percentUsed ?? 0, F: forecast(state, reading, now), codexPercent: weeklyPercent(codex) }
-        : { u: decided.five_hour ?? 0, F: decided.forecast ?? undefined, codexPercent: decided.codex_weekly ?? undefined }
-      return denyText({ tier, reason, limit, ...readings, command, saved: briefFile !== undefined, delimiter })
+        ? { u: reading.fiveHour?.percentUsed ?? 0, F: forecast(state, reading, now), codexPercent: weeklyWindow(codex)?.usedPercent,
+            account: accountWeekState(reading.sevenDay, sevenDayReadAt, now), surplus: codexSurplus(codex, config, now) }
+        : { u: decided.five_hour ?? 0, F: decided.forecast ?? undefined, codexPercent: decided.codex_weekly ?? undefined,
+            account: decided.account_week ? { ...decided.account_week, line: decided.account_week.line ?? undefined } : undefined,
+            surplus: decided.codex_surplus ?? undefined }
+      return denyText({ tier, reason, limit: limit ?? undefined, cause, ...readings, codexStopPercent: config.codexStopPercent, command, saved: briefFile !== undefined, delimiter })
     },
 
     lastDecision: () => lastDecision,
 
-    toolCall(tool, isSubagent, now = latestNow) {
+    toolCall(tool, isSubagent, now = latestNow ?? 0) {
       if (isSubagent || !COUNTED_TOOLS.includes(tool)) return undefined
       calls += 1
-      const limit = familyFact(mainModel, now)
-      if (mode === 'off' || stretchNotified || calls < config.stretchCalls || (!limit && (pressure(state, reading) < 0.3 || !reading.fiveHour))) return undefined
+      if (stretchNotified || calls < config.stretchCalls) return undefined
+      const { reasons, limit } = mainLoop(now)
+      if (!reasons.length) return undefined
       stretchNotified = true
-      return stretchReminder({ calls, limit, u: reading.fiveHour?.percentUsed, script, session })
+      return { text: stretchReminder({ calls, limit, reasons, u: reading.fiveHour?.percentUsed, script, session, codexStopPercent: config.codexStopPercent }),
+        nudge: { session: session ?? null, kind: 'stretch', reasons, calls } }
     },
 
     takeNotices,
@@ -379,30 +465,45 @@ export function createCore(config: Config, script: string, session?: string): Co
 
     setMode(nextMode) {
       mode = nextMode
-      if (mode === 'off') { notices = []; limitNotices = [] }
+      if (mode === 'off') {
+        pendingPressure = undefined
+        pendingReserve = undefined
+        limitNotices = []
+        lastBalance = undefined
+      }
     },
 
     status,
 
     describe(now) {
       const age = codexAge(now)
-      const cause = headroomCause(codex, config, now, codexProblem)
       const count = burstCount(now)
-      const P = pressure(state, reading)
+      const quotas = balance(now)
+      const { reasons, limit } = mainLoop(now, quotas)
+      const { input } = routingPolicy(now, count, limit, quotas)
+      const cause = input.headroomProblem
       const tiers = (['A', 'B'] as const).map(tier => {
-        const decision = decide({ tier, P: count >= 2 ? Math.max(P, 0.3) : P, g: headroom(codex, config, now), headroomProblem: cause, mode, claudeKnown: reading.fiveHour !== undefined })
+        const decision = decide({ tier, ...input })
         return `tier ${tier} calls: ${decision.handOff ? 'handed to Codex' : `stay on Claude (${decision.reason})`}`
       })
+      const { account, surplus } = quotas
+      const week = weeklyWindow(codex)
+      const unavailable = cause ?? (!week ? 'no weekly window' : week.resetsAt === undefined ? 'weekly reset unknown' : 'weekly window has reset')
+      const surplusStatus = surplus === undefined ? `unknown (${unavailable})`
+        : `${Number(surplus.toFixed(1))} points (${quotas.activeSurplus !== undefined ? 'active' : surplus < 15 ? 'below 15 points' : 'headroom below 0.5'})`
       return [
         status(now),
         ...tiers,
         lastDecision,
-        `Codex headroom: ${headroom(codex, config, now)}${cause ? ` (${cause})` : ''}`,
+        `Claude all-models weekly: ${account.percent === undefined ? 'usage unknown' : `${Math.round(account.percent)}% used`}, even pace ${account.line === undefined ? 'unknown' : `${Math.round(account.line)}%`}, ${account.state}`,
+        `Codex weekly surplus: ${surplusStatus}`,
+        reasons.length ? `hand-offs: on (${reasons.join(', ')})` : 'hand-offs: off',
+        `Codex headroom: ${quotas.g}${cause ? ` (${cause})` : ''}`,
         `eligible calls stayed on Claude in 10 minutes: ${count}`,
         `Codex reading age: ${age === Infinity ? 'never read' : `${Math.round(age / 1000)} seconds`}`,
         ...limitLines(views(now).map(view => {
           const change = view.bucket.family === undefined ? undefined : spawnModel({ subagentType: 'general-purpose', fork: false, parentModel: view.bucket.family }, now)
-          const handOff = mode !== 'off' && view.bucket.family !== undefined && !!fact(view) && headroom(codex, config, now) > 0
+          const handOff = mode !== 'off' && view.bucket.family !== undefined && !!fact(view) && quotas.g > 0
           const subagents = change ? `${handOff ? 'hand off or ' : ''}run on ${change.model}` : handOff ? 'hand off when eligible' : 'unchanged'
           return { label: view.bucket.label, family: view.bucket.family, percent: view.bucket.usedPercent, line: view.line, state: view.state, ageSeconds: usageAge(now) / 1000, subagents }
         })),

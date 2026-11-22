@@ -220,11 +220,12 @@ for (const [name, value, cause] of [
 
 test('takeNotices drains once without resetting the stretch counter', async () => {
   const core = createCore({ ...DEFAULTS, stretchCalls: 2 }, '/plugin/crossfeed.py', "it's session")
-  core.measure(reading(95), BASE)
+  core.setCodex(codex())
+  core.measure(reading(85), BASE)
   core.toolCall('Bash', false)
-  expect(core.takeNotices().length).toBe(2)
+  expect(core.takeNotices().length).toBe(1)
   expect(core.takeNotices()).toEqual([])
-  expect(core.toolCall('Bash', false)?.includes('--session ' + shellQuote("it's session"))).toBe(true)
+  expect(core.toolCall('Bash', false)?.text.includes('--session ' + shellQuote("it's session"))).toBe(true)
   expect(core.userPrompt()).toEqual([])
   expect(core.toolCall('Bash', false)).toBe(undefined)
   expect(core.toolCall('Bash', false)).not.toBe(undefined)
@@ -232,7 +233,7 @@ test('takeNotices drains once without resetting the stretch counter', async () =
 
 test('reminder is read-only by default and quotes session; static guidance covers missing CLI', async () => {
   for (const session of [undefined, '', "it's; 检查"]) {
-    const reminder = stretchReminder({ calls: 12, u: 95, script: '/plugin/crossfeed.py', session })
+    const reminder = stretchReminder({ reasons: ['pressure'], calls: 12, u: 85, script: '/plugin/crossfeed.py', session })
     expect(reminder.includes('read-only unless --write is added')).toBe(true)
     expect(reminder.includes('--session')).toBe(session !== undefined)
     if (session !== undefined) expect(reminder.includes('--session ' + shellQuote(session))).toBe(true)
@@ -261,7 +262,7 @@ test('a clock that goes back does not keep a burst or a Codex reading alive', as
   expect(core.route(B, earlier)).toBe(undefined)
   expect(core.lastDecision().includes('ahead of the clock')).toBe(true)
   // With a reading taken on the new clock the earlier calls still do not count.
-  core.setCodex({ ...codex(), readAt: earlier })
+  core.setCodex({ ...codex(), readAt: earlier }, undefined, earlier)
   expect(core.route(B, earlier)).toBe(undefined)
   expect(core.lastDecision().includes('pressure is low')).toBe(true)
 })

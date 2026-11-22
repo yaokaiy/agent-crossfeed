@@ -22,7 +22,25 @@ class DecisionTests(CrossfeedCase):
         record, = load_crossfeed().read_ledger()
         self.assertEqual(next(iter(record)), "type")
         self.assertRegex(record["ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-        self.assertEqual(record, dict(decision, type="decision", v=1, ts=record["ts"]))
+        self.assertEqual(record, dict(decision, type="decision", v=1, ts=record["ts"],
+                                      account_week=None, codex_surplus=None))
+
+    def test_decision_records_balance_readings_and_cause(self):
+        for week, surplus, cause in (
+            (None, None, None),
+            ({"percent": 79, "line": 66.1, "state": "ahead"}, -2.34, "account-week"),
+            ({"percent": 0, "line": 0, "state": "ok"}, 38.52, "codex-surplus"),
+            ({"percent": 100, "line": 99, "state": "full"}, 0, "account-week"),
+            ({"percent": 0, "line": None, "state": "unknown"}, None, None),
+        ):
+            with self.subTest(week=week, surplus=surplus):
+                decision = {"eligible": True, "handed_off": bool(cause), "cause": cause,
+                            "account_week": week, "codex_surplus": surplus}
+                result = run_crossfeed(["decision"], stdin=json.dumps(decision).encode(), env=self.env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = load_crossfeed().read_ledger()[-1]
+                self.assertEqual((record["account_week"], record["codex_surplus"], record["cause"]),
+                                 (week, round(surplus, 1) if surplus is not None else None, cause))
 
     def test_decision_accepts_exact_byte_limit(self):
         payload = b'{"eligible":true,"handed_off":true}'.ljust(16384)
@@ -46,6 +64,11 @@ class DecisionTests(CrossfeedCase):
             "encoding": prefix + b',"note":"\xff"}',
             "surrogate value": prefix + br',"note":["\ud800"]}',
             "surrogate key": prefix + br',"\ud800":null}',
+            "week type": prefix + b',"account_week":[]}',
+            "week percent": prefix + b',"account_week":{"percent":true,"line":0,"state":"ok"}}',
+            "week state": prefix + b',"account_week":{"percent":0,"line":0,"state":"other"}}',
+            "week line": prefix + b',"account_week":{"percent":0,"line":"0","state":"ok"}}',
+            "surplus type": prefix + b',"codex_surplus":false}',
         }
         for field in ("eligible", "handed_off"):
             decision = {"eligible": True, "handed_off": False}
@@ -67,6 +90,40 @@ class DecisionTests(CrossfeedCase):
                         self.assertFalse(ledger.exists())
                     else:
                         self.assertEqual(ledger.read_bytes(), original)
+
+
+class NudgeTests(CrossfeedCase):
+    def test_nudges_accept_utf8_bom_and_the_exact_size_limit(self):
+        for kind, reasons, calls in (("balance-on", ["account-week", "codex-surplus"], None),
+                                     ("balance-off", [], None), ("stretch", ["任意"], 12)):
+            with self.subTest(kind=kind):
+                nudge = {"session": "session-1", "kind": kind, "reasons": reasons, "calls": calls}
+                payload = json.dumps(dict(nudge, type="job", v=2, ts="old"), ensure_ascii=False).encode("utf-8-sig")
+                result = run_crossfeed(["nudge"], stdin=payload.ljust(16384), env=self.env)
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
+                record = load_crossfeed().read_ledger()[-1]
+                self.assertEqual(record, dict(nudge, type="nudge", v=1, ts=record["ts"]))
+                self.assertNotEqual(record["ts"], "old")
+
+    def test_invalid_nudges_leave_existing_ledger_untouched(self):
+        ledger = self.home / "ledger.jsonl"
+        original = b'{"type":"existing"}\n'
+        ledger.write_bytes(original)
+        nudge = {"kind": "stretch", "reasons": [], "calls": 0}
+        valid = json.dumps(nudge).encode()
+        invalid = [b"", b"{}", b"[]", b"null", b"{", b"\xff", valid.ljust(16385)]
+        invalid += [valid[:-1] + b',"extra":' + value + b"}" for value in
+                    (b"NaN", b"Infinity", b"-Infinity", b"1e400", br'"\ud800"')]
+        for field, values in (("kind", ["other", 1, []]), ("reasons", ["limit", [1], None]),
+                              ("calls", [True, 1.0, "1", []])):
+            invalid.append(json.dumps({k: v for k, v in nudge.items() if k != field}).encode())
+            invalid.extend(json.dumps(dict(nudge, **{field: value})).encode() for value in values)
+        for index, payload in enumerate(invalid):
+            with self.subTest(case=index):
+                result = run_crossfeed(["nudge"], stdin=payload, env=self.env)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(ledger.read_bytes(), original)
 
 
 class LedgerTests(CrossfeedCase):

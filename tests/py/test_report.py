@@ -32,7 +32,7 @@ class ReportTests(CrossfeedCase):
             "lockouts: 1; locked: 2h00m; unknown resets: 0",
             "model limits: Fable 2 lockouts, locked 112h00m; Opus 1 lockout, locked 25h05m",
             "subagents moved to a cheaper model: 3 (Fable 3)",
-            "jobs handed off because of a model limit: 2",
+            "jobs handed off because of: model limit 2, account week 0, Codex surplus 0",
         ])
         result = run_crossfeed(["report", "--json"], env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -54,7 +54,7 @@ class ReportTests(CrossfeedCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.decode().splitlines()[2:5], [
                     "model limits: none", "subagents moved to a cheaper model: 0",
-                    "jobs handed off because of a model limit: 0",
+                    "jobs handed off because of: model limit 0, account week 0, Codex surplus 0",
                 ])
 
     def test_limit_report_cutoff_and_malformed_buckets(self):
@@ -276,8 +276,26 @@ class ReportTests(CrossfeedCase):
                         "reset_at": (started + datetime.timedelta(minutes=52)).isoformat(), "session": "one"})
         return records
 
+    def balance_records(self):
+        records = self.sample_records()
+        del records[0]["model"]  # A legacy record with neither a model nor a resume link.
+        del records[0]["resume_of"]
+        records[0]["cause"] = "limit"
+        records[1].update(cause="limit", resume_of="0", model_source="resume")
+        records[2].update(cause="account-week", model="gpt-6.2-astra", model_source="judgment")
+        records[3].update(cause="account-week", resume_of="2", model="gpt-6.2-astra", model_source="resume")
+        records[4].update(cause="codex-surplus", model="custom", model_source="flag")
+        records[5].update(cause="codex-surplus", resume_of="4", model="custom", model_source="resume")
+        records.extend([
+            {"type": "stop", "ts": self.stamp, "resume_of": "0", "kind": "task", "tier": "B",
+             "session": None, "reason": "Codex reported its limit", "codex_weekly": None},
+            *({"type": "nudge", "ts": self.stamp, "session": "one", "kind": kind, "reasons": [], "calls": calls}
+              for kind, calls in (("balance-on", None), ("balance-off", None), ("stretch", 12), ("stretch", 12))),
+        ])
+        return records
+
     def test_report_text(self):
-        self.write_records(self.sample_records())
+        self.write_records(self.balance_records())
         result = run_crossfeed(["report"], env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.decode(),
@@ -285,14 +303,17 @@ class ReportTests(CrossfeedCase):
                          "lockouts: 1; locked: 0h52m; unknown resets: 0\n"
                          "model limits: none\n"
                          "subagents moved to a cheaper model: 0\n"
-                         "jobs handed off because of a model limit: 0\n"
+                         "jobs handed off because of: model limit 1, account week 1, Codex surplus 1\n"
                          "subagent calls: 0; not eligible: 0; handed to Codex: 0 (run: 0); stayed on Claude: 0\n"
 "jobs: 14 (done 12, failed 1, limit 0, timeout 1, interrupted 0); codex tokens: 2900000; median: 6m05s\n"
+                         "jobs by model: Codex default 10, custom 2, gpt-6.2-astra 2\n"
+                         "launches stopped at the Codex stop: 1\n"
+                         "nudges: balance on 1, balance off 1, stretch 2\n"
                          "first-delivery checks: A 5/6, B 2/2; unchecked: 6\n"
                          "read-only results used: yes 0, partly 0, no 0; not rated: 12\n")
 
     def test_report_json_and_fold(self):
-        records = self.sample_records()
+        records = self.balance_records()
         self.write_records(records)
         expected = {
             "lockouts": 1, "locked_s": 3120, "unknown_resets": 0, "jobs": 14,
@@ -300,7 +321,10 @@ class ReportTests(CrossfeedCase):
             "by_tier": {"A": {"jobs": 8, "checked": 6, "passed": 5},
                         "B": {"jobs": 6, "checked": 2, "passed": 2}},
             "tokens": 2900000, "median_wall_s": 365.0, "unchecked": 6,
-            "bucket_lockouts": {}, "downgrades": {"total": 0, "by_bucket": {}}, "limit_jobs": 0,
+            "bucket_lockouts": {}, "downgrades": {"total": 0, "by_bucket": {}},
+            "limit_jobs": 1, "account_week_jobs": 1, "codex_surplus_jobs": 1,
+            "by_model": {"Codex default": 10, "custom": 2, "gpt-6.2-astra": 2},
+            "stops": 1, "nudges": {"balance-on": 1, "balance-off": 1, "stretch": 2},
             "decisions": {"total": 0, "ineligible": 0, "handed_off": 0, "run": 0, "stayed": 0},
             "used": {"yes": 0, "partly": 0, "no": 0, "unrated": 12},
         }
@@ -323,9 +347,12 @@ class ReportTests(CrossfeedCase):
                                  "lockouts: 0; locked: 0h00m; unknown resets: 0\n"
                                  "model limits: none\n"
                                  "subagents moved to a cheaper model: 0\n"
-                                 "jobs handed off because of a model limit: 0\n"
+                                 "jobs handed off because of: model limit 0, account week 0, Codex surplus 0\n"
                                  "subagent calls: 0; not eligible: 0; handed to Codex: 0 (run: 0); stayed on Claude: 0\n"
 "jobs: 0 (done 0, failed 0, limit 0, timeout 0, interrupted 0); codex tokens: 0; median: n/a\n"
+                                 "jobs by model: none\n"
+                                 "launches stopped at the Codex stop: 0\n"
+                                 "nudges: balance on 0, balance off 0, stretch 0\n"
                                  "first-delivery checks: A 0/0, B 0/0; unchecked: 0\n"
                                  "read-only results used: yes 0, partly 0, no 0; not rated: 0\n")
 
@@ -368,7 +395,7 @@ class ReportTests(CrossfeedCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.decode().splitlines()
         self.assertEqual(lines[4:6], [
-            "jobs handed off because of a model limit: 0",
+            "jobs handed off because of: model limit 0, account week 0, Codex surplus 0",
             "subagent calls: 6; not eligible: 1; handed to Codex: 4 (run: 1); stayed on Claude: 1",
         ])
         self.assertEqual(lines[-2:], [
@@ -393,6 +420,7 @@ class ReportTests(CrossfeedCase):
             self.job("old", ts=old), self.job("recent", ts=recent), self.job("today"),
             self.check_record("old", "pass"),
             {"type": "lockout", "ts": old, "reset_at": "unknown", "session": None},
+            {"type": "stop", "ts": old}, {"type": "nudge", "ts": old, "kind": "stretch"},
         ])
         for days, count in ((7, 2), (1, 1)):
             with self.subTest(days=days):
@@ -402,6 +430,8 @@ class ReportTests(CrossfeedCase):
                 self.assertEqual(report["jobs"], count)
                 self.assertEqual(report["unchecked"], count)
                 self.assertEqual(report["lockouts"], 0)
+                self.assertEqual(report["stops"], 0)
+                self.assertEqual(report["nudges"]["stretch"], 0)
 
     def test_fold_includes_exact_cutoff_and_uses_first_ledger_check(self):
         since = self.now - datetime.timedelta(days=7)

@@ -37,7 +37,8 @@ export function toConfig(options: Record<string, unknown> | undefined): Config {
       ? values.eligibleTypes.split(',').map(type => type.trim()).filter(type => type.length > 0)
       : [...DEFAULTS.eligibleTypes],
     stretchCalls: positiveNumber(values.stretchCalls, DEFAULTS.stretchCalls),
-    codexStopPercent: positiveNumber(values.codexStopPercent, DEFAULTS.codexStopPercent),
+    codexStopPercent: typeof values.codexStopPercent === 'number' && values.codexStopPercent > 0 && values.codexStopPercent <= 100
+      ? values.codexStopPercent : DEFAULTS.codexStopPercent,
     timeoutMinutes: positiveNumber(values.timeoutMinutes, DEFAULTS.timeoutMinutes),
   }
 }

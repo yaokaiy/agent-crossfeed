@@ -134,21 +134,22 @@ test('pressure notices are queued once per window and drained once per prompt', 
   heavy(core, next, RESET + 300 * MINUTE)
   const notices = core.userPrompt()
   expect(notices.length).toBe(1)
-  expect(notices[0]?.includes('pressure 0.3')).toBe(true)
+  expect(notices[0]?.text.includes('pressure 0.3')).toBe(true)
 })
 
 test('reserve notices are once per window and reset jitter does not repeat them', async () => {
   const core = createCore(DEFAULTS, SCRIPT)
+  core.setCodex(codex())
   measure(core, 89)
   expect(core.userPrompt().length).toBe(1)
   measure(core, 90, BASE + MINUTE)
   const notices = core.userPrompt()
   expect(notices.length).toBe(1)
-  expect(notices[0]?.includes('reserve')).toBe(true)
+  expect(notices[0]?.text.includes('reserve')).toBe(true)
   measure(core, 97, BASE + 2 * MINUTE, RESET + MINUTE)
   expect(core.userPrompt()).toEqual([])
   measure(core, 95, RESET, RESET + 300 * MINUTE)
-  expect(core.userPrompt().length).toBe(2)
+  expect(core.userPrompt().length).toBe(1)
   expect(core.status(RESET).endsWith(' · reserve')).toBe(true)
   cleanStatus(core, RESET)
 })
@@ -161,11 +162,11 @@ test('stretch reminders count only main-loop tools and occur once per prompt', a
     expect(core.toolCall('Agent', false)).toBe(undefined)
   }
   for (let i = 1; i < 12; i++) expect(core.toolCall('Bash', false)).toBe(undefined)
-  expect(core.toolCall('Bash', false)?.includes('12 main-loop tool calls')).toBe(true)
+  expect(core.toolCall('Bash', false)?.text.includes('12 main-loop tool calls')).toBe(true)
   expect(core.toolCall('Bash', false)).toBe(undefined)
   core.userPrompt()
   for (let i = 1; i < 12; i++) expect(core.toolCall('Bash', false)).toBe(undefined)
-  expect(core.toolCall('Bash', false)?.includes('12 main-loop tool calls')).toBe(true)
+  expect(core.toolCall('Bash', false)?.text.includes('12 main-loop tool calls')).toBe(true)
 })
 
 test('all seven counted tools contribute and low pressure gives no reminder', async () => {
@@ -174,7 +175,7 @@ test('all seven counted tools contribute and low pressure gives no reminder', as
   for (const tool of ['Bash', 'Edit', 'Write', 'Read', 'Grep', 'Glob']) {
     expect(core.toolCall(tool, false)).toBe(undefined)
   }
-  expect(core.toolCall('NotebookEdit', false)?.includes('7 main-loop tool calls')).toBe(true)
+  expect(core.toolCall('NotebookEdit', false)?.text.includes('7 main-loop tool calls')).toBe(true)
   const quiet = createCore(DEFAULTS, SCRIPT)
   measure(quiet, 5)
   for (let i = 0; i < 20; i++) expect(quiet.toolCall('Bash', false)).toBe(undefined)
@@ -246,8 +247,8 @@ test('a new window discards queued pressure and reserve notices from the old win
   expect(core.userPrompt()).toEqual([])
   measure(core, 97, RESET + MINUTE, RESET + 300 * MINUTE)
   const notices = core.userPrompt()
-  expect(notices.length).toBe(2)
-  expect(notices.every(notice => notice.includes('97%'))).toBe(true)
+  expect(notices.length).toBe(1)
+  expect(notices.every(notice => notice.text.includes('97%'))).toBe(true)
 })
 
 test('needsCodex only permits eligible non-C calls while routing is enabled', async () => {
@@ -366,7 +367,7 @@ test('limit notices fire once per family and state, including a later main-model
   core.setUsage(usage, undefined, BASE)
   expect(core.takeNotices()).toEqual([])
   core.setUsage({ ...usage, buckets: [{ ...usage.buckets[0]!, usedPercent: 100 }] }, undefined, BASE)
-  expect(core.takeNotices()[0]?.includes('limit is used up')).toBe(true)
+  expect(core.takeNotices()[0]?.text.includes('limit is used up')).toBe(true)
   core.setMainModel('opus', BASE)
   expect(core.takeNotices()).toEqual([])
   const switched = limitCore(62, 'opus')
@@ -384,12 +385,12 @@ test('stretch reminder fires on an ahead limit once per stretch without five-hou
   const core = limitCore()
   core.takeNotices()
   for (let i = 0; i < 11; i++) expect(core.toolCall('Read', false)).toBe(undefined)
-  expect(core.toolCall('Read', false)?.includes('Fable weekly 62% used')).toBe(true)
+  expect(core.toolCall('Read', false)?.text.includes('Fable weekly 62% used')).toBe(true)
   expect(core.toolCall('Read', false)).toBe(undefined)
   core.userPrompt()
   core.measure({}, BASE)
   for (let i = 0; i < 11; i++) core.toolCall('Read', false)
-  expect(core.toolCall('Read', false)?.includes('Fable weekly 62% used')).toBe(true)
+  expect(core.toolCall('Read', false)?.text.includes('Fable weekly 62% used')).toBe(true)
 })
 
 test('bucketLockout is separate from five-hour pressure and deduplicates bucket and reset', async () => {
@@ -442,11 +443,12 @@ test('a dropped full notice can be queued again and is marked only on delivery',
   const now = BASE + 21 * MINUTE
   expect(core.takeNotices(now)).toEqual([])
   const fresh = { readAt: now, buckets: [{ label: 'Fable', family: 'fable' as const, usedPercent: 100, resetsAt: LIMIT_RESET }] }
+  core.setCodex(codex(now))
   core.setUsage(fresh, undefined, now)
   core.setUsage(fresh, undefined, now)
   const notes = core.takeNotices(now)
   expect(notes.length).toBe(1)
-  expect(notes[0]?.includes('Fable weekly limit is used up')).toBe(true)
+  expect(notes[0]?.text.includes('Fable weekly limit is used up')).toBe(true)
   expect(core.takeNotices(now)).toEqual([])
   core.setUsage({ ...fresh, readAt: now + MINUTE }, undefined, now + MINUTE)
   expect(core.takeNotices(now + MINUTE)).toEqual([])
@@ -458,13 +460,15 @@ test('newConversation resets notices and stretch while retaining readings, press
   core.setCodex(codex())
   core.setMainModel('fable', BASE)
   core.setUsage({ readAt: BASE, buckets: [{ label: 'Fable', family: 'fable', usedPercent: 100, resetsAt: LIMIT_RESET }] }, undefined, BASE)
-  expect(core.takeNotices(BASE).length).toBe(3)
+  expect(core.takeNotices(BASE).map(note => note.text.includes('reserve'))).toEqual([true])
+  measure(core, 85)
+  expect(core.takeNotices(BASE).length).toBe(2)
   expect(core.bucketLockout(BASE)?.bucket).toBe('Fable')
   core.setCodex(undefined)
   core.route(B, BASE)
   core.setCodex(codex())
   core.toolCall('Read', false, BASE)
-  expect(core.toolCall('Read', false, BASE)?.includes("--session 'first-session'")).toBe(true)
+  expect(core.toolCall('Read', false, BASE)?.text.includes("--session 'first-session'")).toBe(true)
   const status = core.status(BASE)
   core.newConversation('second-session')
   expect(core.status(BASE)).toBe(status)
@@ -473,10 +477,12 @@ test('newConversation resets notices and stretch while retaining readings, press
   expect(core.describe(BASE).includes('eligible calls stayed on Claude in 10 minutes: 1')).toBe(true)
   expect(core.bucketLockout(BASE)).toBe(undefined)
   measure(core, 95)
-  expect(core.takeNotices(BASE).length).toBe(3)
+  expect(core.takeNotices(BASE).map(note => note.text.includes('reserve'))).toEqual([true])
+  measure(core, 85)
+  expect(core.takeNotices(BASE).length).toBe(2)
   expect(core.takeNotices(BASE)).toEqual([])
   expect(core.toolCall('Read', false, BASE)).toBe(undefined)
-  expect(core.toolCall('Read', false, BASE)?.includes("--session 'second-session'")).toBe(true)
+  expect(core.toolCall('Read', false, BASE)?.text.includes("--session 'second-session'")).toBe(true)
   expect(agentCall(core, B, CWD, BASE)?.deny.includes("--session 'second-session'")).toBe(true)
   // Undelivered old pressure/reserve notices must also be discarded.
   core.newConversation(undefined)
@@ -492,6 +498,7 @@ for (const [family, percent, opusPercent, fallback] of [
 ] as const) {
   test(`limit notice recommends only a usable fallback: ${family} ${percent}, opus ${opusPercent}`, async () => {
     const core = createCore(DEFAULTS, SCRIPT)
+    core.setCodex(codex())
     core.setMainModel(`claude-${family}-5-5`, BASE)
     core.setUsage({ readAt: BASE, buckets: [
       { label: family === 'fable' ? 'Fable' : 'Sonnet only', family, usedPercent: percent, resetsAt: LIMIT_RESET },
@@ -499,7 +506,7 @@ for (const [family, percent, opusPercent, fallback] of [
     ] }, undefined, BASE)
     const notes = core.takeNotices(BASE)
     expect(notes.length).toBe(1)
-    const note = notes[0]!
+    const note = notes[0]!.text
     expect(note.includes('/model')).toBe(fallback)
     expect(note.includes('run on opus')).toBe(fallback)
     if (fallback) {
@@ -522,7 +529,7 @@ function decisionCore(session = 'session-1') {
 const RECORD_BASE = {
   session: 'session-1', mode: 'auto', agent_type: null, model: null, main_model: 'claude-opus-5-5', from_subagent: false,
   description: null, cause: null, burst: 0, pressure: 0, five_hour: 5, forecast: null, seven_day: null,
-  codex_headroom: 1, codex_weekly: 18, codex_age_s: 0, limit: null, brief_file: null,
+  account_week: null, codex_surplus: 6.3, codex_headroom: 1, codex_weekly: 18, codex_age_s: 0, limit: null, brief_file: null,
 }
 
 test('a hand-off decision is recorded with its tier, policy reason and readings', async () => {
@@ -564,7 +571,7 @@ test('off mode records no decision and missing readings are null, not zero', asy
   const fresh = createCore(DEFAULTS, SCRIPT)
   fresh.route(A, BASE)
   expect(fresh.lastRecord()).toEqual({
-    ...RECORD_BASE, session: null, main_model: null, five_hour: null, codex_headroom: 0, codex_weekly: null, codex_age_s: null,
+    ...RECORD_BASE, codex_surplus: null, session: null, main_model: null, five_hour: null, codex_headroom: 0, codex_weekly: null, codex_age_s: null,
     brief_chars: A.prompt.length, eligible: true, tier: 'A', tier_reason: 'has a check command and is implementation-type work',
     handed_off: false, reason: 'no Claude reading yet',
   })
@@ -652,4 +659,271 @@ test('a weekly-limit reading taken before the one held is ignored, unless the he
   // The clock went back an hour: a reading taken now is older than the held one but must be used.
   back.setUsage({ readAt: BASE, buckets: [{ label: 'Fable', family: 'fable', usedPercent: 30, resetsAt: BASE + 4.5 * 1440 * MINUTE }] }, undefined, BASE)
   expect(back.status(BASE).includes('fable wk 30%')).toBe(true)
+})
+
+const BALANCE_TIME = Date.parse('2026-11-21T12:35:00Z')
+const accountWeek = { percentUsed: 79, resetsAt: Date.parse('2026-11-23T22:00:00Z') }
+const codexWeek = { minutes: 10080, usedPercent: 40, resetsAt: Date.parse('2026-11-22T01:27:00Z') }
+
+function balanceCore() {
+  const core = createCore({ ...DEFAULTS, stretchCalls: 2 }, SCRIPT, 'one')
+  core.setMainModel('opus', BALANCE_TIME)
+  core.measure({ fiveHour: { percentUsed: 10 }, sevenDay: accountWeek }, BALANCE_TIME)
+  core.setCodex({ readAt: BALANCE_TIME, windows: [codexWeek], limitReached: false }, undefined, BALANCE_TIME)
+  return core
+}
+
+test('an Opus call snapshots both weeks, their reasons and the combined notice', async () => {
+  const core = balanceCore()
+  const route = core.route(B, BALANCE_TIME)
+  const record = core.lastRecord()!
+  expect(route?.cause).toBe('account-week')
+  expect(record.cause).toBe('account-week')
+  expect(record.account_week?.state).toBe('ahead')
+  expect(record.account_week?.percent).toBe(79)
+  expect(Math.round(record.account_week?.line ?? 0)).toBe(66)
+  expect(record.codex_surplus).toBe(38.5)
+  expect(core.status(BALANCE_TIME).includes('7d 79% ahead · codex wk 40% +38')).toBe(true)
+  const description = core.describe(BALANCE_TIME)
+  for (const line of ['tier B calls: handed to Codex', 'Claude all-models weekly: 79% used, even pace 66%, ahead',
+    'Codex weekly surplus: 38.5 points (active)', 'hand-offs: on (account-week, codex-surplus)']) {
+    expect(description.split('\n').includes(line)).toBe(true)
+  }
+  expect(core.takeNotices(BALANCE_TIME)).toEqual([{
+    text: 'crossfeed: hand-offs are on. Claude all-models weekly 79% used, an even pace would be 66% (resets 2026-11-23 22:00 UTC); Codex weekly 40% used, 38 points under an even pace to its 85% stop (resets 2026-11-22 01:27 UTC). Before you start execution with a result you can check, hand it to Codex; keep talking with the user, decisions and review here.',
+    nudge: { session: 'one', kind: 'balance-on', reasons: ['account-week', 'codex-surplus'], calls: null },
+  }])
+  expect(core.takeNotices(BALANCE_TIME)).toEqual([])
+  measure(core, 5, BALANCE_TIME)
+  const denial = core.denial(route!, B, CWD, BALANCE_TIME, '/brief', record)
+  expect(denial.split('\n')[1]).toBe('Why: tier B; Claude all-models weekly 79% used, ahead of an even pace (66%).')
+  expect(denial.includes('--cause account-week')).toBe(true)
+  const surplusRoute = core.route(B, BALANCE_TIME)!
+  const surplusRecord = core.lastRecord()!
+  expect(surplusRoute.cause).toBe('codex-surplus')
+  expect(surplusRecord.account_week).toBe(null)
+  core.setCodex(undefined)
+  const surplusDenial = core.denial(surplusRoute, B, CWD, BALANCE_TIME, '/brief', surplusRecord)
+  expect(surplusDenial.split('\n')[1]).toBe('Why: tier B; Codex weekly 40% used, 38 points under an even pace to its 85% stop.')
+  expect(surplusDenial.includes('--cause codex-surplus')).toBe(true)
+})
+
+test('only an auto tier B hand-off changed by a floor records its first applicable cause', async () => {
+  const core = balanceCore()
+  const fable = { ...B, model: 'fable' }
+  core.setUsage({ buckets: [{ label: 'Fable', family: 'fable', usedPercent: 90 }], readAt: BALANCE_TIME }, undefined, BALANCE_TIME)
+  expect(core.route(fable, BALANCE_TIME)?.cause).toBe('limit')
+  expect(core.route(A, BALANCE_TIME)?.tier).toBe('A')
+  expect(core.lastRecord()?.cause).toBe(null)
+  core.setMode('always')
+  expect(core.route(fable, BALANCE_TIME)?.tier).toBe('B')
+  expect(core.lastRecord()?.cause).toBe(null)
+  core.setMode('auto')
+  core.measure({ sevenDay: accountWeek }, BALANCE_TIME)
+  for (let i = 0; i < 2; i++) {
+    expect(core.route(B, BALANCE_TIME)).toBe(undefined)
+    expect(core.lastRecord()?.reason).toBe('no Claude reading yet')
+  }
+  // Burst pressure cannot open the missing five-hour gate, but the family limit can.
+  expect(core.route(fable, BALANCE_TIME)?.cause).toBe('limit')
+  core.measure({ fiveHour: { percentUsed: 5 }, sevenDay: accountWeek }, BALANCE_TIME)
+  expect(core.route(fable, BALANCE_TIME)?.tier).toBe('B')
+  expect(core.lastRecord()?.cause).toBe(null)
+  expect(core.lastRecord()?.burst).toBe(2)
+})
+
+test('the full account week routes even with low positive headroom while main-loop steering stays off', async () => {
+  const core = balanceCore()
+  core.measure({ fiveHour: { percentUsed: 5 }, sevenDay: { ...accountWeek, percentUsed: 100 } }, BALANCE_TIME)
+  core.setCodex({ readAt: BALANCE_TIME, windows: [{ minutes: 10080, usedPercent: 84 }], limitReached: false })
+  const route = core.route(B, BALANCE_TIME)!
+  expect(route.cause).toBe('account-week')
+  expect(core.denial(route, B, CWD, BALANCE_TIME, '/brief', core.lastRecord()).split('\n')[1]).toBe('Why: tier B; Claude all-models weekly 100% used, limit used up.')
+  expect(core.describe(BALANCE_TIME).includes('hand-offs: off')).toBe(true)
+  expect(core.takeNotices(BALANCE_TIME)).toEqual([])
+})
+
+test('Codex surplus uses the exact 15-point and half-headroom boundaries before rounding', async () => {
+  for (const [used, otherUsed, active] of [[27.5, 75, true], [27.501, 75, false], [27.5, 75.001, false]] as const) {
+    const core = decisionCore()
+    core.setCodex({ readAt: BASE, limitReached: false, windows: [
+      { minutes: 10080, usedPercent: used, resetsAt: BASE + 3.5 * 1440 * MINUTE },
+      { minutes: 400, usedPercent: otherUsed },
+    ] })
+    expect(core.route(B, BASE)?.cause).toBe(active ? 'codex-surplus' : undefined)
+    expect(core.takeNotices(BASE).length).toBe(active ? 1 : 0)
+    expect(core.describe(BASE).includes('hand-offs: on (codex-surplus)')).toBe(active)
+  }
+})
+
+test('balance stays on through unknown readings and other reasons, then announces off and on once', async () => {
+  const core = balanceCore()
+  const kinds = (now: number) => core.takeNotices(now).flatMap(item => item.nudge ? [item.nudge.kind] : [])
+  const later = BALANCE_TIME + 20 * MINUTE
+  expect(kinds(BALANCE_TIME)).toEqual(['balance-on'])
+  expect(kinds(later)).toEqual([])
+  core.measure({}, later)
+  core.setCodex({ readAt: later, windows: [{ ...codexWeek, usedPercent: 70 }], limitReached: false })
+  expect(kinds(later)).toEqual([])
+  core.setCodex({ readAt: later, windows: [codexWeek], limitReached: false })
+  expect(kinds(later)).toEqual([])
+  core.measure({ fiveHour: { percentUsed: 85, resetsAt: later + 300 * MINUTE }, sevenDay: { ...accountWeek, percentUsed: 40 } }, later)
+  core.setCodex({ readAt: later, windows: [{ ...codexWeek, usedPercent: 70 }], limitReached: false })
+  expect(kinds(later)).toEqual([])
+  core.setUsage({ readAt: later, buckets: [{ family: 'opus', label: 'Opus', usedPercent: 90 }] }, undefined, later)
+  core.measure({ fiveHour: { percentUsed: 5 }, sevenDay: { ...accountWeek, percentUsed: 40 } }, later)
+  expect(kinds(later)).toEqual([])
+  core.setUsage({ readAt: later, buckets: [] }, undefined, later)
+  const off = core.userPrompt(later)
+  expect(off.length).toBe(1)
+  expect(off[0]?.text).toBe('crossfeed: hand-offs are off (the Claude week is on pace and the Codex surplus is under 10 points). Do execution yourself; hand work to Codex only when a subagent call is refused.')
+  expect(off[0]?.nudge).toEqual({ session: 'one', kind: 'balance-off', calls: null, reasons: [] })
+  expect(kinds(later)).toEqual([])
+  core.measure({ sevenDay: accountWeek }, later)
+  core.setCodex({ readAt: later, windows: [{ minutes: 300, usedPercent: 10 }], limitReached: false })
+  expect(kinds(later)).toEqual(['balance-on'])
+  core.setMode('off')
+  expect(kinds(later)).toEqual([])
+  core.setMode('always')
+  expect(core.takeNotices(later)[0]?.nudge?.reasons).toEqual(['account-week', 'always'])
+})
+
+test('reserve wins at delivery over every hand-off notice, while subagent routing still works', async () => {
+  const core = balanceCore()
+  core.setUsage({ readAt: BALANCE_TIME, buckets: [{ family: 'opus', label: 'Opus', usedPercent: 90 }] }, undefined, BALANCE_TIME)
+  core.measure({ fiveHour: { percentUsed: 85 }, sevenDay: accountWeek }, BALANCE_TIME)
+  core.toolCall('Bash', false, BALANCE_TIME)
+  core.measure({ fiveHour: { percentUsed: 90 }, sevenDay: accountWeek }, BALANCE_TIME)
+  expect(core.toolCall('Read', false, BALANCE_TIME)).toBe(undefined)
+  expect(core.takeNotices(BALANCE_TIME)).toEqual([{ text: 'crossfeed: Claude 5h 90%; reserve. Please finish the current step, keep a hand-off note and start no new autonomous work.' }])
+  expect(core.route(B, BALANCE_TIME)?.tier).toBe('B')
+})
+
+test('an Opus account-week stretch fires once at the counted call, resets per prompt and needs Codex headroom', async () => {
+  const core = balanceCore()
+  core.setCodex({ readAt: BALANCE_TIME, windows: [{ minutes: 300, usedPercent: 10 }], limitReached: false })
+  for (let i = 0; i < 2; i++) {
+    core.userPrompt(BALANCE_TIME)
+    expect(core.toolCall('Read', false, BALANCE_TIME)).toBe(undefined)
+    const note = core.toolCall('Read', false, BALANCE_TIME)
+    expect(note?.text.includes('run --kind task')).toBe(true)
+    expect(note?.text.includes('--codex-stop')).toBe(false)
+    expect(note?.text.includes('account-week')).toBe(true)
+    expect(note?.nudge).toEqual({ session: 'one', kind: 'stretch', reasons: ['account-week'], calls: 2 })
+    expect(core.toolCall('Read', false, BALANCE_TIME)).toBe(undefined)
+  }
+  core.userPrompt(BALANCE_TIME)
+  core.setCodex(undefined)
+  core.toolCall('Read', false, BALANCE_TIME)
+  expect(core.toolCall('Bash', false, BALANCE_TIME)).toBe(undefined)
+  core.setCodex({ readAt: BALANCE_TIME, windows: [codexWeek], limitReached: false })
+  expect(core.toolCall('Bash', false, BALANCE_TIME)?.nudge?.calls).toBe(3)
+})
+
+test('the stretch reminder waits past call 12 for a reason and fires once at call 15', async () => {
+  const core = decisionCore()
+  for (let count = 1; count <= 14; count++) expect(core.toolCall('Read', false, BASE)).toBe(undefined)
+  core.measure({ fiveHour: { percentUsed: 5 }, sevenDay: { percentUsed: 55, resetsAt: BASE + 3.5 * 1440 * MINUTE } }, BASE)
+  expect(core.toolCall('Read', false, BASE)?.nudge).toEqual({ session: 'session-1', kind: 'stretch', reasons: ['account-week'], calls: 15 })
+  expect(core.toolCall('Read', false, BASE)).toBe(undefined)
+})
+
+test('the last on notice survives unknown Codex headroom but turns off once fresh headroom falls below half', async () => {
+  const core = balanceCore()
+  expect(core.takeNotices(BALANCE_TIME)[0]?.nudge?.kind).toBe('balance-on')
+  const later = BALANCE_TIME + 16 * MINUTE
+  const lowQuota = { readAt: later, windows: [{ ...codexWeek, usedPercent: 82 }], limitReached: false }
+  core.setCodex({ ...lowQuota, readAt: BALANCE_TIME })
+  expect(core.takeNotices(later)).toEqual([])
+  core.setCodex({ ...lowQuota, windows: [] })
+  expect(core.takeNotices(later)).toEqual([])
+  core.setCodex({ ...lowQuota, windows: [{ ...lowQuota.windows[0]!, resetsAt: later }] })
+  expect(core.takeNotices(later)).toEqual([])
+  core.setCodex(lowQuota)
+  expect(core.takeNotices(later)).toEqual([{
+    text: 'crossfeed: hand-offs are off (Codex is close to its stop). Do execution yourself; hand work to Codex only when a subagent call is refused.',
+    nudge: { session: 'one', kind: 'balance-off', reasons: [], calls: null },
+  }])
+  expect(core.takeNotices(later)).toEqual([])
+})
+
+test('reserve suppresses balance-off even with fresh low headroom', async () => {
+  const core = balanceCore()
+  expect(core.takeNotices(BALANCE_TIME)[0]?.nudge?.kind).toBe('balance-on')
+  measure(core, 90, BALANCE_TIME)
+  core.setCodex({ readAt: BALANCE_TIME, windows: [{ ...codexWeek, usedPercent: 82 }], limitReached: false })
+  const notes = core.takeNotices(BALANCE_TIME)
+  expect(notes.length).toBe(1)
+  expect(notes[0]?.text.includes('reserve')).toBe(true)
+  expect(notes[0]?.nudge).toBe(undefined)
+  measure(core, 89, BALANCE_TIME)
+  expect(core.takeNotices(BALANCE_TIME)[0]?.nudge?.kind).toBe('balance-off')
+})
+
+test('surplus hysteresis holds a delivered on at 14 and 10 points and turns off at 9', async () => {
+  const core = decisionCore()
+  core.measure({ fiveHour: { percentUsed: 5 }, sevenDay: { percentUsed: 40, resetsAt: BASE + 3.5 * 1440 * MINUTE } }, BASE)
+  const setSurplus = (points: number) => core.setCodex({
+    readAt: BASE, limitReached: false, windows: [{ minutes: 10080, usedPercent: 42.5 - points, resetsAt: BASE + 3.5 * 1440 * MINUTE }],
+  })
+  setSurplus(16)
+  expect(core.takeNotices(BASE)[0]?.nudge?.reasons).toEqual(['codex-surplus'])
+  setSurplus(14)
+  expect(core.takeNotices(BASE)).toEqual([])
+  expect(core.route(B, BASE)).toBe(undefined)
+  setSurplus(10)
+  expect(core.takeNotices(BASE)).toEqual([])
+  setSurplus(9)
+  expect(core.takeNotices(BASE)[0]?.nudge?.kind).toBe('balance-off')
+  setSurplus(14)
+  expect(core.takeNotices(BASE)).toEqual([])
+})
+
+test('account-week hysteresis holds a delivered on at line plus 3 and 2 and turns off at plus 1', async () => {
+  const core = decisionCore()
+  const setWeek = (points: number) => core.measure({
+    fiveHour: { percentUsed: 5 }, sevenDay: { percentUsed: 50 + points, resetsAt: BASE + 3.5 * 1440 * MINUTE },
+  }, BASE)
+  setWeek(5)
+  expect(core.takeNotices(BASE)[0]?.nudge?.reasons).toEqual(['account-week'])
+  setWeek(3)
+  expect(core.takeNotices(BASE)).toEqual([])
+  expect(core.route(B, BASE)).toBe(undefined)
+  setWeek(2)
+  expect(core.takeNotices(BASE)).toEqual([])
+  setWeek(1)
+  expect(core.takeNotices(BASE)[0]?.nudge?.kind).toBe('balance-off')
+  setWeek(3)
+  expect(core.takeNotices(BASE)).toEqual([])
+})
+
+test('an older Codex answer is ignored unless the held reading exceeds five minutes of clock skew', async () => {
+  const core = balanceCore()
+  const quota = { readAt: BALANCE_TIME - MINUTE, limitReached: false, windows: [{ ...codexWeek, usedPercent: 60 }] }
+  core.setCodex(quota, undefined, BALANCE_TIME)
+  expect(core.status(BALANCE_TIME).includes('codex wk 40%')).toBe(true)
+  core.setCodex(quota, undefined, BALANCE_TIME - 5 * MINUTE)
+  expect(core.status(BALANCE_TIME).includes('codex wk 40%')).toBe(true)
+  core.setCodex(quota, undefined, BALANCE_TIME - 5 * MINUTE - 1)
+  expect(core.status(BALANCE_TIME).includes('codex wk 60%')).toBe(true)
+})
+
+test('low headroom blocks pressure, family, balance and stretch advice until the main-loop gate opens', async () => {
+  const core = balanceCore()
+  core.setMode('always')
+  core.setUsage({ readAt: BALANCE_TIME, buckets: [{ family: 'opus', label: 'Opus', usedPercent: 90 }] }, undefined, BALANCE_TIME)
+  core.measure({ fiveHour: { percentUsed: 89 }, sevenDay: accountWeek }, BALANCE_TIME)
+  const quota = { readAt: BALANCE_TIME, windows: [codexWeek, { minutes: 400, usedPercent: 75.01 }], limitReached: false }
+  core.setCodex(quota)
+  expect(core.takeNotices(BALANCE_TIME)).toEqual([])
+  core.toolCall('Read', false)
+  expect(core.toolCall('Bash', false)).toBe(undefined)
+  expect(core.describe(BALANCE_TIME).includes('38.5 points (headroom below 0.5)')).toBe(true)
+  core.setCodex({ ...quota, windows: [codexWeek, { minutes: 400, usedPercent: 75 }] })
+  const notices = core.userPrompt(BALANCE_TIME)
+  expect(notices.map(item => item.nudge?.kind)).toEqual([undefined, undefined, 'balance-on'])
+  expect(notices[0]?.text.includes('pressure')).toBe(true)
+  expect(notices[1]?.text.includes('Opus weekly')).toBe(true)
+  core.toolCall('Read', false)
+  expect(core.toolCall('Bash', false)?.nudge?.reasons).toEqual(['pressure', 'limit', 'account-week', 'codex-surplus', 'always'])
 })

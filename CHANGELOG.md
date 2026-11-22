@@ -4,6 +4,47 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Tier B calls can move when Claude's all-models week is 5 points ahead
+  of an even pace or reaches 90% used.
+- Tier B calls can also move when Codex is at least 15 points under an
+  even pace to its weekly stop and has at least half its headroom.
+- Balance notices tell Claude when to hand off checkable execution before
+  its first command and when to do that work itself again.
+- The status line shows an all-models week ahead and an active Codex
+  surplus. `/crossfeed status` gives the figures and current hand-off reasons.
+- The plugin attempts to log each balance notice and stretch reminder it
+  attaches.
+- `run --codex-stop PERCENT` sets the long-window stop for a launch,
+  including a resume. The plugin passes its configured stop.
+
+### Changed
+
+- Weekly hand-off explanations use the account-week or surplus figures
+  that moved the call. The decision record includes both weekly readings
+  when available.
+- The stretch reminder applies to every main-loop hand-off reason. It
+  fires once per prompt on a counted call at or beyond `stretchCalls`.
+- Hand-off advice needs at least half of Codex headroom. At 90% of
+  Claude's 5-hour window, the reserve notice takes precedence.
+- Fresh review, research and tier B subagent jobs use `gpt-6.2-astra`
+  when Codex lists it. `CROSSFEED_JUDGMENT_MODEL` selects another listed
+  model. An explicit `--model` takes precedence.
+- `report` counts fresh jobs by hand-off cause, all jobs by model,
+  launches refused by the guard and each kind of nudge.
+
+### Fixed
+
+- `run` checks quota before starting or resuming a job. At or above a
+  counted Codex window's stop, it records the reason and exits 75.
+- The plugin omits its static hand-off instructions in `off` mode.
+- A late Codex reading no longer replaces a newer one unless the held
+  reading is dated more than 5 minutes ahead of the clock.
+- Headroom ignores Codex windows whose reset time has passed.
+
 ## 0.2.2 - 2026-11-21
 
 ### Added

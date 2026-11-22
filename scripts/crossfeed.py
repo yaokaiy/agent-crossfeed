@@ -528,10 +528,13 @@ def _event_time(event, mtime):
         return mtime
 
 
+def _codex_home():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
 def _log_quota():
-    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     candidates = []
-    for path in (codex_home / "sessions").rglob("rollout-*.jsonl"):
+    for path in (_codex_home() / "sessions").rglob("rollout-*.jsonl"):
         try:
             candidates.append((path.stat().st_mtime, path))
         except OSError:
@@ -865,8 +868,26 @@ def changes(before: dict, after: dict) -> dict:
     }
 
 
+def _judgment_model():
+    slug = os.environ.get("CROSSFEED_JUDGMENT_MODEL", "gpt-6.2-astra")
+    if not slug:
+        return None
+    try:
+        with (_codex_home() / "models_cache.json").open(encoding="utf-8-sig") as stream:
+            cache = json.load(stream, parse_constant=_reject_json_constant)
+    except (OSError, ValueError, RecursionError):
+        return None
+    models = cache.get("models") if isinstance(cache, dict) else None
+    if isinstance(models, list) and any(isinstance(model, dict) and model.get("slug") == slug
+                                        for model in models):
+        return slug
+    return None
+
+
 def _prepare_run(args):
     thread = None
+    if not _finite_number(args.codex_stop) or not 0 < args.codex_stop <= 100:
+        raise ValueError("--codex-stop must be a finite percent greater than 0 and at most 100")
     if args.cause is not None and re.fullmatch(r"[A-Za-z0-9-]{1,32}", args.cause) is None:
         raise ValueError("--cause must be 1 to 32 letters, digits or hyphens")
     if args.resume is not None:
@@ -887,7 +908,14 @@ def _prepare_run(args):
         args.dir = prior["dir"]
         args.write = prior["sandbox"] == "workspace-write"
         args.model = prior.get("model")
+        args.model_source = "resume"
         args.cause = prior.get("cause")
+    elif args.model:
+        args.model_source = "flag"
+    else:
+        judgment = args.kind in ("review", "research") or (args.kind == "subagent" and args.tier == "B")
+        args.model = _judgment_model() if judgment else None
+        args.model_source = "judgment" if args.model else "codex-default"
     args.dir = str(Path(args.dir).resolve())
     if not Path(args.dir).is_dir():
         raise ValueError("directory does not exist: {}".format(args.dir))
@@ -913,12 +941,12 @@ def _job_status(code, timed_out, result, errors):
 
 def _run_allocated_job(args, job_dir, now, brief, resume_thread, interrupted):
     start = time.monotonic()
-    session = args.session if args.session is not None else os.environ.get("CLAUDE_CODE_SESSION_ID")
     record = {
-        "type": "job", "id": job_dir.name, "session": session or None, "kind": args.kind,
+        "type": "job", "id": job_dir.name, "session": args.session or None, "kind": args.kind,
         "brief_file": args.brief_file,
         "tier": args.tier, "dir": args.dir, "sandbox": "workspace-write" if args.write else "read-only",
-        "worktree": args.worktree, "effort": args.effort, "model": args.model, "cause": args.cause,
+        "worktree": args.worktree, "effort": args.effort, "model": args.model,
+        "model_source": args.model_source, "cause": args.cause,
         "started": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "wall_s": 0,
         "status": "running", "exit": None,
         "tokens": {"input": 0, "cached": 0, "output": 0, "reasoning": 0},
@@ -964,6 +992,48 @@ def _run_allocated_job(args, job_dir, now, brief, resume_thread, interrupted):
     return record["exit"]
 
 
+def _stop_reason(windows, limit_reached, stop):
+    if limit_reached and windows:
+        return "Codex reported its limit"
+    for window in windows:
+        short = window["minutes"] <= 360
+        threshold = 90 if short else stop
+        if window["used_percent"] < threshold:
+            continue
+        label = "{:g}-hour".format(window["minutes"] / 60) if short else "weekly"
+        reason = "Codex {} {}% used, at or above the {}% stop".format(
+            label, str(window["used_percent"]).removesuffix(".0"), str(threshold).removesuffix(".0"))
+        if window.get("resets_at") is not None:
+            try:
+                reset = datetime.datetime.fromtimestamp(window["resets_at"], datetime.timezone.utc)
+                reason += reset.strftime(" (resets %Y-%m-%d %H:%M UTC)")
+            except (OSError, OverflowError, ValueError):
+                pass  # Unprintable timestamps don't invalidate the quota percentage.
+        return reason
+    return None
+
+
+def _launch_stopped(args, quota, now):
+    if quota["source"] == "none" or quota["age_s"] < -300:
+        print("crossfeed: Codex quota is unknown; proceeding.", file=sys.stderr)
+        return False
+    fresh = quota["age_s"] <= 900
+    windows = []
+    for window in quota["windows"]:
+        reset = window.get("resets_at")
+        if (reset is None and fresh) or (reset is not None and reset > now):
+            windows.append(window)
+    reason = _stop_reason(windows, fresh and quota["limit_reached"], args.codex_stop)
+    if reason is None:
+        return False
+    weekly = max((w for w in windows if w["minutes"] > 360), key=lambda w: w["minutes"], default=None)
+    print("crossfeed: not started: {}. Do this work yourself.".format(reason), file=sys.stderr)
+    append_ledger({"type": "stop", "session": args.session or None, "kind": args.kind, "tier": args.tier,
+                   "resume_of": args.resume, "reason": reason,
+                   "codex_weekly": weekly["used_percent"] if weekly else None})
+    return True
+
+
 def _run(args) -> int:
     try:
         brief = Path(args.brief_file).read_bytes() if args.brief_file is not None else sys.stdin.buffer.read()
@@ -979,7 +1049,10 @@ def _run(args) -> int:
         print("crossfeed: {}".format(error), file=sys.stderr)
         return 2
     try:
+        quota = read_quota()
         now = datetime.datetime.now(datetime.timezone.utc)
+        if _launch_stopped(args, quota, now.timestamp()):
+            return 75
         job_dir = _create_job_dir(now)
         with _job_interrupts() as interrupted:
             return _run_allocated_job(args, job_dir, now, brief, resume_thread, interrupted)
@@ -1016,33 +1089,64 @@ def _reject_json_constant(constant):
     raise ValueError("invalid JSON constant: {}".format(constant))
 
 
-def _decision(args) -> int:
+def _read_record_input(name):
     payload = sys.stdin.buffer.read(16385)
     if len(payload) > 16384:
-        raise ValueError("decision input exceeds 16384 bytes")
+        raise ValueError("{} input exceeds 16384 bytes".format(name))
     try:
         data = json.loads(payload.decode("utf-8-sig"), parse_constant=_reject_json_constant)
+        # Reject unpaired surrogates and numbers like 1e400 before opening the ledger.
+        json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
     except UnicodeDecodeError as error:
-        raise ValueError("decision input must be UTF-8") from error
+        raise ValueError("{} input must be UTF-8".format(name)) from error
+    except UnicodeEncodeError as error:
+        raise ValueError("{} text must be encodable as UTF-8".format(name)) from error
     except RecursionError as error:
-        raise ValueError("decision input is nested too deeply") from error
+        raise ValueError("{} input is nested too deeply".format(name)) from error
     if not isinstance(data, dict):
-        raise ValueError("decision input must be a JSON object")
+        raise ValueError("{} input must be a JSON object".format(name))
+    return data
+
+
+def _decision(args) -> int:
+    data = _read_record_input("decision")
     for field in ("eligible", "handed_off"):
         if not isinstance(data.get(field), bool):
             raise ValueError("decision field {} must be a boolean".format(field))
     if data["handed_off"] and not data["eligible"]:
         raise ValueError("a decision cannot hand off a call that is not eligible")
-    try:
-        # A number too large for a float (1e400) parses as infinity and would be written as Infinity.
-        json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
-    except UnicodeEncodeError as error:
-        raise ValueError("decision text must be encodable as UTF-8") from error
-    except RecursionError as error:
-        raise ValueError("decision input is nested too deeply") from error
+    week = data.setdefault("account_week", None)
+    if week is not None:
+        if (not isinstance(week, dict) or not _finite_number(week.get("percent"))
+                or week.get("state") not in ("ok", "ahead", "full", "unknown")
+                or (week.get("line") is not None and not _finite_number(week["line"]))):
+            raise ValueError("invalid decision account_week")
+        week.setdefault("line", None)
+    surplus = data.setdefault("codex_surplus", None)
+    if surplus is not None:
+        if not _finite_number(surplus):
+            raise ValueError("decision codex_surplus must be a number or null")
+        data["codex_surplus"] = round(surplus, 1)
     record = {"type": "decision"}
     record.update((key, value) for key, value in data.items() if key not in ("type", "v", "ts"))
     append_ledger(record)
+    return 0
+
+
+NUDGE_KINDS = ("balance-on", "balance-off", "stretch")
+
+
+def _nudge(args) -> int:
+    data = _read_record_input("nudge")
+    if data.get("kind") not in NUDGE_KINDS:
+        raise ValueError("nudge kind must be balance-on, balance-off or stretch")
+    reasons = data.get("reasons")
+    if not isinstance(reasons, list) or not all(isinstance(reason, str) for reason in reasons):
+        raise ValueError("nudge reasons must be a list of strings")
+    if "calls" not in data or (data["calls"] is not None and type(data["calls"]) is not int):
+        raise ValueError("nudge calls must be an integer or null")
+    append_ledger({"type": "nudge", "session": data.get("session"), "kind": data["kind"],
+                   "reasons": reasons, "calls": data["calls"]})
     return 0
 
 
@@ -1174,7 +1278,16 @@ def _fold_decision(counts, record, briefs):
 
 def _fold_job(summary, record, checks, walls):
     summary["jobs"] += 1
-    summary["limit_jobs"] += int(record.get("cause") == "limit")
+    if record.get("resume_of") is None:
+        cause = record.get("cause")
+        summary["limit_jobs"] += int(cause == "limit")
+        summary["account_week_jobs"] += int(cause == "account-week")
+        summary["codex_surplus_jobs"] += int(cause == "codex-surplus")
+    model = record.get("model")
+    if not isinstance(model, str) or not model:
+        model = "Codex default"
+    by_model = summary["by_model"]
+    by_model[model] = by_model.get(model, 0) + 1
     summary["by_status"][record["status"]] += 1
     verdict = checks.get(record["id"])
     if verdict is None:
@@ -1206,7 +1319,9 @@ def fold(records: list, since: datetime.datetime) -> dict:
         "by_tier": {"A": {"jobs": 0, "checked": 0, "passed": 0},
                     "B": {"jobs": 0, "checked": 0, "passed": 0}},
         "tokens": 0, "median_wall_s": None, "unchecked": 0,
-        "bucket_lockouts": {}, "downgrades": {"total": 0, "by_bucket": {}}, "limit_jobs": 0,
+        "bucket_lockouts": {}, "downgrades": {"total": 0, "by_bucket": {}},
+        "limit_jobs": 0, "account_week_jobs": 0, "codex_surplus_jobs": 0,
+        "by_model": {}, "stops": 0, "nudges": dict.fromkeys(NUDGE_KINDS, 0),
         "decisions": {"total": 0, "ineligible": 0, "handed_off": 0, "run": 0, "stayed": 0},
         "used": {"yes": 0, "partly": 0, "no": 0, "unrated": 0},
     }
@@ -1241,6 +1356,10 @@ def fold(records: list, since: datetime.datetime) -> dict:
                 counts[bucket] = counts.get(bucket, 0) + 1
         elif record.get("type") == "decision":
             _fold_decision(summary["decisions"], record, briefs)
+        elif record.get("type") == "stop":
+            summary["stops"] += 1
+        elif record.get("type") == "nudge" and record.get("kind") in NUDGE_KINDS:
+            summary["nudges"][record["kind"]] += 1
         elif (record.get("type") == "job" and isinstance(record.get("id"), str)
               and record.get("status") in ("done", "failed", "limit", "timeout", "interrupted")):
             _fold_job(summary, record, checks, walls)
@@ -1271,6 +1390,7 @@ def _report_text(summary, days):
         wall_minutes, seconds = divmod(int(median), 60)
         median_text = "{}m{:02d}s".format(wall_minutes, seconds)
     statuses = summary["by_status"]
+    models = ", ".join("{} {}".format(model, count) for model, count in sorted(summary["by_model"].items()))
     tier_a, tier_b = summary["by_tier"]["A"], summary["by_tier"]["B"]
     return "\n".join([
         "crossfeed report, last {} days".format(days),
@@ -1278,12 +1398,16 @@ def _report_text(summary, days):
             summary["lockouts"], hours, minutes, summary["unknown_resets"]),
         "model limits: " + ("; ".join(limits) if limits else "none"),
         moved,
-        "jobs handed off because of a model limit: {}".format(summary["limit_jobs"]),
+        "jobs handed off because of: model limit {limit_jobs}, account week {account_week_jobs}, "
+        "Codex surplus {codex_surplus_jobs}".format(**summary),
         "subagent calls: {total}; not eligible: {ineligible}; handed to Codex: {handed_off} (run: {run}); "
         "stayed on Claude: {stayed}".format(**summary["decisions"]),
         "jobs: {} (done {}, failed {}, limit {}, timeout {}, interrupted {}); codex tokens: {}; median: {}".format(
             summary["jobs"], statuses["done"], statuses["failed"], statuses["limit"], statuses["timeout"],
             statuses["interrupted"], summary["tokens"], median_text),
+        "jobs by model: " + (models or "none"),
+        "launches stopped at the Codex stop: {}".format(summary["stops"]),
+        "nudges: balance on {balance-on}, balance off {balance-off}, stretch {stretch}".format(**summary["nudges"]),
         "first-delivery checks: A {}/{}, B {}/{}; unchecked: {}".format(
             tier_a["passed"], tier_a["checked"], tier_b["passed"], tier_b["checked"], summary["unchecked"]),
         "read-only results used: yes {yes}, partly {partly}, no {no}; not rated: {unrated}".format(**summary["used"]),
@@ -1314,6 +1438,8 @@ def main(argv) -> int:
     stash.set_defaults(handler=_stash)
     decision = subcommands.add_parser("decision")
     decision.set_defaults(handler=_decision)
+    nudge = subcommands.add_parser("nudge")
+    nudge.set_defaults(handler=_nudge)
     check = subcommands.add_parser("check")
     check.add_argument("job")
     check.add_argument("check_command", nargs=argparse.REMAINDER)
@@ -1348,10 +1474,11 @@ def main(argv) -> int:
     run.add_argument("--worktree", action="store_true")
     run.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"), default="high")
     run.add_argument("--model", default=None)
+    run.add_argument("--codex-stop", type=float, default=85, metavar="PERCENT")
     run.add_argument("--cause")
     run.add_argument("--timeout", type=float, default=30)
     run.add_argument("--resume")
-    run.add_argument("--session")
+    run.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID"))
     run.add_argument("--brief-file")
     quota = subcommands.add_parser("quota")
     quota.add_argument("--timeout", type=float, default=10.0, metavar="SECONDS")

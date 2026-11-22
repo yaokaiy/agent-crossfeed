@@ -32,11 +32,11 @@ Clone the repository and run `make test`.
    without the plugin.
 3. **A broken hook never blocks work.** A hook that throws logs the failure
    and lets the original event continue.
-4. **Unknown is not free capacity.** A missing or failed quota reading on
-   either side hands nothing off.
-5. **The system-prompt section never changes within a session.** Live
-   numbers enter only at the tail of the conversation, so the prompt cache
-   stays valid.
+4. **Unknown is not free capacity.** Without a usable Codex reading the
+   plugin hands nothing off and sends no hand-off advice. Standalone `run`
+   proceeds on unknown quota, and Codex still refuses at its own limit.
+5. **Live numbers stay out of the system-prompt section.** Switching to
+   or from `off` changes the next composed prompt and may cause a cache miss.
 6. **Tests start from inputs.** Cover empty, missing and zero-length values,
    CRLF and non-ASCII text, and states where two values the code assumes
    agree do not. Do not build tests from expected outputs alone.

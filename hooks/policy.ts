@@ -1,6 +1,9 @@
 import type { Config, Mode } from './config'
 
 export type Tier = 'A' | 'B' | 'C'
+export type FloorCause = 'limit' | 'account-week' | 'codex-surplus'
+export type HandOffReason = FloorCause | 'pressure' | 'always'
+
 export type AgentCall = {
   prompt: string
   agentId?: string
@@ -65,6 +68,30 @@ const MINUTE = 60000
 // A Codex reading older than this, or dated this far ahead of the clock, gives no headroom and shows as stale.
 export const CODEX_MAX_AGE = 15 * MINUTE
 
+export type AccountWeek = { percent?: number; line?: number; resetsAt?: number; state: BucketState }
+
+export function accountWeekState(window: ClaudeReading['sevenDay'], readAt: number, now: number): AccountWeek {
+  if (!window) return { state: 'unknown' }
+  const { percentUsed: percent, resetsAt } = window
+  if (resetsAt === undefined) return { percent, state: 'unknown' }
+  const line = 100 * clamp(1 - (resetsAt - now) / (7 * 1440 * MINUTE), 0, 1)
+  const state = now >= resetsAt || readAt - now > 5 * MINUTE ? 'unknown'
+    : percent >= 100 ? 'full' : percent >= line + 5 || percent >= 90 ? 'ahead' : 'ok'
+  return { percent, line, resetsAt, state }
+}
+
+export function weeklyWindow(codex: CodexReading | undefined): CodexWindow | undefined {
+  return codex?.windows.filter(window => window.minutes > 360).sort((a, b) => b.minutes - a.minutes)[0]
+}
+
+export function codexSurplus(codex: CodexReading | undefined, config: Config, now: number): number | undefined {
+  if (!codex || codex.limitReached || Math.abs(codex.readAt - now) > CODEX_MAX_AGE) return undefined
+  const week = weeklyWindow(codex)
+  if (week?.resetsAt === undefined || now >= week.resetsAt) return undefined
+  const elapsed = clamp(1 - (week.resetsAt - now) / (week.minutes * MINUTE), 0, 1)
+  return config.codexStopPercent * elapsed - week.usedPercent
+}
+
 function usageRate(samples: PressureState['samples'], u: number, now: number): number | undefined {
   if (samples.length < 2) return undefined
   let ref = samples[0]!
@@ -126,13 +153,24 @@ export function pressure(state: PressureState, reading: ClaudeReading): number {
   return Math.max(state.p, 0.25 * clamp((w - 75) / 15, 0, 1))
 }
 
-export function headroom(codex: CodexReading | undefined, config: Config, now: number): number {
-  if (!codex || !codex.windows.length || codex.limitReached || Math.abs(now - codex.readAt) > CODEX_MAX_AGE) return 0
-  return Math.min(...codex.windows.map(window => {
+function currentWindows(codex: CodexReading, now: number): CodexWindow[] {
+  return codex.windows.filter(window => window.resetsAt === undefined || now < window.resetsAt)
+}
+
+export function knownHeadroom(codex: CodexReading | undefined, config: Config, now: number): number | undefined {
+  if (!codex || Math.abs(now - codex.readAt) > CODEX_MAX_AGE) return undefined
+  if (codex.limitReached) return 0
+  const windows = currentWindows(codex, now)
+  if (!windows.length) return undefined
+  return Math.min(...windows.map(window => {
     if (window.minutes <= 360) return window.usedPercent >= 90 ? 0 : 1
     const days = window.resetsAt === undefined ? 7 : Math.max(0, (window.resetsAt - now) / (1440 * MINUTE))
     return clamp((config.codexStopPercent - window.usedPercent) / (10 + 10 * clamp(days / 7, 0, 1)), 0, 1)
   }))
+}
+
+export function headroom(codex: CodexReading | undefined, config: Config, now: number): number {
+  return knownHeadroom(codex, config, now) ?? 0
 }
 
 // Keep diagnostics safe for one-line status and refusal text, regardless of source.
@@ -149,7 +187,9 @@ export function headroomCause(codex: CodexReading | undefined, config: Config, n
   if (!codex || !codex.windows.length) return 'no Codex reading' + suffix
   if (now - codex.readAt > CODEX_MAX_AGE) return `Codex reading is ${Math.round((now - codex.readAt) / MINUTE)} minutes old` + suffix
   if (codex.readAt - now > CODEX_MAX_AGE) return `Codex reading is dated ${Math.round((codex.readAt - now) / MINUTE)} minutes ahead of the clock` + suffix
-  const window = codex.windows.find(window => window.usedPercent >= (window.minutes <= 360 ? 90 : config.codexStopPercent))
+  const windows = currentWindows(codex, now)
+  if (!windows.length) return 'all Codex windows have reset' + suffix
+  const window = windows.find(window => window.usedPercent >= (window.minutes <= 360 ? 90 : config.codexStopPercent))
   if (!window) return 'no Codex headroom'
   const label = window.minutes === 10080 ? 'weekly' : `${window.minutes / 60}-hour`
   return `Codex ${label} use is ${Math.round(window.usedPercent)}%` + suffix

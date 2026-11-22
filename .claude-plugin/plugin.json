@@ -1,7 +1,7 @@
 {
   "name": "agent-crossfeed",
   "version": "0.2.2",
-  "description": "Dynamic subagent routing from Claude Code to Codex: picks, call by call, which subagent work to hand to the Codex CLI or to a cheaper Claude model, based on task fit, how fast Claude's 5-hour window and model weekly limits are filling, and Codex headroom.",
+  "description": "Routes suitable Claude Code subagent calls to the Codex CLI based on Claude's 5-hour pace, weekly use across all models and by model, and Codex headroom and weekly surplus. Can move subagents to a cheaper Claude model and prompt Claude to hand off checkable tasks.",
   "author": {
     "name": "yaokaiy"
   },
@@ -10,7 +10,7 @@
     "mode": {
       "type": "string",
       "title": "Crossfeed mode",
-      "description": "Choose automatic routing, always hand off eligible work with headroom, or turn steering off.",
+      "description": "auto routes on both quotas; always hands off every eligible tier A and B call while Codex has headroom and Claude's 5-hour usage is known (or the call's model limit is ahead or full); off stops steering.",
       "options": [
         "auto",
         "always",
@@ -21,7 +21,7 @@
     "effort": {
       "type": "string",
       "title": "Codex reasoning effort",
-      "description": "Reasoning effort for work handed to Codex.",
+      "description": "Codex reasoning effort for jobs handed out from a refused subagent call.",
       "options": [
         "low",
         "medium",
@@ -34,7 +34,7 @@
     "model": {
       "type": "string",
       "title": "Codex model",
-      "description": "Model for work handed to Codex. Leave empty to use Codex's own default.",
+      "description": "Model for jobs handed out from a refused subagent call. Leave empty to let crossfeed choose: its judgment model for tier B hand-offs when Codex lists it, otherwise Codex's own default.",
       "default": ""
     },
     "premiumFallback": {
@@ -52,19 +52,19 @@
     "stretchCalls": {
       "type": "number",
       "title": "Long-stretch reminder",
-      "description": "Main-loop tool calls before a hand-off reminder when pressure is high.",
+      "description": "Counted hands-on main-loop tool calls in one prompt before the one hand-off reminder, sent while hand-offs are on.",
       "default": 12
     },
     "codexStopPercent": {
       "type": "number",
       "title": "Codex stop percentage",
-      "description": "Stop handing off new work when a long Codex quota window reaches this percentage.",
+      "description": "Stop handing off new work when a long Codex quota window reaches this percentage. Use a value greater than 0 and at most 100.",
       "default": 85
     },
     "timeoutMinutes": {
       "type": "number",
       "title": "Job timeout in minutes",
-      "description": "Maximum time for each job handed to Codex.",
+      "description": "Codex time limit, in minutes, for jobs handed out from a refused subagent call.",
       "default": 30
     }
   }

@@ -1,4 +1,6 @@
+import contextlib
 import datetime
+import io
 import json
 import os
 from pathlib import Path
@@ -47,6 +49,108 @@ class QuotaTests(CrossfeedCase):
             "source": "app-server", "age_s": 0, "limit_reached": False,
             "error": None, "windows": [WEEKLY], "app_server_error": None,
         })
+
+    def run_with_limits(self, limits, *args, **env):
+        return run_crossfeed(["run", "--dir", str(self.root), *args], stdin=b"Brief\n", cwd=self.root,
+                             env=dict(self.env, FAKE_CODEX_RATE_LIMITS=json.dumps(limits), **env))
+
+    def test_launch_stops_before_allocation_with_exact_message_and_record(self):
+        reset = datetime.datetime(2099, 11, 22, 1, 27, tzinfo=datetime.timezone.utc).timestamp()
+        limits = {"secondary": {"window_minutes": 10080, "used_percent": 86, "resets_at": reset}}
+        argv = self.root / "exec-argv"
+        result = self.run_with_limits(limits, "--kind", "subagent", "--tier", "A",
+                                      CLAUDE_CODE_SESSION_ID="session", FAKE_CODEX_ARGV=str(argv))
+        reason = "Codex weekly 86% used, at or above the 85% stop (resets 2099-11-22 01:27 UTC)"
+        self.assertEqual((result.returncode, result.stdout, result.stderr.decode()),
+                         (75, b"", "crossfeed: not started: {}. Do this work yourself.\n".format(reason)))
+        record, = load_crossfeed().read_ledger()
+        self.assertEqual(record, {"v": 1, "ts": record["ts"], "type": "stop", "reason": reason,
+                                  "codex_weekly": 86, "kind": "subagent", "tier": "A",
+                                  "session": "session", "resume_of": None})
+        self.assertFalse(argv.exists())
+        self.assertFalse((self.home / "jobs").exists())
+
+    def test_launch_thresholds_and_limit_flag(self):
+        for minutes, percent, args, limited, code in (
+            (360, 89.99, [], False, 0), (360, 90, ["--codex-stop", "100"], False, 75),
+            (361, 84.99, [], False, 0), (361, 85, [], False, 75),
+            (10080, 85, ["--codex-stop", "85.5"], False, 0),
+            (10080, 85.5, ["--codex-stop", "85.5"], False, 75),
+            (10080, 0.1, ["--codex-stop", "0.1"], False, 75),
+            (10080, 0, ["--codex-stop", "100"], True, 75),
+        ):
+            with self.subTest(minutes=minutes, percent=percent, args=args, limited=limited):
+                limits = {"primary": {"window_minutes": minutes, "used_percent": percent},
+                          "rateLimitReachedType": "primary" if limited else None}
+                result = self.run_with_limits(limits, *args)
+                self.assertEqual(result.returncode, code, result.stderr)
+                record = load_crossfeed().read_ledger()[-1]
+                self.assertEqual(record["type"], "stop" if code == 75 else "job")
+                if code == 75:
+                    self.assertEqual(record["codex_weekly"], percent if minutes > 360 else None)
+
+    def test_unknown_quota_proceeds_and_resumed_launch_is_guarded(self):
+        result = self.run_with_limits({})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"quota is unknown", result.stderr)
+        job, = load_crossfeed().read_ledger()
+        limits = {"primary": {"window_minutes": 300, "used_percent": 90},
+                  "secondary": {"window_minutes": 10080, "used_percent": 45}}
+        result = self.run_with_limits(limits, "--resume", job["id"], "--session", "next")
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertEqual([p.name for p in (self.home / "jobs").iterdir()], [job["id"]])
+        original, stop = load_crossfeed().read_ledger()
+        self.assertEqual(original, job)
+        self.assertEqual((stop["type"], stop["resume_of"], stop["session"], stop["codex_weekly"]),
+                         ("stop", job["id"], "next", 45))
+
+    def test_limit_flag_with_a_mix_of_expired_and_current_windows(self):
+        limits = {"primary": {"window_minutes": 300, "used_percent": 100, "resets_at": 1},
+                  "secondary": {"window_minutes": 10080, "used_percent": 12}}
+        result = self.run_with_limits(limits)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_with_limits(dict(limits, rateLimitReachedType="primary"))
+        self.assertEqual(result.returncode, 75, result.stderr)
+        record = load_crossfeed().read_ledger()[-1]
+        self.assertEqual((record["reason"], record["codex_weekly"]), ("Codex reported its limit", 12))
+
+    def test_invalid_codex_stop_is_a_usage_error_before_probing(self):
+        probe = self.root / "app-server.pid"
+        for value in ("", "0", "-1", "101", "nan", "inf", "-inf", "bad"):
+            with self.subTest(value=value):
+                result = self.run_with_limits({}, "--codex-stop=" + value, FAKE_CODEX_APPSERVER_PIDFILE=str(probe))
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b"--codex-stop", result.stderr)
+        self.assertFalse(probe.exists())
+        self.assertFalse((self.home / "jobs").exists())
+        self.assertEqual(load_crossfeed().read_ledger(), [])
+
+    def test_launch_guard_on_dated_log_windows(self):
+        crossfeed = load_crossfeed()
+        now = datetime.datetime(2026, 11, 21, tzinfo=datetime.timezone.utc)
+        stamp = now.timestamp()
+        brief = self.root / "brief"
+        brief.write_bytes(b"Brief\n")
+        for age, reset, percent, limited, code in (
+            (604800, stamp - 1, 100, True, 0), (0, stamp, 100, True, 0),
+            (604800, stamp + 1, 85, False, 75), (901, stamp + 1, 0, True, 0),
+            (900, stamp + 1, 0, True, 75), (901, None, 85, True, 0),
+            (900, None, 85, False, 75), (900, None, 0, True, 75),
+            (-300, stamp + 1, 85, False, 75), (-301, stamp + 1, 100, True, 0),
+        ):
+            with self.subTest(age=age, reset=reset, limited=limited, percent=percent):
+                limits = {"secondary": {"window_minutes": 10080, "used_percent": percent, "resets_at": reset},
+                          "rateLimitReachedType": "secondary" if limited else None}
+                stderr = io.StringIO()
+                with patch.object(time, "time", return_value=stamp), \
+                        patch.dict(os.environ, FAKE_CODEX_APPSERVER="error"):
+                    self.write_log(age=age, limits=limits)
+                    with patch.object(datetime, "datetime", wraps=datetime.datetime) as clock, \
+                            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                        clock.now.return_value = now
+                        result = crossfeed.main(["run", "--brief-file", str(brief), "--dir", str(self.root)])
+                self.assertEqual(result, code, stderr.getvalue())
+                self.assertEqual("quota is unknown" in stderr.getvalue(), age < -300)
 
     def test_garbage_lines_are_ignored(self):
         reading = self.quota("garbage")
@@ -109,7 +213,7 @@ class QuotaTests(CrossfeedCase):
     def assert_child_stopped(self, mode):
         pidfile = self.root / "child.pid"
         start = time.monotonic()
-        reading = self.quota(mode, args=("--timeout", "1"), FAKE_CODEX_PIDFILE=str(pidfile))
+        reading = self.quota(mode, args=("--timeout", "1"), FAKE_CODEX_APPSERVER_PIDFILE=str(pidfile))
         self.assertLess(time.monotonic() - start, 20)
         self.assertEqual(reading["source"], "none")
         self.assertIn("timed out", reading["error"])

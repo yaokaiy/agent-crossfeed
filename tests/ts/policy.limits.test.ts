@@ -97,3 +97,24 @@ for (const [from, fallback, fallbackState, expected] of [
     expect(policy.rewriteModel({ mode: 'auto', subagentType: 'general-purpose', fork: false, parentModel: from, fallback, views })?.model).toBe(expected)
   })
 }
+
+test('the account week needs a current reset and tolerates an old reading in the same week', async () => {
+  const window = { percentUsed: 55, resetsAt: NOW + 3.5 * DAY }
+  for (const absent of [undefined, { percentUsed: 100 }, { percentUsed: 100, resetsAt: NOW }, { percentUsed: 100, resetsAt: NOW - 1 }]) {
+    expect(policy.accountWeekState(absent, NOW, NOW).state).toBe('unknown')
+  }
+  for (const readAt of [NOW - 3 * DAY, NOW, NOW + 5 * MINUTE]) {
+    expect(policy.accountWeekState(window, readAt, NOW)).toEqual({ percent: 55, line: 50, resetsAt: window.resetsAt, state: 'ahead' })
+  }
+  expect(policy.accountWeekState(window, NOW + 5 * MINUTE + 1, NOW).state).toBe('unknown')
+})
+
+test('account pace has a five-point margin and an absolute 90 percent threshold', async () => {
+  for (const [days, percentUsed, line, state] of [
+    [3.5, 0, 50, 'ok'], [3.5, 54.99, 50, 'ok'], [3.5, 55, 50, 'ahead'], [8, 5, 0, 'ahead'],
+    [0.4375, 85, 93.75, 'ok'], [0.4375, 89.99, 93.75, 'ok'], [0.4375, 90, 93.75, 'ahead'], [0.4375, 100, 93.75, 'full'],
+  ] as const) {
+    const resetsAt = NOW + days * DAY
+    expect(policy.accountWeekState({ percentUsed, resetsAt }, NOW, NOW)).toEqual({ percent: percentUsed, resetsAt, line, state })
+  }
+})

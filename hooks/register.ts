@@ -1,8 +1,8 @@
 import type { EngineInterface, HookFailure, Register, SessionRateLimit } from 'claude-code'
 import type { Mode } from './config'
-import { toConfig } from './config'
+import { DEFAULTS, toConfig } from './config'
 import { createCore } from './core'
-import type { Core, DecisionRecord } from './core'
+import type { Core, DecisionRecord, Notice, Nudge } from './core'
 import type { AgentCall, ClaudeReading, CodexReading, UsageReading, Family } from './policy'
 import { CODEX_MAX_AGE, familyOf, shortProblem } from './policy'
 import { staticSection } from './text'
@@ -23,9 +23,9 @@ async function clock($: EngineInterface): Promise<number> {
   return now
 }
 
-function showStatus($: EngineInterface, core: Core, now: number): void {
+async function showStatus($: EngineInterface, core: Core, now: number): Promise<void> {
   try {
-    void Promise.resolve($.ui.status(core.status(now))).catch(() => { /* The status line must not block the event. */ })
+    await $.ui.status(core.status(now))
   } catch { /* The status line must not block the event. */ }
 }
 
@@ -48,7 +48,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-async function readCodex($: EngineInterface, script: string, now: number): Promise<{ reading?: CodexReading; problem?: string }> {
+async function readCodex($: EngineInterface, script: string): Promise<{ reading?: CodexReading; problem?: string; at?: number }> {
   try {
     const result = await $.process.run(['python3', '-I', script, 'quota'], { timeoutMs: 15000 })
     if (result.exitCode !== 0) return { problem: shortProblem(`quota probe exited with code ${result.exitCode}`) }
@@ -66,13 +66,16 @@ async function readCodex($: EngineInterface, script: string, now: number): Promi
       if (!isRecord(window) || typeof window.minutes !== 'number' || !Number.isFinite(window.minutes) || window.minutes <= 0 ||
           typeof window.used_percent !== 'number' || !Number.isFinite(window.used_percent)) return { problem: problem ?? 'quota probe returned an invalid window' }
       const reset = window.resets_at
-      if (reset !== null && reset !== undefined && (typeof reset !== 'number' || !Number.isFinite(reset * 1000))) return { problem: problem ?? 'quota probe returned an invalid reset time' }
+      if (reset !== null && reset !== undefined && (typeof reset !== 'number' || !Number.isFinite(reset * 1000) || Math.abs(reset * 1000) > 8640000000000000)) return { problem: problem ?? 'quota probe returned an invalid reset time' }
       windows.push({ minutes: window.minutes, usedPercent: window.used_percent, resetsAt: typeof reset === 'number' ? reset * 1000 : undefined })
     }
     // An unknown age is not a fresh reading. A log stamped slightly ahead of this clock counts as now.
     const age = value.age_s
     if (typeof age !== 'number' || !Number.isFinite(age) || age < -300) return { problem: problem ?? 'quota probe returned an invalid age' }
-    return { reading: { windows, limitReached: value.limit_reached, readAt: now - Math.max(0, age) * 1000 }, problem }
+    const at = await clock($)
+    const readAt = at - Math.max(0, age) * 1000
+    if (!Number.isFinite(readAt)) return { problem: problem ?? 'quota probe returned an invalid age' }
+    return { reading: { windows, limitReached: value.limit_reached, readAt }, problem, at }
   } catch (error) {
     return { problem: shortProblem(`quota probe failed: ${String(error)}`) }
   }
@@ -116,7 +119,7 @@ export async function readUsage($: EngineInterface, script: string, fresh: boole
 // so neither probe delays the other or the other's result.
 async function refreshReadings($: EngineInterface, core: Core, script: string, now: number, due: { codex: boolean; usage: boolean }): Promise<void> {
   await Promise.all([
-    due.codex ? readCodex($, script, now).then(quota => core.setCodex(quota.reading, quota.problem)) : undefined,
+    due.codex ? readCodex($, script).then(quota => core.setCodex(quota.reading, quota.problem, quota.at ?? now)) : undefined,
     due.usage ? readUsage($, script, false).then(usage => core.setUsage(usage.reading, usage.problem, usage.at ?? now)) : undefined,
   ])
 }
@@ -166,16 +169,34 @@ async function recordDecision($: EngineInterface, script: string, record: Decisi
   }
 }
 
+async function recordNudge($: EngineInterface, script: string, nudge: Nudge): Promise<void> {
+  try {
+    const result = await $.process.run(['python3', '-I', script, 'nudge'], { stdin: JSON.stringify(nudge), timeoutMs: 5000 })
+    if (result.exitCode !== 0) logFailure($, `nudge record exited with code ${result.exitCode}`)
+  } catch (error) {
+    logFailure($, `nudge record failed: ${errorText(error)}`)
+  }
+}
+
+async function noticeText($: EngineInterface, script: string, items: Notice[]): Promise<string[]> {
+  for (const item of items) {
+    if (item.nudge) await recordNudge($, script, item.nudge)
+  }
+  return items.map(item => item.text)
+}
+
 export const register: Register = (on, options) => {
   let core: Core | undefined
   let script = ''
   let session: string | undefined
   let conversationChanged = false
+  let conversationVersion = 0
   // Track attempts separately from reading age: an unavailable or stale reading
   // must not trigger another subprocess on every call.
   let lastProbeAt = -Infinity
   let lastUsageProbeAt = -Infinity
   let mode: Mode = 'auto'
+  let codexStopPercent = DEFAULTS.codexStopPercent
   // Readings of the session's usage and main model are applied in the order they were asked for:
   // a reply that arrives after a newer reading was applied is dropped, whichever hook asked. A
   // usage update's reading counts as asked for when its event came. Claude Code raises an update
@@ -200,7 +221,8 @@ export const register: Register = (on, options) => {
     core.setMainModel(model, now)
   }
 
-  function refreshConversation(id: string | undefined): void {
+  function refreshConversation(version: number, id: string | undefined): void {
+    if (!conversationChanged || version !== conversationVersion) return
     session = id
     core?.newConversation(session)
     conversationChanged = false
@@ -229,6 +251,8 @@ export const register: Register = (on, options) => {
     script = $.plugin.root + '/scripts/crossfeed.py'
     const config = toConfig(options)
     mode = config.mode
+    codexStopPercent = config.codexStopPercent
+    conversationVersion += 1
     session = await $.session.id()
     core = createCore(config, script, session)
     conversationChanged = false
@@ -238,54 +262,61 @@ export const register: Register = (on, options) => {
     lastUsageProbeAt = -Infinity
     if (config.mode !== 'off') { lastProbeAt = now; lastUsageProbeAt = now }
     const [quota, lockout, usage] = await Promise.all([
-      config.mode === 'off' ? Promise.resolve({ reading: undefined, problem: undefined }) : readCodex($, script, now),
+      config.mode === 'off' ? Promise.resolve({ reading: undefined, problem: undefined, at: undefined }) : readCodex($, script),
       readLockout($, script),
       config.mode === 'off' ? Promise.resolve({ reading: undefined, problem: undefined, at: undefined }) : readUsage($, script, false),
     ])
-    core.setCodex(quota.reading, quota.problem)
+    core.setCodex(quota.reading, quota.problem, quota.at ?? now)
     core.setLockout(lockout)
     const usageAsk = ++usageAsked
-    applyUsage(usageAsk, claudeReading((await $.session.usage()).rateLimits), now)
+    applyUsage(usageAsk, claudeReading((await $.session.usage()).rateLimits), await clock($))
     const modelAsk = ++modelAsked
     applyModel(modelAsk, await mainModel($), now)
     if (mode !== 'off') core.setUsage(usage.reading, usage.problem, usage.at ?? now)
-    showStatus($, core, now)
+    await showStatus($, core, await clock($))
     return next(e)
   }).catch(failOpen)
 
   on('session.end', async (_$, e, next) => {
-    if (e.reason === 'clear' || e.reason === 'resume') conversationChanged = true
+    if (e.reason === 'clear' || e.reason === 'resume') {
+      conversationChanged = true
+      conversationVersion += 1
+    }
     return next(e)
   }).catch(failOpen)
 
   on('session.measure', async ($, e, next) => {
     const usageAsk = ++usageAsked
-    if (conversationChanged) refreshConversation(await sessionId($))
+    if (conversationChanged) refreshConversation(conversationVersion, await sessionId($))
     if (core) {
       const now = await clock($)
       applyUsage(usageAsk, claudeReading(e.rateLimits), now)
       const modelAsk = ++modelAsked
       applyModel(modelAsk, await mainModel($), now)
       await refreshReadings($, core, script, now, { codex: needsCodex(now), usage: needsUsage(now) })
-      showStatus($, core, now)
+      await showStatus($, core, await clock($))
     }
     return next(e)
   }).catch(failOpen)
 
   on('prompt.compose', async (_$, e, next) => {
     const result = await next(e)
-    if (!script) return result
-    return { sections: [...result.sections, { id: 'agent-crossfeed:policy', text: staticSection(script), scope: 'session' as const }] }
+    if (!script || mode === 'off') return result
+    return { sections: [...result.sections, { id: 'agent-crossfeed:policy', text: staticSection(script, codexStopPercent), scope: 'session' as const }] }
   }).catch(failOpen)
 
   on('prompt.submit', async ($, e, next) => {
-    if (conversationChanged) refreshConversation(await sessionId($))
-    const notices = !e.isMeta && !e.command ? core?.userPrompt(await clock($)) ?? [] : []
-    return next(notices.length ? { ...e, context: [...(e.context ?? []), ...notices] } : e)
+    const version = conversationVersion
+    if (conversationChanged) refreshConversation(version, await sessionId($))
+    if (e.isMeta || e.command || !core) return next(e)
+    const now = await clock($)
+    if (version !== conversationVersion) return next(e)
+    const notices = core.userPrompt(now)
+    return next(notices.length ? { ...e, context: [...(e.context ?? []), ...await noticeText($, script, notices)] } : e)
   }).catch(failOpen)
 
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
-    if (conversationChanged) refreshConversation(await sessionId($))
+    if (conversationChanged) refreshConversation(conversationVersion, await sessionId($))
     if (!core) return next(e)
     const now = await clock($)
     // A model-limit reading that arrives during the probes is judged against the main model.
@@ -295,7 +326,7 @@ export const register: Register = (on, options) => {
     // Take the session's own readings at decision time: a measure event may not have fired
     // yet in a session's first turn, and the main model may have changed during the probes.
     const usageAsk = ++usageAsked
-    applyUsage(usageAsk, claudeReading((await $.session.usage()).rateLimits), now)
+    applyUsage(usageAsk, claudeReading((await $.session.usage()).rateLimits), await clock($))
     const modelAsk = ++modelAsked
     applyModel(modelAsk, await mainModel($), now)
     // Decide at the time the decision is made, with no wait in between: a call that waited on
@@ -307,7 +338,7 @@ export const register: Register = (on, options) => {
     const record = core.lastRecord()
     const decision = core.lastDecision()
     // The decision may rest on readings newer than the ones the status line was drawn from.
-    showStatus($, core, decidedAt)
+    await showStatus($, core, decidedAt)
     if (!route) {
       try { $.ui.log(decision) } catch { /* Logging must not block the call. */ }
       // The record is written while the subagent starts, not before it.
@@ -329,16 +360,19 @@ export const register: Register = (on, options) => {
   }).catch(failOpen)
 
   on('tool.call', async ($, e, next) => {
-    if (conversationChanged) refreshConversation(await sessionId($))
+    const version = conversationVersion
+    if (conversationChanged) refreshConversation(version, await sessionId($))
     const ran = await next(e)
     // A refused call is not a hands-on step and must not use up the one reminder.
     if (ran.deny !== undefined || e.agentId !== undefined) return ran
     let now: number
     try { now = await clock($) } catch { return ran }
+    // A tool finishing after /clear has no counted step or notice in the new prompt.
+    if (version !== conversationVersion) return ran
     const note = core?.toolCall(String(e.tool), false, now)
     const notices = core?.takeNotices(now) ?? []
     if (note) notices.push(note)
-    return notices.length ? { ...ran, context: [...(ran.context ?? []), ...notices] } : ran
+    return notices.length ? { ...ran, context: [...(ran.context ?? []), ...await noticeText($, script, notices)] } : ran
   }).catch(failOpen)
 
   on('agent.spawn', async ($, e, next) => {
@@ -374,7 +408,7 @@ export const register: Register = (on, options) => {
       core.setUsage(usage.reading, usage.problem, usage.at ?? now)
       const bucket = core.bucketLockout(now)
       if (bucket) await $.process.run(['python3', '-I', script, 'lockout', '--reset-at', bucket.resetAt, '--bucket', bucket.bucket, ...(session ? ['--session', session] : [])])
-      showStatus($, core, now)
+      await showStatus($, core, now)
     }
     return next(e)
   }).catch(failOpen)
@@ -388,7 +422,7 @@ export const register: Register = (on, options) => {
     if (args === 'auto' || args === 'always' || args === 'off') {
       mode = args
       core.setMode(args)
-      showStatus($, core, now)
+      await showStatus($, core, now)
       return { text: `crossfeed mode: ${args} (this session)` }
     }
     return { text: 'usage: /crossfeed [status|report|auto|always|off]' }

@@ -15,7 +15,7 @@ def reply(value):
 
 def app_server():
     mode = os.environ.get("FAKE_CODEX_APPSERVER", "ok")
-    pidfile = os.environ.get("FAKE_CODEX_PIDFILE")
+    pidfile = os.environ.get("FAKE_CODEX_APPSERVER_PIDFILE")
     if pidfile:
         Path(pidfile).write_text(str(os.getpid()), encoding="utf-8")
     if mode in ("multiline", "long-stderr", "non-utf8"):

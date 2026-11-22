@@ -56,8 +56,8 @@ Constraints the design works under:
   work. Hence the headroom rule.
 - A Codex result is a claim. The model is told to check it, and jobs
   without a recorded check are counted as unchecked.
-- The system prompt must not change during a session, which would
-  invalidate the prompt cache.
+- Quota updates must preserve the prompt cache. Live readings go in
+  notices and refusals.
 - A failure of the plugin itself must not block the user's work.
 
 ## The decision
@@ -133,7 +133,7 @@ is not.
   `a = max(0, 90 - u) / max(R, 1)` is the pace that would end at 90%; while
   `F < 80` it falls by 0.10; between the two it stays.
 - A reset time that moves by more than one minute means a new window: the
-  readings and any queued notices are cleared and `p` returns to `p0`. A
+  samples and queued pressure and reserve notices are cleared and `p` returns to `p0`. A
   reading without a reset time, once the known reset time has passed, also
   starts over, with `p0 = 0`.
 - After a lockout `p0` is 0.3, on the assumption that the work that filled
@@ -150,14 +150,22 @@ is not.
 - Claude's weekly use `w` adds `b = 0.25 * clamp((w - 75) / 15, 0, 1)`.
   Pressure is `P = max(p, b)`.
 
+The all-models week also has a pace of its own. Its even-pace line is
+`L = 100 * clamp(1 - (reset - now) / 7 days, 0, 1)`. The week is full
+at 100% used, ahead at `w >= L + 5` or `w >= 90`, and on pace otherwise.
+The state is unknown if the latest applied usage reading omits the week,
+the reset is missing or has passed, or the reading was applied more than
+5 minutes ahead of the current clock. Within the same week there is no
+other age limit. An older percentage is a lower bound on use.
+
 The controller sees only usage that has been reported, and a subagent's
 usage arrives minutes after it starts. Several subagents started together
 can use most of a window before `p` moves. So calls are counted as well:
 when 2 eligible tier A or B calls have stayed on Claude in the last 10
 minutes of the session, the next call is decided with `P` taken as at least
 0.3. A call that something else then refuses, so that no subagent starts,
-is taken out of the count when the refusal arrives. Notices and the
-long-stretch reminder use `P` itself.
+is taken out of the count when the refusal arrives. A burst affects only
+subagent decisions.
 
 ### 4. Headroom: how much Codex quota is left?
 
@@ -165,13 +173,22 @@ long-stretch reminder use `P` itself.
 `codexStopPercent` option (default 85). For a window longer than 6 hours,
 with `v` its percent used and `D` the days to its reset (7 when unknown):
 
-`g = clamp((85 - v) / (10 + 10 * clamp(D / 7, 0, 1)), 0, 1)`
+`g = clamp((codexStopPercent - v) / (10 + 10 * clamp(D / 7, 0, 1)), 0, 1)`
 
 so hand-offs taper over the last 10 to 20 points, sooner when the reset is
 far away. A window of 6 hours or less gives 0 at 90% used and 1 below. With
-several windows the smallest value counts. `g` is 0 when Codex reported its
-limit, when the reading is more than 15 minutes old or dated that far ahead
-of the clock, or when there is none.
+several windows the smallest value counts, excluding any whose reset time
+has arrived. A fresh reported limit gives known headroom of 0. Absent a
+reported limit, an empty set of current windows gives unknown headroom.
+A missing reading or one dated more than 15 minutes from now also gives
+unknown headroom. Routing uses 0 for unknown headroom.
+
+For the surplus, take the longest Codex window over 360 minutes. It needs
+a future reset, a reading within 15 minutes of now and no reported limit.
+Let `E` be the elapsed fraction of that window, clamped to [0, 1].
+The surplus in percentage points is `codexStopPercent * E - usedPercent`.
+At 92.3% of the window elapsed, a stop of 85 and 40% used give about 38.5
+points. A surplus of at least 15 points is active when `g >= 0.5`.
 
 When `g` is 0 the plugin keeps the cause: no reading, a reading that is too
 old, Codex's reported limit, or the window that is used up. `/crossfeed
@@ -189,7 +206,10 @@ update never replaces a reading a call could still use, and nothing is
 read while the session is idle. The plugin waits 5 minutes after any
 attempt before the next, whichever event made it. A reading whose age is
 missing or not a number, or that is dated more than 5 minutes ahead of the
-clock, counts as no reading.
+clock, counts as no reading. The hook dates the reading when the probe
+answers, less its reported age (zero for an accepted future timestamp).
+An older reading cannot replace a newer one unless the held reading is
+dated more than 5 minutes ahead of the clock.
 
 ### 5. Model limits: is one model's weekly limit going too fast?
 
@@ -235,9 +255,9 @@ that family, or names none and the main loop runs on that family.
 
 - A subagent call that would run on it is decided with `P` taken as at
   least 0.3, so tier B goes to Codex when `g > 0`; tier A keeps its own
-  rule. The known limit also stands in for a missing Claude reading. When
-  the limit is what moved a tier B call (pressure without it is below
-  0.3), the command carries `--cause limit` and the job record keeps it.
+  rule. Only the call's family limit can stand in for a missing 5-hour
+  reading. The all-models week and Codex surplus still need that reading
+  to move a subagent call.
 - A subagent that still starts on Claude runs on the `premiumFallback`
   model (default `opus`; empty turns this off) when its type is
   `general-purpose` or `claude`, it is not a fork, and either it named no
@@ -252,13 +272,14 @@ that family, or names none and the main loop runs on that family.
   a resumed agent.
 - When the main loop runs on that family, one notice per session when it
   becomes `ahead` and one when it becomes `full`, delivered like the
-  notices below. It asks the model to keep planning, decisions and review,
-  to hand execution to Codex, and to tell the user once about `/model
-  <fallback>` with `/advisor <family>` (Claude Code's own setting for
-  consulting a stronger model at key moments); without a usable fallback
-  it suggests neither. A notice counts as sent only once it is delivered.
-  The long-stretch reminder also fires while that family is `ahead` or
-  `full`.
+  notices below. The ahead notice asks Claude to keep planning, decisions
+  and review and hand execution to Codex. The full notice reports that the
+  limit is used up and names the fallback if available or advises handing
+  execution to Codex. With a usable fallback for Fable, Opus or Sonnet,
+  either notice can suggest `/model <fallback>` with `/advisor <family>`.
+  A notice counts as sent only once it is delivered.
+  Both the family notice and the stretch reminder require the main-loop
+  headroom and reserve checks below.
 - After a rate-limit error, if the main loop's family is at 100% on a
   fresh reading, the ledger gets a lockout record for that limit, once
   per limit and reset time per session. These records never count as
@@ -266,23 +287,68 @@ that family, or names none and the main loop runs on that family.
 
 ### The decision
 
-In this order: mode `off` hands nothing off; so does a missing Claude
-reading (unknown is not free capacity) unless the call would run on a
-model limit that is `ahead` or `full`; so does `g = 0`; tier C stays; mode
-`always` hands off every remaining call; tier A goes when `g >= 0.5`; tier B
-goes when `P >= 0.3`, which a burst (section 3) or a model limit (section
-5) can supply.
+**Subagents.** An eligible call stays in `off` mode or at zero headroom.
+It also stays without a 5-hour reading unless its family limit is ahead
+or full. Tier C always stays. Mode `always` hands off the remaining calls.
+In `auto`, tier A goes at `g >= 0.5` and tier B at `P >= 0.3`. A burst, the call's
+family limit ahead or full, the all-models week ahead or full, or an
+active Codex surplus can each raise effective pressure to 0.3.
 
-Two more signals reach the model, each once per window or stretch:
+To attribute a tier B hand-off in `auto`, crossfeed asks whether pressure
+and the burst alone would have handed it off, keeping the usual 5-hour
+reading requirement. If the call would have stayed, the first applicable
+cause is `limit`, `account-week` or `codex-surplus`, in that order.
+The command passes it as `--cause`. Other hand-offs have no recorded cause.
 
-- when `P` first reaches 0.3, and when `u` first reaches 90, a one-line
-  notice is attached to the next tool result in the main loop or to the
-  user's next prompt, whichever comes first. A refused tool call, a slash
-  command and a meta prompt do not carry it;
-- after `stretchCalls` hands-on tool calls (default 12) with no user prompt
-  in between, while `P >= 0.3` or the main loop's model limit is `ahead`
-  or `full`, one reminder is attached to a tool result. Refused calls are
-  not counted.
+**Main loop.** Hand-offs are on with `g >= 0.5`, steering enabled, no
+5-hour reading at or above 90%, and at least one of these reasons:
+
+- `pressure` when there is a 5-hour reading and `P >= 0.3`
+- `limit` when the main model's family is ahead or full
+- `account-week` when the all-models week is ahead or full
+- `codex-surplus` when the surplus is active
+- `always` in that mode
+
+A missing 5-hour reading leaves the reserve inactive. The other reasons
+can still turn on main-loop hand-offs. The status line marks the all-models
+week `ahead` for both ahead and full, and shows the active Codex surplus
+rounded down to whole points. `/crossfeed status` shows the account-week
+state and pace, surplus or reason it is unavailable, and current hand-off
+reasons. It evaluates the tier lines for the main model's family.
+
+The pressure and family notices use their own reasons. An all-models
+week ahead or full, active surplus or `always` produces a balance-on
+notice unless the conversation already received one as its last balance
+notice. It names the applicable facts. At the start of each task, before
+the first command, Claude is asked to give Codex execution with a checkable
+result. Examples include fixing failing tests, a change across several
+files, three or more dependent shell steps, and searches across many files.
+Claude keeps the conversation, design and UX decisions, steps requiring
+Claude-only tools and edits under about 20 lines. The brief gives the
+goal, prior decisions, paths, constraints, check and expected answer.
+
+After a balance-on notice, known headroom below 0.5 triggers balance-off.
+With enough headroom, balance-off requires all reasons to have cleared,
+an `ok` account week below `L + 2` and a known surplus below 10 points.
+These lower thresholds apply only to withdrawing the notice. Unknown
+readings alone leave the last notice in place. Balance-off asks Claude
+to do execution itself unless a subagent call is refused. Selecting
+`off` clears the remembered balance notice silently.
+
+The stretch reminder fires once per ordinary user prompt, on the first
+counted main-loop tool result at or after `stretchCalls` (default 12)
+when hand-offs are on. Bash, Edit, Write, Read, Grep, Glob and NotebookEdit
+count. The reminder lists the active reasons and gives a `run --kind task`
+command. Refused calls and tools run by a subagent do not count.
+
+At 90% of the 5-hour window, reserve takes precedence at delivery. Claude
+gets the reserve notice once per window and is asked to finish the current
+step, keep a hand-off note and start no new autonomous work. Pressure,
+family, balance and stretch advice is suppressed while in reserve.
+Subagent admission uses its own rules above. Pressure, reserve, family and
+balance notices can arrive with a main-loop tool result or an ordinary
+user prompt. A refused tool call, slash command or meta prompt does not
+carry them. Prompt submission uses the readings already held.
 
 Notices and the stretch count belong to a conversation. Claude Code reports
 `/clear` and a resume as the end of a session without a new start; after
@@ -293,8 +359,9 @@ session id. Readings and the pressure state are kept.
 
 1. The plugin saves the subagent's brief to a file through the dispatcher
    (`crossfeed.py stash`).
-2. It refuses the subagent call. The refusal text holds the tier and its
-   reason, both quota readings, and one command to run.
+2. It refuses the subagent call. The refusal text holds the tier, the
+   reason for the hand-off and one command to run. The explanation uses the readings from
+   the decision, including the weekly figures when they caused the hand-off.
 3. The main agent starts that command as a background shell command and is
    notified when it exits. Waiting costs no model turns.
 4. The dispatcher runs `codex exec` on the brief and prints the result,
@@ -313,9 +380,9 @@ If saving the brief fails, the call is still refused, and the command takes
 the brief on standard input through a quoted heredoc whose delimiter is
 checked to be absent from the brief.
 
-The system-prompt section is fixed text. Live numbers enter only at the
-tail of the conversation: in the refusal, in notices, in tool-result
-context.
+The system-prompt section depends only on the script path and configured
+stop in `auto` and `always`. In `off` the hook omits it. Live readings
+appear in refusals and notices.
 
 ## The dispatcher
 
@@ -334,8 +401,9 @@ plugin.
   Codex was installed in. When the directory Codex was found in is not on
   the child's `PATH`, it is put first, since a Codex installed through npm
   starts `node` from there. A `$CROSSFEED_CODEX` that is not an executable
-  file is an error, not a reason to look further. When Codex is not found,
-  `run` exits with 127 and says where it looked.
+  file is an error, not a reason to look further. If the launch passes
+  the quota guard and Codex cannot be found, `run` exits with 127 and
+  says where it looked.
 - **Sandbox.** It asks Codex for its read-only sandbox by default and for
   `workspace-write` in the given directory with `--write`. What those
   sandboxes permit, including network access, is decided by Codex and the
@@ -345,9 +413,33 @@ plugin.
   40 lines with the conclusion, the evidence and what is not done. These are
   instructions to Codex, not a mechanism.
 - **Effort.** Reasoning effort defaults to `high` and is an option.
-- **Time limit.** 30 minutes by default. On timeout, or when the dispatcher
-  receives SIGINT, SIGTERM or SIGHUP, the Codex process group is stopped and
-  the job is recorded as `timeout` or `interrupted`.
+- **Model.** On a fresh job, a nonempty `--model` wins. Otherwise
+  `--kind review`, `--kind research` and `--kind subagent --tier B` use
+  `gpt-6.2-astra` if it appears under `models[].slug` in
+  `$CODEX_HOME/models_cache.json` (default directory `~/.codex`).
+  `CROSSFEED_JUDGMENT_MODEL` replaces the slug, and an empty value
+  disables the choice. If the slug is absent, the cache is unreadable
+  or malformed, or the work is another kind (default `task`), Codex uses
+  its own default. A resume keeps the prior model selection and rejects
+  `--model`. To try another model after Codex rejects a cached model,
+  start a fresh job with `--model`.
+- **Launch guard.** After validating the brief and arguments, `run`
+  reads quota before allocating a job directory, including for a resume.
+  A missing reading or one dated more than 5 minutes ahead prints a quota
+  warning and the launch proceeds. A window counts until its reset, or,
+  without a reset time, when the reading is at most 15 minutes old.
+  A reported limit stops the launch only with a reading that fresh and at
+  least one counted window. Any counted window of at most 360 minutes
+  stops the launch at 90% used. Longer windows stop it at `--codex-stop`
+  (default 85, finite, greater than 0 and at most 100). A stop prints
+  the reason, records it and exits 75. The plugin uses 85 for an invalid
+  `codexStopPercent` and includes the flag in every suggested `run`
+  command, including resumes, when the configured value differs from 85.
+- **Time limit.** 30 minutes by default for Codex execution after the
+  quota check. During an allocated job, a timeout or a handled SIGINT,
+  SIGTERM or SIGHUP stops the Codex process group if it started. The job
+  is recorded as `timeout` or `interrupted`. An interrupt during
+  preflight can end `run` without a job record.
 - **Failures are told apart.** Codex's own usage-limit message gives exit
   code 75 and a line telling the model to do the work itself; hand-offs stop
   once a later quota reading reports the limit. Any other failure of a Codex
@@ -379,6 +471,18 @@ plugin.
   `--bucket <label>` is a model-limit lockout. `lockout --last` prints the
   reset time of the newest 5-hour lockout that has one. `run --cause
   <word>` stores why a job was handed off.
+  Decisions include `account_week` (percent, even-pace line and state) and
+  `codex_surplus` in points to one decimal, with null for missing data.
+  Jobs record the selected model (null for the Codex default) and
+  `model_source` (`flag`, `judgment`, `codex-default` or `resume`).
+  A resume copies the earlier model field and continues the Codex thread
+  without passing a new model flag.
+  A `stop` line records the session, kind, tier, prior job on a resume,
+  reason and longest counted weekly window's use when available. The
+  plugin sends `nudge` a JSON object on standard input for each delivered
+  `balance-on`, `balance-off` or `stretch`. The line records the session,
+  kind, reasons and the call count (null for balance notices). Writes are
+  best effort on both prompt and tool-result delivery.
 - **Claude usage.** `claude-usage` reads model-scoped weekly limits as
   section 5 says. It finds Claude Code through `$CROSSFEED_CLAUDE`, then
   `PATH`, then `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`.
@@ -389,8 +493,8 @@ plugin.
 
 The data directory is `$CROSSFEED_HOME`, else `$CLAUDE_CONFIG_DIR/crossfeed`,
 else `~/.claude/crossfeed`. Exit codes of `run`: 0 done, 1 failed, 2 usage
-error, 75 Codex usage limit, 124 timeout, 127 Codex not found, 130
-interrupted.
+error, 75 launch stopped or Codex usage limit, 124 timeout, 127 Codex not
+found, 130 for an interrupt handled during an allocated job.
 
 ## Architecture
 
@@ -432,9 +536,17 @@ If a hook throws, it logs the failure and lets the original event continue.
   off, including any that another hook refused afterwards);
 - **read-only results**: how many successful read-only jobs the model
   rated as used, partly used or not used, and how many it did not rate;
-- **model limits**: lockouts per limit and the time from each to its reset;
-  subagents moved to a cheaper model; jobs handed off because of a model
-  limit.
+- **model limits**: lockouts per limit and the time from each to its reset,
+  plus subagents moved to a cheaper model.
+- **jobs handed off because of** a model limit, account week or Codex
+  surplus. Only fresh jobs count. A resume inherits the cause. JSON keeps
+  `limit_jobs` and adds `account_week_jobs` and `codex_surplus_jobs`.
+- **jobs by model** counts all recorded jobs, including resumes. A missing
+  model name counts under `Codex default`.
+- **launches stopped at the Codex stop** counts guard refusals. These
+  launches have no job record.
+- **nudges** counts balance-on notices, balance-off notices and stretch
+  reminders separately.
 
 Compare a week with crossfeed against a week without. Time locked out
 should fall; most checked jobs should pass their first check in each tier;
@@ -446,6 +558,13 @@ change the options or open an issue with the numbers.
 
 - No measurement yet shows that hand-offs reduce lockouts, or what they
   cost in Claude usage.
+- Astra's weight in the Codex weekly allowance has yet to be measured.
+  How often Claude follows the start-of-task rule is also unknown.
+- The 5-point all-models pace margin and the 15-point Codex surplus are
+  judgment calls. Concurrent launches can each pass the guard before
+  either job's usage appears in a reading.
+- Switching to or from `off` changes the next composed prompt and may
+  cause a cache miss.
 - In a very heavy window, demand can be several times the window's capacity
   and only part of it can move.
 - The fit rules are keyword heuristics. They will misfile some briefs.
@@ -455,9 +574,11 @@ change the options or open an issue with the numbers.
 - A Codex job starts with none of the conversation. A thin brief gives a
   poor result.
 - Claude's reading comes from its last API response and Codex's from its
-  app server, with a session-log fallback. Either can be missing; then
-  nothing is handed off, except that a fresh model-limit reading that is
-  `ahead` or `full` stands in for a missing Claude reading (section 5).
+  app server, with a session-log fallback. Unknown Codex headroom blocks
+  hand-offs to Codex. Without a 5-hour reading, an ahead or full call-family
+  limit can still permit subagent routing. Weekly signals or `always`
+  can still prompt main-loop hand-offs with sufficient headroom.
+  Standalone `run` proceeds on unknown quota.
 - Calls are counted per session. Subagents started from two sessions at
   the same time are not seen as one burst, and subagents that are already
   running cannot be moved.
@@ -469,11 +590,8 @@ change the options or open an issue with the numbers.
   asks the model to hand off execution and suggests `/model` and
   `/advisor`; the user decides. Whether advisor calls count toward the
   advised model's weekly limit has not been measured.
-
-## Planned
-
-Continuity: when Claude is locked out anyway, continue the task on Codex
-from a hand-off note and let Claude review the result after the reset.
+- A Claude lockout interrupts the conversation. Hand-offs move individual
+  tasks while Claude can still coordinate and review them.
 
 ## References
 
