@@ -27,8 +27,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 PREAMBLE_READ = (
-    "Work only inside the given directory. Never push, commit or post to any service. "
-    "Print no secrets. Answer in at most 40 lines with the conclusion, the evidence "
+    "The given directory is your workspace: make any changes only inside it. You may read "
+    "the files and directories the brief names, wherever they are. "
+    "Never push, commit or post to any service. Print no secrets. Answer in at most 40 lines with the conclusion, the evidence "
     "(file and line, or command output), and what is not done."
 )
 PREAMBLE_WRITE = PREAMBLE_READ + (
