@@ -318,16 +318,18 @@ here `brief.md`, and use the job id that `run` prints:
 ```bash
 python3 -I scripts/crossfeed.py run --tier A --dir "$PWD" --write < brief.md
 python3 -I scripts/crossfeed.py check 20260101-120000-ab12 -- pytest -q
-python3 -I scripts/crossfeed.py run --kind review --dir "$PWD" < review.md
+python3 -I scripts/crossfeed.py run --kind review --artifact draft-v1 --dir "$PWD" < review.md
 python3 -I scripts/crossfeed.py used 20260101-120500-cd34 partly
+python3 -I scripts/crossfeed.py receipt draft-v1 --path draft.md --json
 python3 -I scripts/crossfeed.py quota
 python3 -I scripts/crossfeed.py report
 ```
 
-`run` puts a fixed preamble before the brief (stay in the directory, never
-push, commit or post, answer in at most 40 lines), runs `codex exec` asking
-for Codex's read-only sandbox, or for `workspace-write` with `--write`, and
-prints the result capped at 60 lines. For a write job in a git repository it
+`run` tells Codex to keep changes inside the workspace, permits reads of
+paths named in the brief, forbids pushing, committing or posting, and
+requests an answer of at most 40 lines. It runs `codex exec` with the
+read-only sandbox by default or `workspace-write` with `--write`, and
+prints up to 60 lines of the result. For a write job in a git repository it
 compares the modified and untracked files before and after, lists the ones
 that changed, and warns when `HEAD` moved. Jobs run with `--worktree` and
 directories outside git get no change list. `--brief-file PATH` reads the
@@ -344,6 +346,37 @@ value disables the choice. If the judgment model is absent or the cache
 cannot be read, crossfeed uses Codex's own default. Other kinds of work,
 including `task` (the default kind), also use that default unless you
 supply `--model`. `run --resume <job>` keeps the prior model selection.
+
+- `--artifact ID` labels jobs for the same draft or other artifact. Use
+  1 to 64 ASCII letters, digits, dots, underscores or hyphens. `run`
+  prints the round, one more than the number of earlier successful jobs
+  with the same label and kind. A resume inherits the label if present.
+  You can repeat the selected job’s label or choose a label if that job has none.
+  Use `--kind review` again when the resumed job is a review.
+- `--role-file PATH` puts a UTF-8 Markdown role between the preamble and
+  the brief. It accepts an optional BOM and strips opening YAML
+  frontmatter delimited by `---` lines, so you can use a file from
+  `~/.claude/agents/`. The file must be at most 64 KiB and contain a
+  nonempty body. `brief.md` stores the brief alone. Use the flag on the
+  first turn of a thread.
+- `--output-schema PATH` passes a JSON object from a file to Codex as its
+  output schema. Codex writes the structured final message to `result.md`.
+  The flag works on fresh jobs and resumes with Codex CLI 0.170.0. Supply
+  it on each turn that needs the schema.
+
+`receipt ID` looks up the latest successful `review` for an artifact.
+Use `--kind KIND` to select a different kind or `--kind any` to look across
+all kinds. The receipt includes the job ID, kind, round, timestamps, model,
+latest `used` rating, completed rounds for that kind, and paths to
+`brief.md` and `result.md`. The receipt takes its verdict from a string
+`verdict` in a JSON object in `result.md`. Run the review with
+`--output-schema` to produce that result. If `result.md` lacks a JSON object with a string `verdict`, the receipt prints `none` in text output and `null` in JSON output.
+Pass `--path PATH` for each file whose modification time you want checked.
+A directory argument checks only the directory’s own modification time.
+`--json` prints one object with `stale` and `stale_paths` alongside the
+job details. Receipt exit codes are 0 for
+a match with no stale paths, 1 for no match, 2 for bad input such as a
+missing or empty path, and 3 for a match with stale paths.
 
 Jobs Claude starts itself use `run`'s defaults of `--effort high` and
 `--timeout 30` unless the command specifies other values. The timeout

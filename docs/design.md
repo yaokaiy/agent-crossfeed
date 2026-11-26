@@ -409,9 +409,10 @@ plugin.
   sandboxes permit, including network access, is decided by Codex and the
   user's Codex configuration.
 - **Preamble.** Every brief is preceded by fixed rules: stay in the
-  directory; never push, commit or post; print no secrets; answer in at most
-  40 lines with the conclusion, the evidence and what is not done. These are
-  instructions to Codex, not a mechanism.
+  directory for changes, read the paths named in the brief, never push,
+  commit or post, print no secrets, and answer in at most 40 lines with
+  the conclusion, the evidence and what is not done. The preamble gives
+  Codex instructions within its configured sandbox.
 - **Effort.** Reasoning effort defaults to `high` and is an option.
 - **Model.** On a fresh job, a nonempty `--model` wins. Otherwise
   `--kind review`, `--kind research` and `--kind subagent --tier B` use
@@ -495,6 +496,24 @@ The data directory is `$CROSSFEED_HOME`, else `$CLAUDE_CONFIG_DIR/crossfeed`,
 else `~/.claude/crossfeed`. Exit codes of `run`: 0 done, 1 failed, 2 usage
 error, 75 launch stopped or Codex usage limit, 124 timeout, 127 Codex not
 found, 130 for an interrupt handled during an allocated job.
+
+### Artifact rounds and receipts
+
+Job records store `artifact` and `round`, both null for an unlabelled job.
+For a labelled job, the dispatcher assigns the round under the ledger lock
+when it appends the record. It adds one to the count of earlier `done`
+jobs with that artifact and kind. Failed or interrupted attempts leave
+that round available for the next attempt. `role_file` and `output_schema`
+store absolute paths for files supplied on that turn, or null. The role
+body goes into the Codex prompt between the preamble and brief.
+
+`receipt` selects the last matching `done` job in ledger order and uses
+the last `use` rating for that job. It takes the verdict from a string
+`verdict` in a JSON object in `result.md`, or returns null otherwise.
+Run the review with `--output-schema` to produce a structured verdict.
+A checked path is stale when its modification time in epoch nanoseconds
+is strictly later than `started` converted to epoch nanoseconds. Older
+ledger entries without labels still count in `report`.
 
 ## Architecture
 

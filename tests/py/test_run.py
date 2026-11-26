@@ -1,5 +1,6 @@
 import datetime
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import os
@@ -89,6 +90,155 @@ class RunTests(CrossfeedCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.records()[-1]["brief_file"], path)
 
+    def test_artifact_round_counts_only_done_jobs_of_the_same_kind(self):
+        crossfeed = load_crossfeed()
+        for status, kind, artifact in (
+            ("done", "review", "draft.v1_2-3"), ("failed", "review", "draft.v1_2-3"),
+            ("timeout", "review", "draft.v1_2-3"), ("interrupted", "review", "draft.v1_2-3"),
+            ("done", "research", "draft.v1_2-3"), ("done", "review", "another-draft"),
+        ):
+            crossfeed.append_ledger({"type": "job", "id": "prior-{}-{}-{}".format(status, kind, artifact),
+                                     "status": status, "kind": kind, "artifact": artifact})
+        args = ["--kind", "review", "--artifact", "draft.v1_2-3"]
+        failed = self.run_job(args, mode="fail")
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertEqual(self.records()[-1]["round"], 2)
+        done = self.run_job(args)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(b"[crossfeed] artifact draft.v1_2-3 round 2\n", done.stdout)
+        record = self.records()[-1]
+        self.assertEqual((record["artifact"], record["round"]), ("draft.v1_2-3", 2))
+        state = json.loads((self.job_dir() / "state.json").read_text())
+        self.assertEqual((state["artifact"], state["round"]), ("draft.v1_2-3", 2))
+
+    def test_concurrent_artifact_rounds_follow_ledger_order(self):
+        args = ["--kind", "review", "--artifact", "draft"]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(self.run_job, [args, args]))
+        for result in results:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([record["round"] for record in self.records()], [1, 2])
+
+    def test_resume_inherits_artifact_and_rejects_conflict(self):
+        self.assertEqual(self.run_job(["--kind", "review", "--artifact", "draft"]).returncode, 0)
+        first = self.records()[-1]
+        resume = ["--kind", "review", "--resume", first["id"]]
+        for number, flags in enumerate(([], ["--artifact", "draft"]), start=2):
+            result = self.run_job(resume + flags)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = self.records()[-1]
+            self.assertEqual((record["artifact"], record["round"]), ("draft", number))
+        result = self.run_job(resume + ["--artifact", "other"])
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, b"crossfeed: --artifact cannot be overridden with --resume\n")
+        self.assertEqual(len(self.records()), 3)
+
+    def test_resume_can_label_an_unlabelled_job(self):
+        self.assertEqual(self.run_job().returncode, 0)
+        first = self.records()[-1]
+        result = self.run_job(["--resume", first["id"], "--artifact", "draft"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = self.records()[-1]
+        self.assertEqual((record["artifact"], record["round"]), ("draft", 1))
+
+    def test_run_rejects_invalid_artifact_ids(self):
+        for artifact in ("", "a" * 65, "a/b", "two words", "café", "draft\n"):
+            with self.subTest(artifact=artifact):
+                result = self.run_job(["--artifact", artifact])
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b"crossfeed: artifact ID", result.stderr)
+        self.assertEqual(self.records(), [])
+        self.assertFalse((self.home / "jobs").exists())
+
+    def test_role_file_sends_exact_prompt_bytes_and_saves_only_brief(self):
+        preamble = load_crossfeed().PREAMBLE_READ.encode("utf-8")
+        role_file = self.root / "role.md"
+        brief = b"Retain brief whitespace \r\n\r\n"
+        body = "\nReview café. \n".encode("utf-8")
+        crlf_body = body.replace(b"\n", b"\r\n")
+        for content, expected in (
+            (b"---\nname: reviewer\n---\n" + body, body),
+            (b"---\r\nname: reviewer\r\n---\r\n" + crlf_body, crlf_body),
+            (b"\xef\xbb\xbf---\nname: reviewer\n---\n" + body, body),
+            (b"  ---\n" + body, b"  ---\n" + body),
+            (b"x" * 65536, b"x" * 65536),
+        ):
+            with self.subTest(prefix=content[:40]):
+                role_file.write_bytes(content)
+                result = self.run_job(["--role-file", "role.md"], brief=brief, mode="echo")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.job_dir() / "brief.md").read_bytes(), brief)
+                self.assertEqual((self.job_dir() / "result.md").read_bytes(),
+                                 b"\n\n".join((preamble, expected, brief)))
+                self.assertEqual(self.records()[-1]["role_file"], str(role_file.resolve()))
+
+    def test_invalid_role_files_are_usage_errors(self):
+        role = self.root / "role.md"
+        for content, error in (
+            (None, b"requires an existing file"),
+            (b"", b"must contain a role"),
+            (b"---\nname: reviewer\n---\n  \r\n", b"must contain a role"),
+            (b"---\nname: reviewer\n--- \n", b"unterminated frontmatter"),
+            (b"x" * 65537, b"exceeds 64 KiB"),
+            (b"\xff", b"must be UTF-8"),
+        ):
+            with self.subTest(content=content and content[:40]):
+                if content is not None:
+                    role.write_bytes(content)
+                result = self.run_job(["--role-file", str(role)])
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(error, result.stderr)
+        self.assertEqual(self.records(), [])
+
+    def test_resume_rejects_role_file(self):
+        role = self.root / "role.md"
+        role.write_text("Review the draft.", encoding="utf-8")
+        self.assertEqual(self.run_job(["--role-file", str(role)]).returncode, 0)
+        first = self.records()[-1]
+        resume = ["--resume", first["id"]]
+        result = self.run_job(resume + ["--role-file", str(role)])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b"--role-file cannot be combined with --resume", result.stderr)
+        self.assertEqual(self.run_job(resume).returncode, 0)
+        self.assertIsNone(self.records()[-1]["role_file"])
+
+    def test_invalid_output_schemas_are_usage_errors(self):
+        schema = self.root / "schema.json"
+        for content in (None, b"", b"\xef\xbb\xbf{}", b"{invalid}", b"[]", b'{"value": NaN}'):
+            with self.subTest(content=content):
+                if content is not None:
+                    schema.write_bytes(content)
+                result = self.run_job(["--output-schema", str(schema)])
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(b"crossfeed: --output-schema", result.stderr)
+        self.assertEqual(self.records(), [])
+        self.assertFalse((self.home / "jobs").exists())
+
+    def test_output_schema_reaches_fresh_and_resume_commands_when_supplied(self):
+        schema = self.root / "schema opts.json"
+        schema.write_text('{"type": "object"}', encoding="utf-8")
+        work = self.root / "work"
+        work.mkdir()
+        argv_file = self.root / "schema-argv.json"
+        env = {"FAKE_CODEX_ARGV": str(argv_file)}
+        flags = ["--output-schema", schema.name]
+        result = self.run_job(["--dir", str(work)] + flags, **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        first = self.records()[-1]
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                if resume:
+                    result = self.run_job(["--resume", first["id"]] + flags, **env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                argv = json.loads(argv_file.read_text())
+                self.assertEqual(argv[1:3], ["exec", "resume" if resume else "--skip-git-repo-check"])
+                self.assertEqual(argv[argv.index("--output-schema") + 1], str(schema.resolve()))
+                self.assertEqual(self.records()[-1]["output_schema"], str(schema.resolve()))
+        result = self.run_job(["--resume", first["id"]], **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--output-schema", json.loads(argv_file.read_text()))
+        self.assertIsNone(self.records()[-1]["output_schema"])
+
     def test_write_job_footer(self):
         result = self.run_job(["--write"])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -115,7 +265,7 @@ class RunTests(CrossfeedCase):
         self.assertEqual(set(record), {
             "v", "type", "ts", "id", "session", "kind", "tier", "dir", "sandbox", "worktree",
             "effort", "model", "model_source", "cause", "started", "wall_s", "status", "exit", "tokens", "codex_thread",
-            "changed", "head_moved", "resume_of", "brief_file",
+            "changed", "head_moved", "resume_of", "brief_file", "artifact", "round", "role_file", "output_schema",
         })
         self.assertEqual(record["type"], "job")
         self.assertEqual(record["status"], "done")
@@ -123,7 +273,10 @@ class RunTests(CrossfeedCase):
         self.assertEqual(record["tier"], "A")
         self.assertEqual(record["kind"], "subagent")
         self.assertEqual(record["session"], "session-1")
+        self.assertRegex(record["started"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\Z")
         self.assertIsNone(record["brief_file"])
+        for field in ("artifact", "round", "role_file", "output_schema"):
+            self.assertIsNone(record[field])
         self.assertEqual(record["tokens"], {"input": 12000, "cached": 500, "output": 321, "reasoning": 21})
         self.assertTrue(record["codex_thread"])
         self.assertEqual(record["effort"], "high")

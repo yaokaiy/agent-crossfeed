@@ -4,6 +4,28 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `run --artifact ID` links jobs by label and kind and prints their round.
+- `receipt ID` finds the latest successful review for an artifact and can
+  check path modification times. Use `--kind any` to include all job kinds.
+  For a verdict, run the review with `--output-schema` to produce a JSON
+  object with a string `verdict`. Other results have no verdict.
+- `run --role-file PATH` reuses a Markdown role such as a Claude Code
+  agent definition in a fresh Codex job.
+- `run --output-schema PATH` requests structured final output from Codex
+  on fresh jobs and resumes.
+
+### Changed
+
+- The Codex preamble permits reading paths the brief names outside the
+  job directory.
+- New job records include six fractional digits in `started`. Readers of
+  mixed ledgers should accept both `YYYY-MM-DDTHH:MM:SSZ` and
+  `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
+
 ## 0.3.0 - 2026-11-21
 
 ### Added

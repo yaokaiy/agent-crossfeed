@@ -81,6 +81,10 @@ def execute():
         Path(os.environ["FAKE_CODEX_ARGV"]).write_text(json.dumps(sys.argv), encoding="utf-8")
     if os.environ.get("FAKE_CODEX_CWD"):
         Path(os.environ["FAKE_CODEX_CWD"]).write_text(os.getcwd(), encoding="utf-8")
+    if "--output-schema" in sys.argv:
+        schema = Path(sys.argv[sys.argv.index("--output-schema") + 1])
+        assert schema.is_absolute()
+        assert isinstance(json.loads(schema.read_text(encoding="utf-8")), dict)
     result = Path(sys.argv[sys.argv.index("-o") + 1])
     brief = sys.stdin.buffer.read()
     if mode == "hang":

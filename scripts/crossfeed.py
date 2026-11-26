@@ -43,6 +43,7 @@ CODEX_NOT_FOUND = -127
 
 CLAUDE_PATHS = ("~/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude")
 MODEL_FAMILIES = ("fable", "opus", "sonnet", "haiku")
+ARTIFACT_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 USAGE_LINE = re.compile(
     r"^\s*Current week \((?P<label>[^)]+)\):\s*(?P<pct><1|\d+(?:\.\d+)?)%\s*used\s*"
     r"(?:[·|\-]\s*)?resets\s+(?P<when>.+?)\s*$", re.IGNORECASE)
@@ -363,6 +364,13 @@ def read_ledger() -> list:
 def _last_job(job_id):
     return next((record for record in reversed(read_ledger()) if isinstance(record, dict)
                  and record.get("type") == "job" and record.get("id") == job_id), None)
+
+
+def _artifact_jobs(records, artifact):
+    return [record for record in records if isinstance(record, dict)
+            and record.get("type") == "job" and record.get("artifact") == artifact
+            and record.get("status") == "done" and isinstance(record.get("id"), str)
+            and isinstance(record.get("kind"), str)]
 
 
 def write_state(job_dir: Path, state: dict) -> None:
@@ -715,17 +723,17 @@ def _execute_job(command, directory, job_dir, brief, timeout_s, interrupted):
 def _codex_command(args, job_dir, resume_thread):
     sandbox = "workspace-write" if args.write else "read-only"
     if resume_thread:
-        return ["codex", "exec", "resume", resume_thread, "--skip-git-repo-check", "--json",
-                "-c", 'sandbox_mode="{}"'.format(sandbox),
-                "-c", 'model_reasoning_effort="{}"'.format(args.effort),
-                "-o", str(job_dir / "result.md"), "-"]
-    command = ["codex", "exec", "--skip-git-repo-check", "--json", "-s", sandbox,
-               "-C", args.dir, "-c", 'model_reasoning_effort="{}"'.format(args.effort),
-               "-o", str(job_dir / "result.md")]
-    if args.model:
-        command.extend(["-m", args.model])
-    if args.worktree:
-        command.append("--worktree")
+        command = ["codex", "exec", "resume", resume_thread, "--skip-git-repo-check", "--json",
+                   "-c", 'sandbox_mode="{}"'.format(sandbox)]
+    else:
+        command = ["codex", "exec", "--skip-git-repo-check", "--json", "-s", sandbox, "-C", args.dir]
+        if args.model:
+            command.extend(["-m", args.model])
+        if args.worktree:
+            command.append("--worktree")
+    command.extend(["-c", 'model_reasoning_effort="{}"'.format(args.effort), "-o", str(job_dir / "result.md")])
+    if args.output_schema is not None:
+        command.extend(["--output-schema", args.output_schema])
     return command + ["-"]
 
 
@@ -759,6 +767,8 @@ def _print_job(record, job_dir, result, errors, timeout_minutes, change_list, ch
     print("[crossfeed] job {} {} in {}m{:02d}s; tier {}; kind {}; sandbox {}; codex tokens {}".format(
         record["id"], record["status"], minutes, seconds, record["tier"], record["kind"],
         record["sandbox"], record["tokens"]["input"] + record["tokens"]["output"]))
+    if record["artifact"] is not None:
+        print("[crossfeed] artifact {} round {}".format(record["artifact"], record["round"]))
     if record["status"] == "done" and error_events:
         print("[crossfeed] codex reported {} recoverable error event(s); see {}".format(
             error_events, job_dir / "events.jsonl"))
@@ -885,12 +895,64 @@ def _judgment_model():
     return None
 
 
+def _validate_artifact(artifact):
+    if ARTIFACT_ID.fullmatch(artifact) is None:
+        raise ValueError("artifact ID must be 1 to 64 ASCII letters, digits, dots, underscores or hyphens")
+
+
+def _input_file(value, flag):
+    try:
+        path = Path(value).expanduser().resolve()
+        if path.is_file():
+            return path
+    except (OSError, RuntimeError, ValueError) as error:
+        raise ValueError("{} could not resolve file: {}".format(flag, value)) from error
+    raise ValueError("{} requires an existing file: {}".format(flag, value))
+
+
+def _read_role(path):
+    try:
+        with path.open("rb") as stream:
+            payload = stream.read(65537)
+    except OSError as error:
+        raise ValueError("--role-file could not be read: {}".format(path)) from error
+    if len(payload) > 65536:
+        raise ValueError("--role-file exceeds 64 KiB")
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        raise ValueError("--role-file must be UTF-8") from error
+    opening = re.match(r"---(?:\r?\n|\Z)", text)
+    if opening:
+        closing = re.search(r"^---(?:\r?\n|\Z)", text[opening.end():], re.MULTILINE)
+        if closing is None:
+            raise ValueError("--role-file has unterminated frontmatter")
+        text = text[opening.end() + closing.end():]
+    if not text.strip():
+        raise ValueError("--role-file must contain a role")
+    return text.encode("utf-8")
+
+
+def _output_schema_path(value):
+    path = _input_file(value, "--output-schema")
+    try:
+        with path.open(encoding="utf-8") as stream:
+            schema = json.load(stream, parse_constant=_reject_json_constant)
+    except (OSError, ValueError, RecursionError) as error:
+        raise ValueError("--output-schema must contain a JSON object: {}".format(path)) from error
+    if not isinstance(schema, dict):
+        raise ValueError("--output-schema must contain a JSON object: {}".format(path))
+    return str(path)
+
+
 def _prepare_run(args):
     thread = None
     if not _finite_number(args.codex_stop) or not 0 < args.codex_stop <= 100:
         raise ValueError("--codex-stop must be a finite percent greater than 0 and at most 100")
     if args.cause is not None and re.fullmatch(r"[A-Za-z0-9-]{1,32}", args.cause) is None:
         raise ValueError("--cause must be 1 to 32 letters, digits or hyphens")
+    if args.artifact is not None:
+        _validate_artifact(args.artifact)
     if args.resume is not None:
         if args.worktree:
             raise ValueError("--resume cannot be combined with --worktree")
@@ -898,6 +960,8 @@ def _prepare_run(args):
             raise ValueError("--model cannot be overridden with --resume")
         if args.cause is not None:
             raise ValueError("--cause cannot be overridden with --resume")
+        if args.role_file is not None:
+            raise ValueError("--role-file cannot be combined with --resume")
         prior = _last_job(args.resume)
         if prior is None:
             raise ValueError("unknown job: {}".format(args.resume))
@@ -911,6 +975,11 @@ def _prepare_run(args):
         args.model = prior.get("model")
         args.model_source = "resume"
         args.cause = prior.get("cause")
+        prior_artifact = prior.get("artifact")
+        if prior_artifact is not None:
+            if args.artifact is not None and args.artifact != prior_artifact:
+                raise ValueError("--artifact cannot be overridden with --resume")
+            args.artifact = prior_artifact
     elif args.model:
         args.model_source = "flag"
     else:
@@ -940,15 +1009,30 @@ def _job_status(code, timed_out, result, errors):
     return "done", 0
 
 
-def _run_allocated_job(args, job_dir, now, brief, resume_thread, interrupted):
+def _finish_job(job_dir, record):
+    if record["artifact"] is None:
+        write_state(job_dir, record)
+        append_ledger(record)
+        return
+    # Count and append under the same lock so rounds follow ledger order.
+    with _private_open(home() / "ledger.jsonl", "a", encoding="utf-8") as ledger:
+        fcntl.flock(ledger, fcntl.LOCK_EX)
+        completed = _artifact_jobs(read_ledger(), record["artifact"])
+        record["round"] = 1 + sum(job["kind"] == record["kind"] for job in completed)
+        write_state(job_dir, record)
+        _write_ledger(ledger, record)
+
+
+def _run_allocated_job(args, job_dir, now, brief, role, resume_thread, interrupted):
     start = time.monotonic()
     record = {
         "type": "job", "id": job_dir.name, "session": args.session or None, "kind": args.kind,
-        "brief_file": args.brief_file,
+        "brief_file": args.brief_file, "artifact": args.artifact, "round": None,
+        "role_file": args.role_file, "output_schema": args.output_schema,
         "tier": args.tier, "dir": args.dir, "sandbox": "workspace-write" if args.write else "read-only",
         "worktree": args.worktree, "effort": args.effort, "model": args.model,
         "model_source": args.model_source, "cause": args.cause,
-        "started": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "wall_s": 0,
+        "started": now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), "wall_s": 0,
         "status": "running", "exit": None,
         "tokens": {"input": 0, "cached": 0, "output": 0, "reasoning": 0},
         "codex_thread": resume_thread, "changed": None, "head_moved": False, "resume_of": args.resume,
@@ -964,8 +1048,10 @@ def _run_allocated_job(args, job_dir, now, brief, resume_thread, interrupted):
         write_state(job_dir, record)
         before = snapshot(args.dir) if args.write and not args.worktree else None
         preamble = PREAMBLE_WRITE if args.write else PREAMBLE_READ
+        prompt = b"\n\n".join((preamble.encode("utf-8"), brief) if role is None
+                             else (preamble.encode("utf-8"), role, brief))
         code, timed_out = _execute_job(_codex_command(args, job_dir, resume_thread), args.dir, job_dir,
-                                      preamble.encode("utf-8") + b"\n\n" + brief, args.timeout * 60, interrupted)
+                                      prompt, args.timeout * 60, interrupted)
         with (job_dir / "events.jsonl").open("rb") as events:
             parsed = parse_events(events)
         error_events = len(parsed["errors"])
@@ -987,8 +1073,7 @@ def _run_allocated_job(args, job_dir, now, brief, resume_thread, interrupted):
             change_error = str(error)
     record["status"], record["exit"] = ("interrupted", 130) if interrupted[0] else _job_status(code, timed_out, result, errors)
     record["wall_s"] = time.monotonic() - start
-    write_state(job_dir, record)
-    append_ledger(record)
+    _finish_job(job_dir, record)
     _print_job(record, job_dir, result, errors, args.timeout, change_list, change_error, error_events)
     return record["exit"]
 
@@ -1046,6 +1131,13 @@ def _run(args) -> int:
         return 2
     try:
         resume_thread = _prepare_run(args)
+        role = None
+        if args.role_file is not None:
+            path = _input_file(args.role_file, "--role-file")
+            role = _read_role(path)
+            args.role_file = str(path)
+        if args.output_schema is not None:
+            args.output_schema = _output_schema_path(args.output_schema)
     except ValueError as error:
         print("crossfeed: {}".format(error), file=sys.stderr)
         return 2
@@ -1056,7 +1148,7 @@ def _run(args) -> int:
             return 75
         job_dir = _create_job_dir(now)
         with _job_interrupts() as interrupted:
-            return _run_allocated_job(args, job_dir, now, brief, resume_thread, interrupted)
+            return _run_allocated_job(args, job_dir, now, brief, role, resume_thread, interrupted)
     except OSError as error:
         print("crossfeed: {}".format(error), file=sys.stderr)
         return 1
@@ -1195,6 +1287,72 @@ def _parse_timestamp(value):
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=datetime.timezone.utc)
+
+
+def _result_verdict(path):
+    try:
+        # Strict UTF-8: json.loads on bytes would accept encoded surrogates.
+        value = json.loads(path.read_bytes().decode("utf-8-sig"), parse_constant=_reject_json_constant)
+    except (OSError, ValueError, RecursionError):
+        return None
+    verdict = value.get("verdict") if isinstance(value, dict) else None
+    if not isinstance(verdict, str):
+        return None
+    try:
+        verdict.encode("utf-8")  # an escaped lone surrogate cannot be printed
+    except UnicodeEncodeError:
+        return None
+    return verdict
+
+
+def _receipt(args) -> int:
+    _validate_artifact(args.artifact)
+    path_mtimes_ns = []
+    for path in args.path:
+        if not path:
+            raise ValueError("--path must not be empty")
+        try:
+            mtime_ns = Path(path).stat().st_mtime_ns
+        except (OSError, ValueError) as error:
+            raise ValueError("could not stat path {}: {}".format(path, error)) from error
+        path_mtimes_ns.append((path, mtime_ns))
+    records = read_ledger()
+    matches = [job for job in _artifact_jobs(records, args.artifact)
+               if args.kind == "any" or job["kind"] == args.kind]
+    if not matches:
+        print("crossfeed: no {} job for artifact {}".format(args.kind, args.artifact), file=sys.stderr)
+        return 1
+    job = matches[-1]
+    stale_paths = []
+    if path_mtimes_ns:
+        started = _parse_timestamp(job.get("started"))
+        if started is None:
+            raise ValueError("job {} has no valid started time".format(job["id"]))
+        elapsed = started - datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+        started_ns = (elapsed.days * 86400 + elapsed.seconds) * 1_000_000_000 + elapsed.microseconds * 1000
+        stale_paths = [path for path, mtime_ns in path_mtimes_ns if mtime_ns > started_ns]
+    directory = home().absolute() / "jobs" / job["id"]
+    brief_path, result_path = directory / "brief.md", directory / "result.md"
+    _, uses = _report_links(records)
+    receipt = {
+        "id": job["id"], "artifact": args.artifact, "kind": job["kind"], "round": job.get("round"),
+        "started": job.get("started"), "ts": job.get("ts"), "model": job.get("model"),
+        "verdict": _result_verdict(result_path), "used": uses.get(job["id"]),
+        "done_rounds": sum(match["kind"] == job["kind"] for match in matches),
+        "brief_path": str(brief_path), "result_path": str(result_path),
+        "paths": args.path, "stale": bool(stale_paths), "stale_paths": stale_paths,
+    }
+    if args.json:
+        print(json.dumps(receipt))
+    else:
+        for field in ("id", "artifact", "kind", "round", "started", "ts", "model", "verdict", "used",
+                      "done_rounds", "brief_path", "result_path"):
+            value = receipt[field]
+            print("{}: {}".format(field, value if value is not None else "none"))
+        stale = set(stale_paths)
+        for path in args.path:
+            print("stale: {} modified after job start".format(path) if path in stale else "fresh: {}".format(path))
+    return 3 if stale_paths else 0
 
 
 def _lockout(args) -> int:
@@ -1449,6 +1607,12 @@ def main(argv) -> int:
     used.add_argument("job")
     used.add_argument("verdict", choices=USE_VERDICTS)
     used.set_defaults(handler=_used)
+    receipt = subcommands.add_parser("receipt")
+    receipt.add_argument("artifact", metavar="ID")
+    receipt.add_argument("--kind", default="review")
+    receipt.add_argument("--path", action="append", default=[])
+    receipt.add_argument("--json", action="store_true")
+    receipt.set_defaults(handler=_receipt)
     lockout = subcommands.add_parser("lockout")
     lockout_action = lockout.add_mutually_exclusive_group(required=True)
     lockout_action.add_argument("--reset-at")
@@ -1481,6 +1645,9 @@ def main(argv) -> int:
     run.add_argument("--resume")
     run.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID"))
     run.add_argument("--brief-file")
+    run.add_argument("--artifact", metavar="ID")
+    run.add_argument("--role-file", metavar="PATH")
+    run.add_argument("--output-schema", metavar="PATH")
     quota = subcommands.add_parser("quota")
     quota.add_argument("--timeout", type=float, default=10.0, metavar="SECONDS")
     args = parser.parse_args(argv)
