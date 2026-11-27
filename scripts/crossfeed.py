@@ -488,7 +488,7 @@ def _app_server_quota(codex_bin, timeout_s):
                 messages = _rpc_messages(child.stdout, selector, deadline)
                 _send_rpc(child.stdin, {
                     "id": 1, "method": "initialize",
-                    "params": {"clientInfo": {"name": "crossfeed", "version": "0.4.0"}},
+                    "params": {"clientInfo": {"name": "crossfeed", "version": "0.5.0"}},
                 })
                 _rpc_result(messages, 1)
                 _send_rpc(child.stdin, {"method": "initialized", "params": {}})
@@ -1697,7 +1697,7 @@ def _report(args) -> int:
 
 def main(argv) -> int:
     parser = argparse.ArgumentParser(prog="crossfeed")
-    parser.add_argument("--version", action="version", version="crossfeed 0.4.0")
+    parser.add_argument("--version", action="version", version="crossfeed 0.5.0")
     subcommands = parser.add_subparsers(dest="command", required=True)
     usage = subcommands.add_parser("claude-usage")
     usage.add_argument("--fresh", action="store_true")

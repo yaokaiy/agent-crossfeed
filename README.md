@@ -506,7 +506,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Status and limits
 
-Version 0.4.0 is an early release.
+Version 0.5.0 is an early release.
 
 - Astra's weight in the Codex weekly allowance and how often Claude
   follows the start-of-task rule have yet to be measured. The 5-point
