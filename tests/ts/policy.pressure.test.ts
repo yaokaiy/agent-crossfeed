@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import { DEFAULTS } from '../../hooks/config'
-import { CODEX_MAX_AGE, INITIAL_PRESSURE, codexSurplus, decide, forecast, headroom, headroomCause, pressure, updatePressure } from '../../hooks/policy'
+import { CODEX_MAX_AGE, INITIAL_PRESSURE, codexSurplus, decide, forecast, headroom, headroomCause, pressure, shortWindow, updatePressure } from '../../hooks/policy'
 import type { ClaudeReading, CodexReading, PressureState, Tier } from '../../hooks/policy'
 
 const BASE = 1794902400000
@@ -54,6 +54,32 @@ test('decreasing usage produces a zero slope', async () => {
   const next = updatePressure(first, reading(40), BASE + 10 * MINUTE)
   expect(forecast(next, reading(40), BASE + 10 * MINUTE)).toBe(40)
   expect(next.p).toBe(0)
+})
+
+test('short window uses the configured shed line and expires at reset or ten minutes', async () => {
+  const known = { percentUsed: 85, at: BASE, resetsAt: RESET }
+  const unknown = { percentUsed: 85, at: BASE }
+  expect(shortWindow(INITIAL_PRESSURE, known, RESET - 1, 85)?.shed).toBe(true)
+  expect(shortWindow(INITIAL_PRESSURE, known, RESET - 1, 86)?.shed).toBe(false)
+  expect(shortWindow(INITIAL_PRESSURE, known, RESET, 85)).toBe(undefined)
+  expect(shortWindow(INITIAL_PRESSURE, unknown, BASE + 10 * MINUTE - 1, 85)?.shed).toBe(true)
+  expect(shortWindow(INITIAL_PRESSURE, unknown, BASE + 10 * MINUTE, 85)).toBe(undefined)
+})
+
+test('short pace needs ten minutes of rising use and fills within 15 minutes strictly before reset', async () => {
+  function pace(before: number, percentUsed: number, elapsed: number, resetsAt: number) {
+    const at = BASE + elapsed * MINUTE
+    const initial = updatePressure(INITIAL_PRESSURE, reading(before, resetsAt), BASE)
+    const state = updatePressure(initial, reading(percentUsed, resetsAt), at)
+    return shortWindow(state, { percentUsed, at, resetsAt }, at, 85)
+  }
+  expect(pace(40, 64, 10, RESET)).toEqual(expect.objectContaining({ pace: true, shed: false, minutesLeft: 15 }))
+  expect(pace(40, 63, 10, RESET)?.pace).toBe(false)
+  expect(pace(40, 64, 10, BASE + 25 * MINUTE)?.pace).toBe(false)
+  expect(pace(40, 64, 10, BASE + 24 * MINUTE)?.pace).toBe(false)
+  expect(pace(64, 64, 10, RESET)?.pace).toBe(false)
+  expect(pace(80, 64, 10, RESET)?.pace).toBe(false)
+  expect(pace(20, 84, 9, RESET)?.pace).toBe(false)
 })
 
 test('a past reset uses zero remaining minutes without division by zero', async () => {

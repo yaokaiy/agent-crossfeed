@@ -1,6 +1,8 @@
 import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { AgentSpawnInput, On, ProcessRunResult, SessionRateLimit } from 'claude-code'
+import type { AgentSpawnInput, On, ProcessRunResult, RenderSurface, SessionRateLimit } from 'claude-code'
+import type { BackgroundRow } from '../../hooks/core'
+import type { BackgroundState } from '../../types'
 
 const BASE = 1794902400000
 const MINUTE = 60000
@@ -45,6 +47,14 @@ function setup(on: On) {
     clockReads: 0, holdClockReadAt: 0, clockGate: undefined as Promise<void> | undefined, clockHeld: false,
     // Per-probe results for `claude-usage`, used in order before the default result.
     usageQueue: [] as { result: ProcessRunResult; gate?: Promise<void> }[],
+    nextAgentId: 'spawned' as string | undefined, workflowTaskId: 'workflow-task', runId: 'wf_test',
+    background: new Map<string, BackgroundState>(), surfaces: [] as RenderSurface[],
+    checks: [] as string[], stops: [] as string[], stopGate: undefined as Promise<void> | undefined,
+    verdicts: new Map<string, 'deny' | 'ask'>(), stopErrors: new Map<string, string>(),
+    stopDeniedReason: 'a TaskStop rule' as string | undefined,
+    wakePrompts: [] as string[], toasts: [] as string[], wakeGate: undefined as Promise<void> | undefined,
+    records: [] as BackgroundRow[][], recordGate: undefined as Promise<void> | undefined,
+    writers: 0, maxWriters: 0,
   }
   on('clock.now', async () => {
     world.clockReads += 1
@@ -82,7 +92,7 @@ function setup(on: On) {
   })
   on('agent.spawn', (_$, e) => {
     world.spawns.push(e)
-    return world.denySpawn ? { deny: 'engine denied spawn' } : { model: world.spawnModel ?? e.model ?? 'claude-fable-5-2', agentId: 'spawned' }
+    return world.denySpawn ? { deny: 'engine denied spawn' } : { model: world.spawnModel ?? e.model ?? 'claude-fable-5-2', agentId: world.nextAgentId }
   })
   on('session.id', () => {
     world.sessionIdReads += 1
@@ -95,9 +105,24 @@ function setup(on: On) {
     return { value: undefined }
   })
   on('ui.log', (_$, e) => { world.logs.push(e.text); return { value: undefined } })
+  on('ui.toast', (_$, e) => { world.toasts.push(e.text); return { value: undefined } })
+  on('session.surfaces', () => ({ value: world.surfaces }))
+  on('state.get', (_$, e) => ({ value: { version: 0, value: world.background.get(e.id ?? '') } }))
+  on('state.set', (_$, e) => {
+    world.background.set(e.id ?? '', e.value as BackgroundState)
+    return { value: { isSet: true, version: 1 } }
+  })
   on('command.register', (_$, e) => { world.commands.push(e.name); return { value: { command: e.name } } })
   on('command.run', () => ({ text: 'engine command' }))
   on('process.run', async (_$, e) => {
+    if (e.argv[3] === 'record') {
+      world.records.push((e.init?.stdin ?? '').trim().split('\n').map(line => JSON.parse(line) as BackgroundRow))
+      world.writers += 1
+      world.maxWriters = Math.max(world.maxWriters, world.writers)
+      await world.recordGate
+      world.writers -= 1
+      return { value: processResult('') }
+    }
     world.sequence.push(e.argv[3] ?? '')
     if (e.argv[3] === 'nudge') {
       world.nudges.push({ argv: e.argv, timeout: e.init?.timeoutMs, stdin: e.init?.stdin })
@@ -166,8 +191,35 @@ function setup(on: On) {
     world.bashCalls += 1
     return world.denyBash ? { deny: 'engine denied' } : { result: { stdout: 'ok', stderr: '', interrupted: false }, context: ['existing tool context'] }
   })
+  on('tool.call', { tool: 'Workflow' }, () => ({ result: {
+    status: 'async_launched', taskId: world.workflowTaskId, runId: world.runId,
+  } }))
+  on('tool.check', { tool: 'TaskStop' }, (_$, e) => {
+    // This fixture controls the preflight query. Let the synthetic tool run after it passes.
+    if (e.tool_use_id !== undefined) return { decision: 'allow' }
+    const id = (e.input as { task_id: string }).task_id
+    world.checks.push(id)
+    const decision = world.verdicts.get(id) ?? 'allow'
+    return { decision, reason: decision === 'deny' ? world.stopDeniedReason : undefined }
+  })
+  on('tool.call', { tool: 'TaskStop' }, async (_$, e) => {
+    const id = e.task_id ?? ''
+    world.stops.push(id)
+    await world.stopGate
+    const error = world.stopErrors.get(id)
+    const result = { message: error ?? 'Successfully stopped task', task_id: id, task_type: 'test' }
+    return error ? { result, isError: true, text: error } : { result }
+  })
   on('prompt.compose', () => ({ sections: [{ id: 'engine', text: 'engine section', scope: 'shared' }] }))
-  on('prompt.submit', (_$, e) => ({ text: e.text, context: e.context }))
+  on('prompt.submit', async (_$, e) => {
+    if (e.origin?.kind === 'plugin') {
+      world.wakePrompts.push(e.text)
+      await world.wakeGate
+    }
+    return { text: e.text, context: e.context }
+  })
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
   on('classic.StopFailure', () => ({}))
   return world
 }
@@ -882,15 +934,28 @@ test('spawn uses its parent model even when the main model differs, including wo
   const world = scarce(on)
   world.model = 'sonnet'
   await start($)
-  await $.agent.spawn({ ...SPAWN, parentAgentId: 'parent-agent', workflow: { runId: 'wf_test', agentIndex: 1 } })
+  await $.agent.spawn({ ...WORKFLOW_SPAWN, parentAgentId: 'parent-agent' })
   expect(world.spawns[0]?.model).toBe('opus')
 })
 
-test('denied spawns are returned unchanged and never recorded', async ($, on) => {
+test('downstream spawn refusals are returned unchanged and logged as refused', async ($, on) => {
   const world = scarce(on)
   world.denySpawn = true
   await start($)
   expect(await $.agent.spawn(SPAWN)).toEqual({ deny: 'engine denied spawn' })
+  expect(world.processes.some(p => p.argv[3] === 'downgrade')).toBe(false)
+  await waitForBackground(() => world.records.flat().some(row => row.type === 'spawn' && row.outcome === 'refused'))
+})
+
+test('a model-only spawn result records an unconfirmed start without a downgrade', async ($, on) => {
+  const world = scarce(on)
+  world.nextAgentId = undefined
+  await start($)
+  const result = await $.agent.spawn(SPAWN)
+  expect(result.model).toBe('opus')
+  expect(result.agentId).toBe(undefined)
+  await waitForBackground(() => world.records.flat().length === 1)
+  expect(world.records.flat()[0]).toEqual(expect.objectContaining({ type: 'spawn', outcome: 'unconfirmed' }))
   expect(world.processes.some(p => p.argv[3] === 'downgrade')).toBe(false)
 })
 
@@ -1527,4 +1592,270 @@ test('a tool finishing after clear leaves the new conversation’s notices and c
     { session: 'new-session', kind: 'balance-on', reasons: ['always'], calls: null },
     { session: 'new-session', kind: 'stretch', reasons: ['always'], calls: 1 },
   ])
+})
+
+async function waitForBackground(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 1000 && !condition(); i++) await Promise.resolve()
+  expect(condition()).toBe(true)
+}
+
+const WORKFLOW_SPAWN = { ...SPAWN, subagentType: 'workflow-subagent', workflow: { runId: 'wf_test', agentIndex: 2 } }
+const WORKFLOW = { tool: 'Workflow' as const, script: 'return [];', name: 'test' }
+
+function completeTurn($: Engine, turnId: string, agentId?: string) {
+  return $.turn.complete({ answer: '', reason: 'answer', durationMs: 1, isAborted: false, turnId, agentId })
+}
+
+test('shed admission checks every spawn origin and propagates background lineage', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 20)
+  world.nextAgentId = 'workflow-parent'
+  await $.agent.spawn(WORKFLOW_SPAWN)
+  world.nextAgentId = 'background-parent'
+  await $.agent.spawn({ ...SPAWN, background: true })
+  world.nextAgentId = 'background-child'
+  await $.agent.spawn({ ...SPAWN, parentAgentId: 'background-parent' })
+  world.nextAgentId = 'foreground-parent'
+  await $.agent.spawn(SPAWN)
+  await measure($, world, 85)
+  const workflow = await $.agent.spawn({ ...WORKFLOW_SPAWN, model: 'opus' })
+  for (const part of ['85%', RESET, 'this agent did not start', 'resumeFromRunId']) {
+    expect(workflow.deny?.includes(part)).toBe(true)
+  }
+  const starts = [
+    [{}, 'agent-tool', 'started'],
+    [{ parentAgentId: 'foreground-parent' }, 'agent-tool', 'started'],
+    [{ background: true }, 'agent-tool', 'refused'],
+    [{ parentAgentId: 'workflow-parent' }, 'agent-tool', 'refused'],
+    [{ parentAgentId: 'background-parent' }, 'agent-tool', 'refused'],
+    [{ parentAgentId: 'background-child' }, 'agent-tool', 'refused'],
+    [{ fork: true, tool_use_id: '', background: true }, 'fork', 'refused'],
+    [{ isTeammate: true, background: true }, 'teammate', 'refused'],
+    [{ resume: { agentId: 'foreground-parent' } }, 'resume', 'started'],
+    [{ tool_use_id: '' }, 'other', 'started'],
+  ] as const
+  for (const [input, , outcome] of starts) {
+    const result = await $.agent.spawn({ ...SPAWN, ...input })
+    expect(result.deny !== undefined).toBe(outcome === 'refused')
+  }
+  await waitForBackground(() => world.records.flat().length === 5 + starts.length)
+  const rows = world.records.flat().slice(4)
+  expect(rows[0]).toEqual({ type: 'spawn', session: 'test-session', origin: 'workflow',
+    run_id: 'wf_test', agent_index: 2, model: 'opus', outcome: 'refused' })
+  expect(rows.slice(1).map(row => row.type === 'spawn' && [row.origin, row.outcome])).toEqual(
+    starts.map(([, origin, outcome]) => [origin, outcome]),
+  )
+})
+
+test('breaker checks registered Workflow, Agent, teammate and command-fork tasks before the crossing', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  await measure($, world, 20)
+  await $.tool.call(WORKFLOW)
+  await $.tool.call({ ...AGENT, prompt: 'Brief' })
+  world.nextAgentId = 'teammate'
+  await $.agent.spawn({ ...SPAWN, background: true, isTeammate: true })
+  world.nextAgentId = 'fork'
+  await $.agent.spawn({ ...SPAWN, background: true, fork: true, tool_use_id: '' })
+  await waitForBackground(() => world.background.get('test-session')?.tasks.length === 4)
+  world.verdicts.set('test-agent', 'deny')
+  world.verdicts.set('teammate', 'ask')
+  world.stopErrors.set('workflow-task', 'temporarily unavailable')
+  world.stopErrors.set('fork', 'Task fork is not running')
+  let release!: () => void
+  world.stopGate = new Promise(resolve => { release = resolve })
+  await measure($, world, 85)
+  await waitForBackground(() => world.stops.length === 3)
+  expect([...world.checks].sort()).toEqual(['fork', 'teammate', 'test-agent', 'workflow-task'])
+  expect([...world.stops].sort()).toEqual(['fork', 'teammate', 'workflow-task'])
+  world.workflowTaskId = 'late-workflow'
+  await $.tool.call(WORKFLOW)
+  release()
+  await waitForBackground(() => world.records.flat().filter(row => row.type === 'breaker').length === 3)
+  expect(world.records.flat()).toContainEqual({ type: 'breaker', session: 'test-session', outcome: 'denied',
+    task_id: 'test-agent', run_id: null, reason: 'a TaskStop rule' })
+  expect(world.toasts.some(note => note.includes('TaskStop denied for task test-agent'))).toBe(true)
+  world.stopErrors.delete('workflow-task')
+  world.now += MINUTE
+  await measure($, world, 86)
+  await waitForBackground(() => world.records.flat().some(row => row.type === 'breaker' && row.run_id === 'wf_test' && row.outcome === 'stopped'))
+  expect(world.stops.slice(3)).toEqual(['workflow-task'])
+})
+
+test('an idle coordinator gets the pace prompt and the second event goes to notices', async ($, on) => {
+  const world = setup(on)
+  world.surfaces = ['terminal']
+  await start($)
+  await $.tool.call(WORKFLOW)
+  await measure($, world, 20)
+  let release!: () => void
+  world.wakeGate = new Promise(resolve => { release = resolve })
+  world.now += 10 * MINUTE
+  await measure($, world, 80)
+  await waitForBackground(() => world.wakePrompts.length === 1)
+  expect(world.wakePrompts[0]?.includes('full in 4 min')).toBe(true)
+  release()
+  await waitForBackground(() => world.records.flat().some(row => row.type === 'wake' && row.outcome === 'prompt'))
+  world.now += MINUTE
+  await measure($, world, 85)
+  await waitForBackground(() => world.toasts.some(note => note.includes('Stopped task workflow-task')))
+  const prompt = await $.prompt.submit({ text: 'Continue', origin: ORIGIN, wait: false })
+  expect(prompt.context?.some(note => note.includes('workflow-task') && note.includes('wf_test') &&
+    note.includes('resumeFromRunId') && note.includes('keep a hand-off note'))).toBe(true)
+  expect(world.wakePrompts.length).toBe(1)
+})
+
+test('a confirmed breaker stop wakes the idle coordinator even without a pace reading', async ($, on) => {
+  const world = setup(on)
+  world.surfaces = ['terminal']
+  await start($)
+  await measure($, world, 20)
+  await $.tool.call(WORKFLOW)
+  let release!: () => void
+  world.stopGate = new Promise(resolve => { release = resolve })
+  await measure($, world, 85)
+  await waitForBackground(() => world.stops.length === 1)
+  expect(world.wakePrompts).toEqual([])
+  release()
+  await waitForBackground(() => world.wakePrompts.length === 1)
+  expect(world.wakePrompts[0]?.includes('Stopped task workflow-task (run wf_test')).toBe(true)
+  expect(world.wakePrompts[0]?.includes('pace unknown')).toBe(true)
+})
+
+test('a clear gives the new conversation its own breaker wake in the same quota window', async ($, on) => {
+  const world = setup(on)
+  world.surfaces = ['terminal']
+  await start($)
+  await measure($, world, 20)
+  await $.tool.call(WORKFLOW)
+  world.now += 10 * MINUTE
+  await measure($, world, 80)
+  await waitForBackground(() => world.wakePrompts.length === 1)
+
+  await $.session.end({ reason: 'clear', sessionId: world.sessionId, resume: { id: world.sessionId } })
+  world.sessionId = 'new-conversation'
+  world.workflowTaskId = 'new-workflow-task'
+  await $.tool.call(WORKFLOW)
+  world.now += MINUTE
+  await measure($, world, 85)
+  await waitForBackground(() => world.wakePrompts.length === 2)
+  expect(world.wakePrompts[1]).toContain('Stopped task new-workflow-task')
+  expect(world.stops).toEqual(['new-workflow-task'])
+})
+
+test('a workflow stop denial shows its run without resume advice and fills in a missing reason only in the notice', async ($, on) => {
+  const world = setup(on)
+  world.stopDeniedReason = undefined
+  world.verdicts.set('workflow-task', 'deny')
+  await start($)
+  await measure($, world, 20)
+  await $.tool.call(WORKFLOW)
+  await measure($, world, 85)
+  await waitForBackground(() => world.toasts.length === 1)
+  expect(world.toasts[0]).toContain('TaskStop denied for task workflow-task (run wf_test). Permission denied.')
+  expect(world.toasts[0]).not.toContain('resumeFromRunId')
+  expect(world.records.flat()).toContainEqual({ type: 'breaker', session: 'test-session', outcome: 'denied',
+    task_id: 'workflow-task', run_id: 'wf_test', reason: null })
+  expect(world.stops).toEqual([])
+})
+
+test('pace always queues a warning even without registered tasks', async ($, on) => {
+  const world = setup(on)
+  world.surfaces = ['terminal']
+  await start($)
+  await measure($, world, 20)
+  world.now += 10 * MINUTE
+  await measure($, world, 80)
+  const prompt = await $.prompt.submit({ text: 'Continue', origin: ORIGIN, wait: false })
+  expect(prompt.context?.some(note => note.includes('window will fill before reset'))).toBe(true)
+  await measure($, world, 81)
+  const next = await $.prompt.submit({ text: 'Again', origin: ORIGIN, wait: false })
+  expect(next.context?.some(note => note.includes('window will fill before reset')) ?? false).toBe(false)
+  expect(world.wakePrompts).toEqual([])
+})
+
+for (const name of ['busy', 'no surface', 'wake disabled'] as const) {
+  test(`pace wake queues a notice when ${name}`, { options: { wake: name !== 'wake disabled' } }, async ($, on) => {
+    const world = setup(on)
+    if (name !== 'no surface') world.surfaces = ['terminal']
+    await start($)
+    if (name === 'busy') await $.turn.start({ text: 'Working', turnId: 'main' })
+    await measure($, world, 20)
+    await $.tool.call(WORKFLOW)
+    world.now += 10 * MINUTE
+    await measure($, world, 80)
+    await waitForBackground(() => world.records.flat().some(row => row.type === 'wake' && row.outcome === 'notice'))
+    expect(world.wakePrompts).toEqual([])
+    expect(world.toasts.length).toBe(name === 'wake disabled' ? 0 : 1)
+    const prompt = await $.prompt.submit({ text: 'Continue', origin: ORIGIN, wait: false })
+    expect(prompt.context?.some(note => note.includes('window will fill before reset'))).toBe(true)
+    expect(prompt.context?.some(note => note.includes('keep a hand-off note'))).toBe(true)
+  })
+}
+
+test('a pace crossing at admission defers wake until measure or main turn completion', async ($, on) => {
+  const world = setup(on)
+  world.surfaces = ['terminal']
+  await start($)
+  await measure($, world, 20)
+  await $.tool.call(WORKFLOW)
+  await $.turn.start({ turnId: 'main', text: 'Working' })
+  world.now += 10 * MINUTE
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  expect((await $.agent.spawn(WORKFLOW_SPAWN)).deny?.includes('80%')).toBe(true)
+  await completeTurn($, 'subagent', 'workflow-child')
+  expect(world.wakePrompts).toEqual([])
+  await completeTurn($, 'main')
+  await waitForBackground(() => world.wakePrompts.length === 1)
+  await measure($, world, 80)
+  expect(world.wakePrompts.length).toBe(1)
+})
+
+test('a pace crossing at admission wakes on the next measure', async ($, on) => {
+  const world = setup(on)
+  world.surfaces = ['terminal']
+  await start($)
+  await measure($, world, 20)
+  await $.tool.call(WORKFLOW)
+  world.now += 10 * MINUTE
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  expect((await $.agent.spawn(WORKFLOW_SPAWN)).deny?.includes('80%')).toBe(true)
+  expect(world.wakePrompts).toEqual([])
+  await measure($, world, 80)
+  await waitForBackground(() => world.wakePrompts.length === 1)
+})
+
+test('off passes spawns and keeps task registration without protection or telemetry', { options: { mode: 'off' } }, async ($, on) => {
+  const world = setup(on)
+  world.surfaces = ['terminal']
+  await start($)
+  await measure($, world, 20)
+  await $.tool.call(WORKFLOW)
+  world.now += 10 * MINUTE
+  await measure($, world, 99)
+  expect((await $.agent.spawn(WORKFLOW_SPAWN)).deny).toBe(undefined)
+  await waitForBackground(() => world.background.get('test-session')?.tasks[0]?.id === 'workflow-task')
+  expect(world.checks).toEqual([])
+  expect(world.wakePrompts).toEqual([])
+  expect(world.records).toEqual([])
+})
+
+test('the row queue uses one writer and drops the oldest entries above 500', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  let release!: () => void
+  world.recordGate = new Promise(resolve => { release = resolve })
+  await $.agent.spawn({ ...SPAWN, model: 'test-0' })
+  await waitForBackground(() => world.writers === 1)
+  for (let i = 1; i <= 503; i++) await $.agent.spawn({ ...SPAWN, model: `test-${i}` })
+  expect(world.records.length).toBe(1)
+  release()
+  await waitForBackground(() => world.records.length === 2)
+  const batch = world.records[1] ?? []
+  expect(batch.length).toBe(500)
+  expect(batch[0]).toEqual(expect.objectContaining({ model: 'test-4' }))
+  expect(batch[499]).toEqual(expect.objectContaining({ model: 'test-503' }))
+  expect(world.maxWriters).toBe(1)
+  expect(world.logs.some(log => log.includes('dropped 3 oldest rows'))).toBe(true)
 })

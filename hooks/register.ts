@@ -1,11 +1,18 @@
 import type { EngineInterface, HookFailure, Register, SessionRateLimit } from 'claude-code'
+import type { BackgroundState } from '../types'
 import type { Mode } from './config'
 import { DEFAULTS, toConfig } from './config'
 import { createCore } from './core'
-import type { Core, DecisionRecord, Notice, Nudge } from './core'
+import type { BackgroundRow, Core, DecisionRecord, Notice, Nudge, StopResult } from './core'
 import type { AgentCall, ClaudeReading, CodexReading, UsageReading, Family } from './policy'
 import { CODEX_MAX_AGE, familyOf, shortProblem } from './policy'
 import { staticSection } from './text'
+
+const ROW_CAP = 500
+
+type RowQueue = { rows: BackgroundRow[]; writing: boolean; dropped: number }
+type StateWrites = Map<string, { value: BackgroundState; settled: Promise<void> }>
+type BackgroundIO = { queue: RowQueue; writes: StateWrites; stops: Set<Promise<void>> }
 
 function logFailure($: EngineInterface, message: string): void {
   try { $.ui.log(`crossfeed: ${message}`) } catch { /* Logging must not block the event. */ }
@@ -159,6 +166,143 @@ function errorText(error: unknown): string {
   try { return String(error) } catch { return 'an error that cannot be shown' }
 }
 
+function queueRow($: EngineInterface, queue: RowQueue, script: string, row: BackgroundRow): void {
+  queue.rows.push(row)
+  if (queue.rows.length > ROW_CAP) {
+    queue.rows.shift()
+    queue.dropped += 1
+  }
+  if (!queue.writing) void drainRows($, queue, script)
+}
+
+async function drainRows($: EngineInterface, queue: RowQueue, script: string): Promise<void> {
+  queue.writing = true
+  try {
+    while (queue.rows.length) {
+      if (queue.dropped) {
+        logFailure($, `record queue dropped ${queue.dropped} oldest rows`)
+        queue.dropped = 0
+      }
+      const stdin = queue.rows.splice(0).map(row => JSON.stringify(row) + '\n').join('')
+      try {
+        const result = await $.process.run(['python3', '-I', script, 'record'], { stdin, timeoutMs: 5000 })
+        if (result.exitCode !== 0) logFailure($, `record exited with code ${result.exitCode}`)
+      } catch (error) { logFailure($, `record failed: ${errorText(error)}`) }
+    }
+  } finally {
+    queue.writing = false
+  }
+}
+
+async function loadBackground($: EngineInterface, writes: StateWrites, id: string | undefined): Promise<BackgroundState | undefined> {
+  if (id === undefined) return undefined
+  try {
+    const ref = { plugin: 'agent-crossfeed', key: 'background', id } as const
+    return writes.get(id)?.value ?? (await $.state.get(ref)).value
+  } catch (error) {
+    logFailure($, `background state read failed: ${errorText(error)}`)
+    return undefined
+  }
+}
+
+async function loadConversation($: EngineInterface, writes: StateWrites): Promise<[string | undefined, BackgroundState | undefined]> {
+  const id = await sessionId($)
+  return [id, await loadBackground($, writes, id)]
+}
+
+function saveBackground($: EngineInterface, writes: StateWrites, id: string | undefined, value: BackgroundState): void {
+  if (id === undefined) return
+  const last = writes.get(id)
+  if (last?.value === value) return
+  const settled = (last?.settled ?? Promise.resolve()).then(async () => {
+    // A later snapshot includes this one's changes.
+    if (writes.get(id)?.value !== value) return
+    const ref = { plugin: 'agent-crossfeed', key: 'background', id } as const
+    await $.state.set(ref, value)
+  }).catch(error => logFailure($, `background state write failed: ${errorText(error)}`))
+  writes.set(id, { value, settled })
+}
+
+function taskError(text: string): StopResult {
+  if (/not running|already (?:ended|finished|completed|stopped)|(?:no|unknown) task|task[^\n]*not found/i.test(text)) {
+    return { outcome: 'ended' }
+  }
+  return { outcome: 'error', reason: shortProblem(text) ?? 'TaskStop returned no confirmation' }
+}
+
+async function stopTask($: EngineInterface, id: string, enabled: () => boolean): Promise<StopResult | undefined> {
+  try {
+    const call = { tool: 'TaskStop', task_id: id } as const
+    const check = await $.tool.check({ tool: call.tool, input: { task_id: id } })
+    if (!enabled()) return undefined
+    if (check.decision === 'deny') return { outcome: 'denied', reason: shortProblem(check.reason) ?? shortProblem(check.rule) }
+    const ran = await $.tool.call(call)
+    if (ran.deny !== undefined) return { outcome: 'denied', reason: shortProblem(ran.deny) }
+    if (!ran.isError && ran.result?.task_id === id) return { outcome: 'stopped' }
+    const message = isRecord(ran.result) ? shortProblem(ran.result.message) : undefined
+    return taskError(ran.text ?? message ?? '')
+  } catch (error) { return taskError(errorText(error)) }
+}
+
+function runBreaker(
+  $: EngineInterface, io: BackgroundIO, core: Core, script: string, id: string | undefined, now: number, enabled: () => boolean,
+): void {
+  saveBackground($, io.writes, id, core.background.snapshot())
+  for (const stop of core.beginStops(now)) {
+    const pending = stopTask($, stop.task.id, enabled).then(result => {
+      const before = core.background.snapshot()
+      const row = core.background.finishStop(stop, result)
+      const after = core.background.snapshot()
+      if (after !== before) saveBackground($, io.writes, id, after)
+      if (row) queueRow($, io.queue, script, row)
+    }).catch(error => logFailure($, `breaker failed: ${errorText(error)}`))
+    io.stops.add(pending)
+    void pending.then(() => io.stops.delete(pending))
+  }
+}
+
+async function submitWake(
+  $: EngineInterface, io: BackgroundIO, core: Core, script: string, wake: { text: string; row: Extract<BackgroundRow, { type: 'wake' }> },
+  current: () => boolean,
+): Promise<void> {
+  try {
+    const result = await $.prompt.submit({ text: wake.text })
+    if (result.drop === undefined) {
+      queueRow($, io.queue, script, wake.row)
+      return
+    }
+    logFailure($, 'wake prompt was dropped')
+  } catch (error) { logFailure($, `wake prompt failed: ${errorText(error)}`) }
+  if (!current()) return
+  const toast = core.background.keepWakeNotice(wake.text)
+  if (toast) $.ui.toast(wake.text)
+  if (toast) queueRow($, io.queue, script, { ...wake.row, outcome: 'notice' })
+}
+
+async function deliverWakes($: EngineInterface, io: BackgroundIO, core: Core, script: string, current: () => boolean): Promise<void> {
+  if (!current() || !core.background.hasWake()) return
+  let surface = false
+  try { surface = (await $.session.surfaces()).length > 0 } catch { /* Keep the notice when the surface is unavailable. */ }
+  while (current()) {
+    const wake = core.background.takeWake(surface)
+    if (!wake) break
+    if (wake.row.outcome === 'prompt') {
+      void submitWake($, io, core, script, wake, current).catch(error => logFailure($, `wake failed: ${errorText(error)}`))
+    } else {
+      queueRow($, io.queue, script, wake.row)
+      if (wake.toast) $.ui.toast(wake.text)
+    }
+  }
+}
+
+function scheduleWakes($: EngineInterface, io: BackgroundIO, core: Core, script: string, current: () => boolean): void {
+  if (!current()) return
+  core.background.releaseWakes()
+  const deliver = () => deliverWakes($, io, core, script, current).catch(error => logFailure($, `wake failed: ${errorText(error)}`))
+  void deliver()
+  for (const pending of io.stops) void pending.then(deliver)
+}
+
 // Never throws: a failed record must not fail the hook, which would replay the call through failOpen.
 async function recordDecision($: EngineInterface, script: string, record: DecisionRecord): Promise<void> {
   try {
@@ -187,6 +331,7 @@ async function noticeText($: EngineInterface, script: string, items: Notice[]): 
 
 export const register: Register = (on, options) => {
   let core: Core | undefined
+  const backgroundIO: BackgroundIO = { queue: { rows: [], writing: false, dropped: 0 }, writes: new Map(), stops: new Set() }
   let script = ''
   let session: string | undefined
   let conversationChanged = false
@@ -207,10 +352,11 @@ export const register: Register = (on, options) => {
   let modelAsked = 0
   let modelApplied = 0
 
-  function applyUsage(asked: number, reading: ClaudeReading, now: number): void {
-    if (!core || asked <= usageApplied) return
+  function applyUsage(asked: number, reading: ClaudeReading, now: number): boolean {
+    if (!core || asked <= usageApplied) return false
     usageApplied = asked
     core.measure(reading, now)
+    return reading.fiveHour !== undefined
   }
 
   // A failed model read (undefined) clears the model, as before, but does not count as applied,
@@ -221,10 +367,10 @@ export const register: Register = (on, options) => {
     core.setMainModel(model, now)
   }
 
-  function refreshConversation(version: number, id: string | undefined): void {
+  function refreshConversation(version: number, id: string | undefined, saved: BackgroundState | undefined): void {
     if (!conversationChanged || version !== conversationVersion) return
     session = id
-    core?.newConversation(session)
+    core?.newConversation(session, saved)
     conversationChanged = false
   }
 
@@ -252,9 +398,9 @@ export const register: Register = (on, options) => {
     const config = toConfig(options)
     mode = config.mode
     codexStopPercent = config.codexStopPercent
-    conversationVersion += 1
+    const version = ++conversationVersion
     session = await $.session.id()
-    core = createCore(config, script, session)
+    core = createCore(config, script, session, await loadBackground($, backgroundIO.writes, session))
     conversationChanged = false
     await $.command.register({ name: 'crossfeed', description: 'Show crossfeed status, report or change routing mode.', argumentHint: '[status|report|auto|always|off]' })
     const now = await clock($)
@@ -269,7 +415,11 @@ export const register: Register = (on, options) => {
     core.setCodex(quota.reading, quota.problem, quota.at ?? now)
     core.setLockout(lockout)
     const usageAsk = ++usageAsked
-    applyUsage(usageAsk, claudeReading((await $.session.usage()).rateLimits), await clock($))
+    const reading = claudeReading((await $.session.usage()).rateLimits)
+    const observedAt = await clock($)
+    if (applyUsage(usageAsk, reading, observedAt)) {
+      runBreaker($, backgroundIO, core, script, session, observedAt, () => mode !== 'off' && version === conversationVersion)
+    }
     const modelAsk = ++modelAsked
     applyModel(modelAsk, await mainModel($), now)
     if (mode !== 'off') core.setUsage(usage.reading, usage.problem, usage.at ?? now)
@@ -287,10 +437,16 @@ export const register: Register = (on, options) => {
 
   on('session.measure', async ($, e, next) => {
     const usageAsk = ++usageAsked
-    if (conversationChanged) refreshConversation(conversationVersion, await sessionId($))
-    if (core) {
+    const version = conversationVersion
+    if (conversationChanged) refreshConversation(version, ...await loadConversation($, backgroundIO.writes))
+    if (core && version === conversationVersion) {
       const now = await clock($)
-      applyUsage(usageAsk, claudeReading(e.rateLimits), now)
+      const current = () => mode !== 'off' && version === conversationVersion
+      if (version !== conversationVersion) return next(e)
+      if (applyUsage(usageAsk, claudeReading(e.rateLimits), now)) {
+        runBreaker($, backgroundIO, core, script, session, now, current)
+      }
+      scheduleWakes($, backgroundIO, core, script, current)
       const modelAsk = ++modelAsked
       applyModel(modelAsk, await mainModel($), now)
       await refreshReadings($, core, script, now, { codex: needsCodex(now), usage: needsUsage(now) })
@@ -307,7 +463,7 @@ export const register: Register = (on, options) => {
 
   on('prompt.submit', async ($, e, next) => {
     const version = conversationVersion
-    if (conversationChanged) refreshConversation(version, await sessionId($))
+    if (conversationChanged) refreshConversation(version, ...await loadConversation($, backgroundIO.writes))
     if (e.isMeta || e.command || !core) return next(e)
     const now = await clock($)
     if (version !== conversationVersion) return next(e)
@@ -316,7 +472,8 @@ export const register: Register = (on, options) => {
   }).catch(failOpen)
 
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
-    if (conversationChanged) refreshConversation(conversationVersion, await sessionId($))
+    const version = conversationVersion
+    if (conversationChanged) refreshConversation(version, ...await loadConversation($, backgroundIO.writes))
     if (!core) return next(e)
     const now = await clock($)
     // A model-limit reading that arrives during the probes is judged against the main model.
@@ -326,7 +483,12 @@ export const register: Register = (on, options) => {
     // Take the session's own readings at decision time: a measure event may not have fired
     // yet in a session's first turn, and the main model may have changed during the probes.
     const usageAsk = ++usageAsked
-    applyUsage(usageAsk, claudeReading((await $.session.usage()).rateLimits), await clock($))
+    const reading = claudeReading((await $.session.usage()).rateLimits)
+    const observedAt = await clock($)
+    if (version !== conversationVersion) return next(e)
+    if (applyUsage(usageAsk, reading, observedAt)) {
+      runBreaker($, backgroundIO, core, script, session, observedAt, () => mode !== 'off' && version === conversationVersion)
+    }
     const modelAsk = ++modelAsked
     applyModel(modelAsk, await mainModel($), now)
     // Decide at the time the decision is made, with no wait in between: a call that waited on
@@ -361,35 +523,89 @@ export const register: Register = (on, options) => {
 
   on('tool.call', async ($, e, next) => {
     const version = conversationVersion
-    if (conversationChanged) refreshConversation(version, await sessionId($))
+    if (conversationChanged) refreshConversation(version, ...await loadConversation($, backgroundIO.writes))
     const ran = await next(e)
     // A refused call is not a hands-on step and must not use up the one reminder.
-    if (ran.deny !== undefined || e.agentId !== undefined) return ran
-    let now: number
-    try { now = await clock($) } catch { return ran }
-    // A tool finishing after /clear has no counted step or notice in the new prompt.
-    if (version !== conversationVersion) return ran
-    const note = core?.toolCall(String(e.tool), false, now)
-    const notices = core?.takeNotices(now) ?? []
-    if (note) notices.push(note)
-    return notices.length ? { ...ran, context: [...(ran.context ?? []), ...await noticeText($, script, notices)] } : ran
+    if (ran.deny !== undefined || version !== conversationVersion || !core) return ran
+    try {
+      const result = ran.result
+      if (!ran.isError && isRecord(result) && result.status === 'async_launched') {
+        if (e.tool === 'Workflow' && typeof result.taskId === 'string' && result.taskId) {
+          core.background.registerTask({ id: result.taskId, runId: typeof result.runId === 'string' ? result.runId : undefined })
+        } else if (e.tool === 'Agent' && typeof result.agentId === 'string' && result.agentId) {
+          core.background.registerAgent(result.agentId)
+        }
+        saveBackground($, backgroundIO.writes, session, core.background.snapshot())
+      }
+      if (e.agentId !== undefined || (e.tool === 'TaskStop' && next.origin.plugin === 'agent-crossfeed')) return ran
+      const now = await clock($)
+      // A tool finishing after /clear has no counted step or notice in the new prompt.
+      if (version !== conversationVersion) return ran
+      const note = core.toolCall(String(e.tool), false, now)
+      const notices = core.takeNotices(now)
+      if (note) notices.push(note)
+      return notices.length ? { ...ran, context: [...(ran.context ?? []), ...await noticeText($, script, notices)] } : ran
+    } catch { return ran }
   }).catch(failOpen)
 
   on('agent.spawn', async ($, e, next) => {
-    const change = core?.spawnModel(e, await clock($))
-    if (!change) return next(e)
-    const ran = await next({ ...e, model: change.model })
-    if (ran.deny !== undefined) return ran
-    if (familyOf(ran.model) !== familyOf(change.model)) {
-      logFailure($, `rewrite to ${change.model} not applied (ran on ${ran.model})`)
-      return ran
+    const version = conversationVersion
+    const usageAsk = ++usageAsked
+    if (conversationChanged) refreshConversation(version, ...await loadConversation($, backgroundIO.writes))
+    if (!core) return next(e)
+    const active = core
+    const reading = mode === 'off' ? undefined : claudeReading((await $.session.usage()).rateLimits)
+    const now = await clock($)
+    if (version !== conversationVersion) return next(e)
+    if (reading && applyUsage(usageAsk, reading, now)) {
+      runBreaker($, backgroundIO, active, script, session, now, () => mode !== 'off' && version === conversationVersion)
     }
-    logFailure($, `subagent ran on ${change.model} instead of ${change.from} (${change.bucket} weekly ${change.percent}%, ${change.percent >= 100 ? 'full' : 'ahead'})`)
+    const { row, deny, background } = active.admission(e, now)
+    if (deny) {
+      if (row) queueRow($, backgroundIO.queue, script, { ...row, outcome: 'refused' })
+      return { deny }
+    }
+    const id = session
+    const change = active.spawnModel(e, now)
+    const ran = await next(change ? { ...e, model: change.model } : e)
     // Once next() has started the agent, ledger failures must never retry the spawn.
     try {
-      const result = await $.process.run(['python3', '-I', script, 'downgrade', '--from', change.from, '--to', change.model, '--bucket', change.bucket, '--percent', String(change.percent), ...(session ? ['--session', session] : [])], { timeoutMs: 5000 })
+      if (row) queueRow($, backgroundIO.queue, script, { ...row, outcome: ran.deny !== undefined ? 'refused' : ran.agentId ? 'started' : 'unconfirmed' })
+      if (!ran.agentId) return ran
+      if (version === conversationVersion) {
+        active.background.started(e, ran.agentId, background)
+        saveBackground($, backgroundIO.writes, id, active.background.snapshot())
+      }
+      if (!change) return ran
+      if (familyOf(ran.model) !== familyOf(change.model)) {
+        logFailure($, `rewrite to ${change.model} not applied (ran on ${ran.model})`)
+        return ran
+      }
+      logFailure($, `subagent ran on ${change.model} instead of ${change.from} (${change.bucket} weekly ${change.percent}%, ${change.percent >= 100 ? 'full' : 'ahead'})`)
+      const result = await $.process.run(['python3', '-I', script, 'downgrade', '--from', change.from, '--to', change.model, '--bucket', change.bucket, '--percent', String(change.percent), ...(id ? ['--session', id] : [])], { timeoutMs: 5000 })
       if (result.exitCode !== 0) logFailure($, `downgrade record exited with code ${result.exitCode}`)
-    } catch (error) { logFailure($, `downgrade record failed: ${String(error)}`) }
+    } catch (error) { logFailure($, `${change ? 'downgrade record' : 'spawn bookkeeping'} failed: ${errorText(error)}`) }
+    return ran
+  }).catch(failOpen)
+
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      const version = conversationVersion
+      if (conversationChanged) refreshConversation(version, ...await loadConversation($, backgroundIO.writes))
+      if (version === conversationVersion) core?.background.startTurn(e.turnId)
+    }
+    return next(e)
+  }).catch(failOpen)
+
+  on('turn.complete', async ($, e, next) => {
+    const version = conversationVersion
+    const ran = await next(e)
+    if (e.agentId === undefined && core && version === conversationVersion) {
+      try {
+        core.background.completeTurn(e.turnId)
+        scheduleWakes($, backgroundIO, core, script, () => mode !== 'off' && !conversationChanged && version === conversationVersion)
+      } catch (error) { logFailure($, `wake scheduling failed: ${errorText(error)}`) }
+    }
     return ran
   }).catch(failOpen)
 

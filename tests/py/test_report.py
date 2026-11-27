@@ -305,7 +305,10 @@ class ReportTests(CrossfeedCase):
                          "subagents moved to a cheaper model: 0\n"
                          "jobs handed off because of: model limit 1, account week 1, Codex surplus 1\n"
                          "subagent calls: 0; not eligible: 0; handed to Codex: 0 (run: 0); stayed on Claude: 0\n"
-"jobs: 14 (done 12, failed 1, limit 0, timeout 1, interrupted 0); codex tokens: 2900000; median: 6m05s\n"
+                         "agent starts: unavailable\n"
+                         "breaker stops: unavailable\n"
+                         "wake-ups: unavailable\n"
+                         "jobs: 14 (done 12, failed 1, limit 0, timeout 1, interrupted 0); codex tokens: 2900000; median: 6m05s\n"
                          "jobs by model: Codex default 10, custom 2, gpt-6.2-astra 2\n"
                          "launches stopped at the Codex stop: 1\n"
                          "nudges: balance on 1, balance off 1, stretch 2\n"
@@ -325,6 +328,7 @@ class ReportTests(CrossfeedCase):
             "limit_jobs": 1, "account_week_jobs": 1, "codex_surplus_jobs": 1,
             "by_model": {"Codex default": 10, "custom": 2, "gpt-6.2-astra": 2},
             "stops": 1, "nudges": {"balance-on": 1, "balance-off": 1, "stretch": 2},
+            "spawns": None, "breaker": None, "wakes": None,
             "decisions": {"total": 0, "ineligible": 0, "handed_off": 0, "run": 0, "stayed": 0},
             "used": {"yes": 0, "partly": 0, "no": 0, "unrated": 12},
         }
@@ -349,12 +353,49 @@ class ReportTests(CrossfeedCase):
                                  "subagents moved to a cheaper model: 0\n"
                                  "jobs handed off because of: model limit 0, account week 0, Codex surplus 0\n"
                                  "subagent calls: 0; not eligible: 0; handed to Codex: 0 (run: 0); stayed on Claude: 0\n"
-"jobs: 0 (done 0, failed 0, limit 0, timeout 0, interrupted 0); codex tokens: 0; median: n/a\n"
+                                 "agent starts: unavailable\n"
+                                 "breaker stops: unavailable\n"
+                                 "wake-ups: unavailable\n"
+                                 "jobs: 0 (done 0, failed 0, limit 0, timeout 0, interrupted 0); codex tokens: 0; median: n/a\n"
                                  "jobs by model: none\n"
                                  "launches stopped at the Codex stop: 0\n"
                                  "nudges: balance on 0, balance off 0, stretch 0\n"
                                  "first-delivery checks: A 0/0, B 0/0; unchecked: 0\n"
                                  "read-only results used: yes 0, partly 0, no 0; not rated: 0\n")
+
+    def test_report_counts_background_events_by_origin_trigger_and_outcome(self):
+        old = (self.now - datetime.timedelta(days=8)).isoformat()
+        self.write_records([
+            {"type": "spawn", "origin": "fork", "outcome": "started", "ts": old},
+            {"type": "spawn", "origin": "agent-tool", "outcome": "started", "ts": self.stamp},
+            {"type": "spawn", "origin": "agent-tool", "outcome": "unconfirmed", "ts": self.stamp},
+            {"type": "spawn", "origin": "workflow", "outcome": "refused", "ts": self.stamp},
+            {"type": "spawn", "origin": [], "outcome": "refused", "ts": self.stamp},
+            {"type": "breaker", "task_id": "job", "outcome": "stopped", "ts": self.stamp},
+            {"type": "breaker", "task_id": "agent", "outcome": "denied", "ts": self.stamp},
+            {"type": "wake", "trigger": "pace", "outcome": "prompt", "ts": self.stamp},
+            {"type": "wake", "trigger": "breaker", "outcome": "notice", "ts": self.stamp},
+        ])
+        result = run_crossfeed(["report", "--json"], env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["spawns"], {"agent-tool": {"started": 1, "refused": 0, "unconfirmed": 1},
+                                            "workflow": {"started": 0, "refused": 1, "unconfirmed": 0}})
+        self.assertEqual(report["breaker"], {"stopped": 1, "denied": 1, "error": 0})
+        self.assertEqual(report["wakes"], {"pace": {"prompt": 1, "notice": 0},
+                                          "breaker": {"prompt": 0, "notice": 1}})
+        text = run_crossfeed(["report"], env=self.env).stdout.decode()
+        self.assertIn("agent starts: agent-tool (started 1, refused 0, unconfirmed 1), "
+                      "workflow (started 0, refused 1, unconfirmed 0)\n", text)
+        self.assertIn("breaker stops: 1 stopped, 1 denied, 0 errors\n", text)
+        self.assertIn("wake-ups: pace (prompt 1, notice 0), breaker (prompt 0, notice 1)\n", text)
+
+    def test_report_distinguishes_older_events_from_legacy_ledger(self):
+        old = (self.now - datetime.timedelta(days=8)).isoformat()
+        self.write_records([{"type": "spawn", "origin": "fork", "outcome": "started", "ts": old}])
+        result = run_crossfeed(["report", "--json"], env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["spawns"], {})
 
     def test_report_decisions_and_used(self):
         old = (self.now - datetime.timedelta(days=8)).isoformat()

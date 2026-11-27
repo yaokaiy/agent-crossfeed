@@ -1,8 +1,45 @@
 import { DEFAULTS } from './config'
 import type { Mode } from './config'
-import type { AccountWeek, BucketState, CodexWindow, FloorCause, HandOffReason } from './policy'
+import type { AccountWeek, BucketState, CodexWindow, FloorCause, HandOffReason, ShortWindow } from './policy'
 
 export type LimitFact = { label: string; family?: string; percent: number; line?: number; resetsAt?: number; state: 'ahead' | 'full' }
+
+function windowReading(window: ShortWindow): string {
+  const reset = window.resetsAt === undefined ? 'reset unknown' : 'resets at ' + new Date(window.resetsAt).toISOString()
+  const pace = window.minutesLeft === undefined ? 'pace unknown'
+    : `pace ${window.rate!.toFixed(2)} points/min, full in ${Math.max(0, Math.ceil(window.minutesLeft))} min`
+  return `Claude 5h ${window.percentUsed}% used, ${reset}, ${pace}`
+}
+
+export function spawnDenial(window: ShortWindow, workflow: boolean): string {
+  const resume = workflow ? ' The coordinator can resume the run after the reset (`resumeFromRunId`).' : ''
+  return `${windowReading(window)}. crossfeed refuses new background Claude agents while the window is short; this agent did not start.${resume}`
+}
+
+export function paceWarning(window: ShortWindow): string {
+  return `crossfeed: ${windowReading(window)}. At this pace the 5-hour window will fill before reset.`
+}
+
+export function shortWindowStatus(shedPercent: number, window: ShortWindow | 'missing' | 'expired-age' | 'expired-reset'): string {
+  const prefix = `Claude 5h short window (shed line ${shedPercent}%): `
+  if (window === 'missing') return prefix + 'unknown (no 5-hour reading)'
+  if (window === 'expired-age') return prefix + 'unknown (reading without a reset expired after 10 minutes)'
+  if (window === 'expired-reset') return prefix + 'unknown (reading expired at reset)'
+  if (window.shed && window.pace) return prefix + 'short (shed and pace lines)'
+  if (window.shed) return prefix + 'short (shed line)'
+  return prefix + (window.pace ? 'short (pace line)' : 'not short')
+}
+
+export type WakeStop = { id: string; runId?: string; outcome: 'stopped' | 'denied'; reason?: string }
+
+export function wakeText(window: ShortWindow, stops: WakeStop[]): string {
+  const details = stops.map(({ id, runId, outcome, reason }) => {
+    const run = runId ? (outcome === 'stopped' ? ` (run ${runId}, resume via \`resumeFromRunId\` after reset)` : ` (run ${runId})`) : ''
+    return outcome === 'stopped' ? `Stopped task ${id}${run}.` : `TaskStop denied for task ${id}${run}. ${reason ?? 'Permission denied'}.`
+  })
+  if (!details.length) details.push('At this pace the 5-hour window will fill before reset.')
+  return `crossfeed: ${windowReading(window)}. ${details.join(' ')} Please keep a hand-off note.`
+}
 
 // /advisor takes these names only; a label such as "Sonnet only" is not one.
 const ADVISOR_MODELS = ['fable', 'opus', 'sonnet']
@@ -72,6 +109,7 @@ export function staticSection(script: string, codexStopPercent = DEFAULTS.codexS
     'This session can hand self-contained work to the Codex CLI, which runs on a separate subscription. crossfeed watches both quotas and tells you when to use it.',
     '- When a subagent call is refused with a message that starts with "crossfeed:", run the command in that message. Do not retry the subagent.',
     '- When a crossfeed notice says hand-offs are on, decide at the start of each task, before your first command: if its core is execution with a result you can check (run the tests and fix until they pass, a change across several files, three or more dependent shell steps, a search or data analysis over many files), write a full brief and run it on Codex. Keep talking with the user, design, architecture and UX decisions, steps that need tools only you have, and edits under about 20 lines for yourself.',
+    "- A workflow's agents all run on Claude, so while hand-offs are on, launch heavy workflows one at a time.",
     `- Start a job as a background Bash command: \`python3 -I ${shellQuote(script)} run --kind task|review|research [--write]${stop}\` with the brief on stdin. \`task\` is execution; \`review\` and \`research\` are judgment, and crossfeed gives them its strongest Codex model. You are notified when it exits. Never poll, sleep, or read its output early.`,
     '- A brief states the goal, the decisions already made, paths, constraints, the check command and the format of the answer. Codex sees none of this conversation.',
     `- To fix or extend the same work, continue its thread with \`run --resume <job>${stop}\` and only the new instructions.`,

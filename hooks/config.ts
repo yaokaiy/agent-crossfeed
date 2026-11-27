@@ -8,6 +8,8 @@ export type Config = {
   eligibleTypes: string[]
   stretchCalls: number
   codexStopPercent: number
+  shedPercent: number
+  wake: boolean
   timeoutMinutes: number
 }
 
@@ -19,6 +21,8 @@ export const DEFAULTS: Config = {
   eligibleTypes: ['general-purpose', 'claude'],
   stretchCalls: 12,
   codexStopPercent: 85,
+  shedPercent: 85,
+  wake: true,
   timeoutMinutes: 30,
 }
 
@@ -39,6 +43,9 @@ export function toConfig(options: Record<string, unknown> | undefined): Config {
     stretchCalls: positiveNumber(values.stretchCalls, DEFAULTS.stretchCalls),
     codexStopPercent: typeof values.codexStopPercent === 'number' && values.codexStopPercent > 0 && values.codexStopPercent <= 100
       ? values.codexStopPercent : DEFAULTS.codexStopPercent,
+    shedPercent: typeof values.shedPercent === 'number' && values.shedPercent > 0 && values.shedPercent <= 100
+      ? values.shedPercent : DEFAULTS.shedPercent,
+    wake: typeof values.wake === 'boolean' ? values.wake : DEFAULTS.wake,
     timeoutMinutes: positiveNumber(values.timeoutMinutes, DEFAULTS.timeoutMinutes),
   }
 }

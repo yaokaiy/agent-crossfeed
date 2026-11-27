@@ -1,5 +1,6 @@
 # engine-written type declarations
 .claude-plugin/types/
+/tsconfig.json
 __pycache__/
 *.pyc
 .DS_Store

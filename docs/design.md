@@ -62,9 +62,9 @@ Constraints the design works under:
 
 ## The decision
 
-Each time the main agent is about to start a subagent, crossfeed asks
-separate questions. Routing research keeps "which model suits this task"
-apart from "how tight is the budget", and so does this design (see
+Crossfeed decides whether to admit every agent start Claude Code exposes.
+It also evaluates main-loop Agent calls for Codex hand-off. Routing research
+keeps "which model suits this task" apart from "how tight is the budget" (see
 [References](#references)).
 
 ### 1. Eligibility
@@ -260,11 +260,11 @@ that family, or names none and the main loop runs on that family.
   to move a subagent call.
 - A subagent that still starts on Claude runs on the `premiumFallback`
   model (default `opus`; empty turns this off) when its type is
-  `general-purpose` or `claude`, it is not a fork, and either it named no
-  model (or `inherit`) or the family is `full` (a call that names a full
+  `general-purpose`, `claude`, or `workflow-subagent`, it is not a fork, and
+  either it named no model (or `inherit`) or the family is `full` (a call that names a full
   model would fail). The fallback must be of a cheaper family (haiku <
   sonnet < opus < fable) that is not itself `ahead` or `full`; otherwise
-  nothing is rewritten. The list of types is fixed: both inherit the
+  nothing is rewritten. The list of types is fixed: these types inherit the
   parent's model, while other types may set their own, which the plugin
   cannot see, and rewriting those could make them more expensive. The
   plugin records a rewrite only when the started subagent's model is of
@@ -299,6 +299,34 @@ and the burst alone would have handed it off, keeping the usual 5-hour
 reading requirement. If the call would have stayed, the first applicable
 cause is `limit`, `account-week` or `codex-surplus`, in that order.
 The command passes it as `--cause`. Other hand-offs have no recorded cause.
+
+**Background admission.** Outside `off`, crossfeed refreshes Claude usage at
+every agent start. It refuses workflow agents, background starts and
+descendants of background work while the 5-hour window is short. Synchronous
+starts in the main loop's foreground chain can still run. Admitted starts
+then follow the model rule in section 5. A workflow refusal explains how
+the coordinator can resume the run after reset.
+
+The window is short at `shedPercent` (default 85%), or when rising usage
+measured over at least 10 minutes would fill it within 15 minutes and
+before its reset. A reading expires at its reset, or after 10 minutes
+when the reset is unknown.
+
+**Breaker and wake-up.** At the first reading at or above the shed line,
+the breaker selects the tasks this conversation has already registered and
+tries to stop them with TaskStop. It checks TaskStop permission, reports
+explicit denials and retries those tasks on later readings at or above the
+line. The first qualifying pace reading queues a warning. A pace crossing
+while the conversation has a registered task, or a confirmed stop or a
+reported denial, can submit one wake-up prompt per window to an idle
+coordinator with an attached surface. The allowance is kept in memory, so
+a plugin reload or a resumed conversation starts it over. Breaker messages
+name stopped tasks or denied stops and give the `resumeFromRunId`
+instruction for each stopped workflow with a known run ID. Other wake-up
+messages are queued for the next eligible main-loop tool result or
+ordinary prompt and, with `wake` on, shown in a toast. Set `wake` to false
+to queue the messages only. Mode `off` disables admission protection,
+stops and wake-ups.
 
 **Main loop.** Hand-offs are on with `g >= 0.5`, steering enabled, no
 5-hour reading at or above 90%, and at least one of these reasons:
@@ -484,6 +512,7 @@ plugin.
   `balance-on`, `balance-off` or `stretch`. The line records the session,
   kind, reasons and the call count (null for balance notices). Writes are
   best effort on both prompt and tool-result delivery.
+  Agent starts, breaker outcomes and wake-ups use a shared batch writer.
 - **Claude usage.** `claude-usage` reads model-scoped weekly limits as
   section 5 says. It finds Claude Code through `$CROSSFEED_CLAUDE`, then
   `PATH`, then `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`.
@@ -553,6 +582,8 @@ If a hook throws, it logs the failure and lets the original event continue.
   Codex and of those how many are linked by their saved brief to a job that
   has ended, and how many stayed on Claude (eligible calls it did not hand
   off, including any that another hook refused afterwards);
+- **agent starts** by origin and outcome, **breaker stops** and **wake-ups**.
+  These counts are unavailable on ledgers without the new rows;
 - **read-only results**: how many successful read-only jobs the model
   rated as used, partly used or not used, and how many it did not rate;
 - **model limits**: lockouts per limit and the time from each to its reset,
@@ -601,6 +632,9 @@ change the options or open an issue with the numbers.
 - Calls are counted per session. Subagents started from two sessions at
   the same time are not seen as one burst, and subagents that are already
   running cannot be moved.
+- The breaker acts on this conversation's registered tasks. Claude Code
+  exposes no admission event for some forked skills. Usage reports can
+  lag behind requests already in flight.
 - Model limits are parsed from text Claude Code prints for people. A change
   in that text makes the reading fail (no limit is acted on) until the
   parser is updated. A feature request to expose these limits to plugins

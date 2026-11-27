@@ -6,6 +6,7 @@
     "name": "yaokaiy"
   },
   "license": "MIT",
+  "types": "./types/index.d.ts",
   "userConfig": {
     "mode": {
       "type": "string",
@@ -60,6 +61,18 @@
       "title": "Codex stop percentage",
       "description": "Stop handing off new work when a long Codex quota window reaches this percentage. Use a value greater than 0 and at most 100.",
       "default": 85
+    },
+    "shedPercent": {
+      "type": "number",
+      "title": "Claude background shed percentage",
+      "description": "Refuse new background Claude agents and try to stop this conversation's registered background tasks when Claude's 5-hour window reaches this percentage. Use a value greater than 0 and at most 100.",
+      "default": 85
+    },
+    "wake": {
+      "type": "boolean",
+      "title": "Wake the coordinator",
+      "description": "Send a prompt to the idle coordinator when background work puts the 5-hour window at risk or the breaker acts.",
+      "default": true
     },
     "timeoutMinutes": {
       "type": "number",

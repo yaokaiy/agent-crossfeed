@@ -1,14 +1,227 @@
+import type { BackgroundState, BackgroundTask as Task } from '../types'
 import type { Config, Mode } from './config'
-import { CODEX_MAX_AGE, INITIAL_PRESSURE, accountWeekState, bucketState, codexSurplus, familyOf, fallbackFor, rewriteModel, subagentFamily, decide, eligible, fit, forecast, headroomCause, knownHeadroom, shortProblem, pressure, updatePressure, weeklyWindow } from './policy'
-import type { AgentCall, BucketState, ClaudeReading, CodexReading, UsageReading, BucketView, Family, FloorCause, HandOffReason, Tier } from './policy'
-import { balanceOffText, balanceOnText, limitLines, limitNotice, denyText, dispatchCommand, heredocDelimiter, pressureNotice, reserveNotice, statusLine, stretchReminder } from './text'
+import { CODEX_MAX_AGE, FIVE_HOUR_WINDOW_MS, INITIAL_PRESSURE, accountWeekState, bucketState, codexSurplus, familyOf, fallbackFor, rewriteModel, subagentFamily, decide, eligible, fit, forecast, headroomCause, knownHeadroom, shortProblem, pressure, shortWindow, spawnOrigin, updatePressure, weeklyWindow } from './policy'
+import type { AgentCall, BucketState, ClaudeReading, CodexReading, UsageReading, BucketView, Family, FiveHour, FloorCause, HandOffReason, PressureState, ShortWindow, Spawn, SpawnOrigin, Tier } from './policy'
+import { balanceOffText, balanceOnText, limitLines, limitNotice, denyText, dispatchCommand, heredocDelimiter, paceWarning, pressureNotice, reserveNotice, shortWindowStatus, spawnDenial, statusLine, stretchReminder, wakeText } from './text'
 
-import type { LimitFact } from './text'
+import type { LimitFact, WakeStop } from './text'
 
 export type Route = { tier: 'A' | 'B'; reason: string; limit?: LimitFact; cause?: FloorCause }
 export type Nudge = { session: string | null; kind: 'balance-on' | 'balance-off' | 'stretch'; reasons: HandOffReason[]; calls: number | null }
 export type Notice = { text: string; nudge?: Nudge }
-type Spawn = { subagentType: string; model?: string; fork: boolean; parentModel: string }
+type SpawnModel = Pick<Spawn, 'subagentType' | 'model' | 'fork' | 'parentModel'>
+type SpawnRow = { type: 'spawn'; session: string | null; origin: SpawnOrigin; run_id: string | null;
+  agent_index: number | null; model: string | null; outcome: 'started' | 'refused' | 'unconfirmed' }
+type BreakerRow = { type: 'breaker'; session: string | null; task_id: string; run_id: string | null;
+  outcome: 'stopped' | 'denied' | 'error'; reason: string | null }
+type WakeRow = { type: 'wake'; session: string | null; trigger: 'pace' | 'breaker'; outcome: 'prompt' | 'notice' }
+export type BackgroundRow = SpawnRow | BreakerRow | WakeRow
+export type StopResult = { outcome: BreakerRow['outcome'] | 'ended'; reason?: string }
+type Stop = { task: Task; session: string | null; conversation: number; window: number; reading: ShortWindow; wakeReady: boolean }
+type Wake = { trigger: WakeRow['trigger']; reading: ShortWindow; stops: WakeStop[]; ready: boolean }
+
+function createBackgroundProtection(config: Config, initialSession?: string, saved?: BackgroundState) {
+  let session = initialSession
+  let mode = config.mode
+  let current = saved ?? { tasks: [], lineage: [] }
+  let observed: (FiveHour & { at: number }) | undefined
+  let resetAt = current.shed?.resetAt
+  let window = 0
+  let conversation = 0
+  let paceShort = false
+  let paceWakeQueued = false
+  let paceWarned = false
+  let wakeHandled = false
+  let mainTurn: string | undefined
+  const stopping = new Map<Task, Stop>()
+  const denied = new Set<Task>()
+  let notices: Notice[] = []
+  let wakes: Wake[] = []
+
+  function windowAt(state: PressureState, now: number) {
+    return shortWindow(state, observed, now, config.shedPercent)
+  }
+
+  function shedMatchesWindow(shed: NonNullable<BackgroundState['shed']>, now: number): boolean {
+    if (resetAt !== undefined && shed.resetAt !== undefined) {
+      return Math.abs(shed.resetAt - resetAt) <= CLOCK_SKEW
+    }
+    const { crossedAt } = shed
+    if (crossedAt === undefined || crossedAt > now + CLOCK_SKEW) return false
+    if (resetAt !== undefined) {
+      return crossedAt >= resetAt - FIVE_HOUR_WINDOW_MS - CLOCK_SKEW && crossedAt < resetAt
+    }
+    return now - crossedAt < FIVE_HOUR_WINDOW_MS && (shed.resetAt === undefined || now < shed.resetAt)
+  }
+
+  function resetWakes(): void {
+    notices = []
+    wakes = []
+    paceWakeQueued = false
+    paceWarned = false
+    wakeHandled = false
+  }
+
+  function registerTask(task: Task): void {
+    if (current.tasks.some(existing => existing.id === task.id)) return
+    current = { ...current, tasks: [...current.tasks, task.runId ? task : { id: task.id }] }
+  }
+
+  function rememberAgent(agentId: string): void {
+    if (!current.lineage.includes(agentId)) current = { ...current, lineage: [...current.lineage, agentId] }
+  }
+
+  return {
+    snapshot: () => current,
+    registerTask,
+    registerAgent(agentId: string) {
+      rememberAgent(agentId)
+      registerTask({ id: agentId })
+    },
+    newConversation(id?: string, restored?: BackgroundState) {
+      session = id
+      conversation += 1
+      current = restored ?? { tasks: [], lineage: [],
+        ...(current.shed ? { shed: { ...current.shed, eligible: [] } } : {}) }
+      resetWakes()
+      mainTurn = undefined
+      denied.clear()
+      stopping.clear()
+    },
+    setMode(nextMode: Mode) {
+      mode = nextMode
+      if (mode === 'off') {
+        notices = []
+        if (wakes.some(wake => wake.trigger === 'pace')) paceWakeQueued = false
+        wakes = []
+      }
+    },
+    measure(reading: FiveHour, state: PressureState, now: number) {
+      const { resetsAt } = reading
+      const undatedCrossing = current.shed?.crossedAt ?? observed?.at
+      // A full window's elapsed time or a known start after the crossing retires an undated cutoff.
+      const moved = resetAt === undefined
+        ? undatedCrossing !== undefined && (now - undatedCrossing >= FIVE_HOUR_WINDOW_MS ||
+            (resetsAt !== undefined && resetsAt - FIVE_HOUR_WINDOW_MS > undatedCrossing + CLOCK_SKEW))
+        : resetsAt === undefined ? now >= resetAt
+          : Math.abs(resetsAt - resetAt) > CLOCK_SKEW || (now >= resetAt && resetsAt > now)
+      if (moved) {
+        current = { tasks: current.tasks, lineage: current.lineage }
+        window += 1
+        paceShort = false
+        denied.clear()
+        resetWakes()
+      }
+      resetAt = resetsAt ?? (moved ? undefined : resetAt)
+      if (current.shed && !shedMatchesWindow(current.shed, now)) {
+        current = { tasks: current.tasks, lineage: current.lineage }
+      }
+      observed = { ...reading, at: now }
+      const latest = windowAt(state, now)
+      const paceCrossed = latest?.pace === true && !paceShort
+      paceShort = mode !== 'off' && latest?.pace === true
+      if (!latest) return
+      if (latest.shed && !current.shed) {
+        current = { ...current, shed: {
+          ...(resetAt === undefined ? {} : { resetAt }), crossedAt: now, eligible: current.tasks.map(task => task.id),
+        } }
+      } else if (current.shed && current.shed.resetAt === undefined && resetAt !== undefined) {
+        current = { ...current, shed: { ...current.shed, resetAt } }
+      }
+      if (!paceShort) return
+      if (!paceWarned) {
+        paceWarned = true
+        notices.push({ text: paceWarning(latest) })
+      }
+      if (paceCrossed && !paceWakeQueued && current.tasks.length) {
+        paceWakeQueued = true
+        wakes.push({ trigger: 'pace', reading: latest, stops: [], ready: false })
+      }
+    },
+    describe(state: PressureState, now: number) {
+      const latest = windowAt(state, now)
+      return shortWindowStatus(config.shedPercent, latest ?? (!observed ? 'missing'
+        : observed.resetsAt === undefined ? 'expired-age' : 'expired-reset'))
+    },
+    admission(spawn: Spawn, state: PressureState, now: number) {
+      const fromBackground = !!spawn.parentAgentId && current.lineage.includes(spawn.parentAgentId)
+      const background = !!spawn.workflow || spawn.background || fromBackground
+      const latest = windowAt(state, now)
+      const deny = mode !== 'off' && background && latest && (latest.shed || latest.pace)
+        ? spawnDenial(latest, !!spawn.workflow) : undefined
+      const row: Omit<SpawnRow, 'outcome'> | undefined = mode === 'off' ? undefined : {
+        type: 'spawn', session: session ?? null, origin: spawnOrigin(spawn), run_id: spawn.workflow?.runId ?? null,
+        agent_index: spawn.workflow?.agentIndex ?? null, model: spawn.model ?? null,
+      }
+      return { row, deny, background }
+    },
+    started(spawn: Spawn, agentId: string, background: boolean) {
+      const hasTask = spawn.isTeammate || (spawn.fork && !spawn.tool_use_id)
+      if (background || hasTask) rememberAgent(agentId)
+      if (hasTask) registerTask({ id: agentId })
+    },
+    beginStops(state: PressureState, now: number): Stop[] {
+      const latest = windowAt(state, now)
+      if (mode === 'off' || !latest?.shed || !current.shed) return []
+      const eligible = new Set(current.shed.eligible)
+      return current.tasks.filter(task => eligible.has(task.id) && !stopping.has(task)).map(task => {
+        const stop = { task, session: session ?? null, conversation, window, reading: latest, wakeReady: false }
+        stopping.set(task, stop)
+        return stop
+      })
+    },
+    finishStop(stop: Stop, result: StopResult | undefined): BreakerRow | undefined {
+      const { task } = stop
+      if (stopping.get(task) === stop) stopping.delete(task)
+      if (!result) return undefined
+      const { outcome, reason } = result
+      if (stop.conversation === conversation) {
+        if (outcome === 'ended' || outcome === 'stopped') {
+          denied.delete(task)
+          current = { ...current, tasks: current.tasks.filter(existing => existing !== task) }
+        }
+        if (stop.window === window && mode !== 'off' && (outcome === 'stopped' || outcome === 'denied')) {
+          if (outcome === 'denied' && denied.has(task)) return undefined
+          if (outcome === 'denied') denied.add(task)
+          const detail = { ...task, outcome, reason }
+          const last = wakes[wakes.length - 1]
+          if (last?.trigger === 'breaker' && last.ready === stop.wakeReady) last.stops.push(detail)
+          else wakes.push({ trigger: 'breaker', reading: stop.reading, stops: [detail], ready: stop.wakeReady })
+        }
+      }
+      if (outcome === 'ended') return undefined
+      return { type: 'breaker', session: stop.session, task_id: task.id, run_id: task.runId ?? null, outcome, reason: reason ?? null }
+    },
+    startTurn(id: string) { mainTurn = id },
+    completeTurn(id: string) { if (mainTurn === id) mainTurn = undefined },
+    releaseWakes() {
+      // A measure or main-loop completion releases only events and stops it has seen.
+      for (const wake of wakes) wake.ready = true
+      for (const stop of stopping.values()) stop.wakeReady = true
+    },
+    hasWake: () => wakes[0]?.ready === true,
+    takeWake(hasSurface: boolean) {
+      if (mode === 'off' || !wakes[0]?.ready) return undefined
+      const event = wakes.shift()!
+      const text = wakeText(event.reading, event.stops)
+      const prompt = !wakeHandled && config.wake && mainTurn === undefined && hasSurface
+      wakeHandled = true
+      if (!prompt) notices.push({ text })
+      const row: WakeRow = { type: 'wake', session: session ?? null, trigger: event.trigger, outcome: prompt ? 'prompt' : 'notice' }
+      return { text, row, toast: !prompt && config.wake }
+    },
+    keepWakeNotice(text: string) {
+      if (mode === 'off') return false
+      notices.push({ text })
+      return config.wake
+    },
+    takeNotices() {
+      const queued = notices
+      notices = []
+      return queued
+    },
+  }
+}
 
 // One ledger line per routing decision, built from plain values when the call is decided.
 export type DecisionRecord = {
@@ -41,11 +254,14 @@ export type DecisionRecord = {
 }
 
 export type Core = {
-  newConversation(session: string | undefined): void
+  newConversation(session: string | undefined, background?: BackgroundState): void
+  background: ReturnType<typeof createBackgroundProtection>
+  admission(spawn: Spawn, now: number): ReturnType<Core['background']['admission']>
+  beginStops(now: number): Stop[]
   setUsage(reading: UsageReading | undefined, problem: string | undefined, now: number): void
   usageAge(now: number): number
   setMainModel(model: string | undefined, now: number): void
-  spawnModel(e: Spawn, now: number): { model: string; from: string; bucket: string; percent: number } | undefined
+  spawnModel(e: SpawnModel, now: number): { model: string; from: string; bucket: string; percent: number } | undefined
   bucketLockout(now: number): { bucket: string; resetAt: string } | undefined
   measure(reading: ClaudeReading, now: number): void
   setCodex(reading: CodexReading | undefined, problem?: string, now?: number): void
@@ -77,8 +293,9 @@ function recentStays(stays: number[], now: number): number[] {
   return stays.filter(time => time >= now - 10 * 60000 && time <= now + CLOCK_SKEW)
 }
 
-export function createCore(config: Config, script: string, session?: string): Core {
+export function createCore(config: Config, script: string, session?: string, saved?: BackgroundState): Core {
   let mode = config.mode
+  const background = createBackgroundProtection(config, session, saved)
   let usage: UsageReading | undefined
   let usageProblem: string | undefined
   let usageAttempted = false
@@ -136,7 +353,7 @@ export function createCore(config: Config, script: string, session?: string): Co
     limitNotices.push({ family, state: limit.state })
   }
 
-  function spawnModel(e: Spawn, now: number) {
+  function spawnModel(e: SpawnModel, now: number) {
     const change = rewriteModel({ ...e, mode, fallback: config.premiumFallback, views: familyViews(now) })
     return change === undefined ? undefined : {
       model: change.model, from: !e.model || e.model === 'inherit' ? e.parentModel : e.model,
@@ -222,6 +439,7 @@ export function createCore(config: Config, script: string, session?: string): Co
       queued.push({ text: pendingReserve })
       pendingReserve = undefined
     }
+    queued.push(...background.takeNotices())
     for (const note of limitNotices) {
       if (open && familyOf(mainModel) === note.family && limit?.state === note.state) {
         queued.push({ text: limitNotice({ ...limit, fallback: fallbackFor(note.family, config.premiumFallback, familyViews(now)) ?? '' }) })
@@ -259,8 +477,12 @@ export function createCore(config: Config, script: string, session?: string): Co
   }
 
   return {
-    newConversation(nextSession) {
+    background,
+    admission: (spawn, now) => background.admission(spawn, state, now),
+    beginStops: now => background.beginStops(state, now),
+    newConversation(nextSession, savedBackground) {
       session = nextSession
+      background.newConversation(nextSession, savedBackground)
       pendingPressure = undefined
       pendingReserve = undefined
       lastBalance = undefined
@@ -314,6 +536,7 @@ export function createCore(config: Config, script: string, session?: string): Co
       reading = nextReading
       sevenDayReadAt = now
       state = nextState
+      if (nextReading.fiveHour) background.measure(nextReading.fiveHour, state, now)
       notifyLimit(now)
       if ((reading.fiveHour?.percentUsed ?? 0) < 90 && pendingReserve) {
         pendingReserve = undefined
@@ -465,6 +688,7 @@ export function createCore(config: Config, script: string, session?: string): Co
 
     setMode(nextMode) {
       mode = nextMode
+      background.setMode(nextMode)
       if (mode === 'off') {
         pendingPressure = undefined
         pendingReserve = undefined
@@ -495,6 +719,7 @@ export function createCore(config: Config, script: string, session?: string): Co
         status(now),
         ...tiers,
         lastDecision,
+        background.describe(state, now),
         `Claude all-models weekly: ${account.percent === undefined ? 'usage unknown' : `${Math.round(account.percent)}% used`}, even pace ${account.line === undefined ? 'unknown' : `${Math.round(account.line)}%`}, ${account.state}`,
         `Codex weekly surplus: ${surplusStatus}`,
         reasons.length ? `hand-offs: on (${reasons.join(', ')})` : 'hand-offs: off',

@@ -4,6 +4,37 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- crossfeed checks every agent start Claude Code exposes, including
+  workflow agents. While the 5-hour window is short (at the `shedPercent`
+  shed line, 85% by default, or when the current pace would fill it within
+  15 minutes and before its reset), it refuses new workflow agents,
+  background agents and the agents they start. A subagent the main loop
+  waits for passes this check.
+- At the first reading at or above the shed line, the breaker tries to
+  stop background tasks already registered by this conversation. It
+  reports explicit TaskStop denials and retries unresolved tasks on later
+  readings at or above the line. With `wake` enabled, a pace crossing with
+  registered work, a confirmed stop, or an explicit denial can wake an idle
+  coordinator with an attached surface. The one-prompt allowance per window
+  resets on plugin reload or conversation resume. Breaker messages identify
+  stopped tasks or denied stops and explain how to resume each stopped
+  workflow with a known run ID.
+- `/crossfeed status` shows the short-window state. `/crossfeed report`
+  counts agent starts by origin and outcome, breaker stops and wake-ups,
+  which the plugin writes through the new `crossfeed.py record` command.
+  Agent-start, breaker and wake-up counts show as unavailable until the
+  ledger contains a valid event of one of those kinds.
+
+### Changed
+
+- Workflow agents follow the Claude model fallback rule. The static
+  guidance asks the coordinator to launch heavy workflows one at a time
+  while hand-offs are on.
+
 ## 0.4.0 - 2026-11-26
 
 ### Added

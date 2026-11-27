@@ -64,6 +64,7 @@ export type PressureState = {
 export const INITIAL_PRESSURE: PressureState = { p: 0, updatedAt: 0, samples: [] }
 
 const MINUTE = 60000
+export const FIVE_HOUR_WINDOW_MS = 300 * MINUTE
 
 // A Codex reading older than this, or dated this far ahead of the clock, gives no headroom and shows as stale.
 export const CODEX_MAX_AGE = 15 * MINUTE
@@ -102,12 +103,43 @@ function usageRate(samples: PressureState['samples'], u: number, now: number): n
   return elapsed > 0 ? Math.max(0, (u - ref.u) / elapsed) : undefined
 }
 
+export type FiveHour = NonNullable<ClaudeReading['fiveHour']>
+export type ShortWindow = FiveHour & { shed: boolean; pace: boolean; rate?: number; minutesLeft?: number }
+
+export function shortWindow(
+  state: PressureState, observed: (FiveHour & { at: number }) | undefined, now: number, shedPercent: number,
+): ShortWindow | undefined {
+  if (!observed) return undefined
+  const { percentUsed, resetsAt, at } = observed
+  if (now >= (resetsAt ?? at + 10 * MINUTE)) return undefined
+  const rate = resetsAt !== undefined && at - (state.samples[0]?.t ?? at) >= 10 * MINUTE
+    ? usageRate(state.samples, percentUsed, at) : undefined
+  const minutesLeft = rate && rate > 0 ? (100 - percentUsed) / rate : undefined
+  return { percentUsed, resetsAt, rate, minutesLeft, shed: percentUsed >= shedPercent,
+    pace: minutesLeft !== undefined && resetsAt !== undefined && minutesLeft <= 15 && minutesLeft < (resetsAt - now) / MINUTE }
+}
+
+export type SpawnOrigin = 'workflow' | 'fork' | 'teammate' | 'resume' | 'agent-tool' | 'other'
+export type Spawn = {
+  subagentType: string; model?: string; fork: boolean; parentModel: string
+  tool_use_id: string; background: boolean; parentAgentId?: string; isTeammate?: boolean
+  workflow?: { runId: string; agentIndex: number }; resume?: { agentId: string }
+}
+
+export function spawnOrigin(spawn: Spawn): SpawnOrigin {
+  if (spawn.workflow) return 'workflow'
+  if (spawn.fork) return 'fork'
+  if (spawn.isTeammate) return 'teammate'
+  if (spawn.resume) return 'resume'
+  return spawn.tool_use_id ? 'agent-tool' : 'other'
+}
+
 export function updatePressure(state: PressureState, reading: ClaudeReading, now: number, lockoutResetAt?: number): PressureState {
   if (!reading.fiveHour) return state
   const { percentUsed: u, resetsAt } = reading.fiveHour
   // The start after a lockout uses this reading's own reset time, never a remembered one,
   // and holds only while the window is young: a session that starts or resumes later begins at 0.
-  const windowStart = (resetsAt ?? NaN) - 300 * MINUTE
+  const windowStart = (resetsAt ?? NaN) - FIVE_HOUR_WINDOW_MS
   const sinceLockout = windowStart - (lockoutResetAt ?? NaN)
   const windowAge = now - windowStart
   const p0 = sinceLockout >= -5 * MINUTE && sinceLockout < 120 * MINUTE && windowAge >= -5 * MINUTE && windowAge < 30 * MINUTE ? 0.3 : 0
@@ -237,7 +269,7 @@ export function subagentFamily(callModel: string | undefined, inheritedModel: st
   return familyOf(!callModel || callModel === 'inherit' ? inheritedModel : callModel)
 }
 
-export const REWRITE_TYPES = ['general-purpose', 'claude'] as const
+export const REWRITE_TYPES = ['general-purpose', 'claude', 'workflow-subagent'] as const
 
 export const MODEL_RANK: Record<Family, number> = { haiku: 0, sonnet: 1, opus: 2, fable: 3 }
 

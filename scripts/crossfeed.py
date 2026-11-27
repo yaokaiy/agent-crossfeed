@@ -316,15 +316,19 @@ def _create_job_dir(now: datetime.datetime) -> Path:
     raise FileExistsError("could not allocate a job directory after 5 attempts")
 
 
-def _write_ledger(ledger, record):
-    record = dict(record)
-    record.setdefault("v", 1)
-    record.setdefault(
-        "ts", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    )
-    ledger.write(json.dumps(record, ensure_ascii=False) + "\n")
+def _write_ledger_rows(ledger, records):
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for record in records:
+        record = dict(record)
+        record.setdefault("v", 1)
+        record.setdefault("ts", stamp)
+        ledger.write(json.dumps(record, ensure_ascii=False) + "\n")
     ledger.flush()
     os.fsync(ledger.fileno())
+
+
+def _write_ledger(ledger, record):
+    _write_ledger_rows(ledger, (record,))
 
 
 def _private_open(path, mode, **kwargs):
@@ -1243,6 +1247,76 @@ def _nudge(args) -> int:
     return 0
 
 
+SPAWN_ORIGINS = ("workflow", "fork", "teammate", "resume", "agent-tool", "other")
+SPAWN_OUTCOMES = ("started", "refused", "unconfirmed")
+BREAKER_OUTCOMES = ("stopped", "denied", "error")
+WAKE_TRIGGERS = ("pace", "breaker")
+WAKE_OUTCOMES = ("prompt", "notice")
+
+
+def _record_text(value, allow_empty=False):
+    if not isinstance(value, str) or (not value and not allow_empty):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _background_record(data):
+    """Validate and project rows onto the fields written by the plugin."""
+    if not isinstance(data, dict):
+        return None
+    kind, session = data.get("type"), data.get("session")
+    if session is not None and not _record_text(session):
+        return None
+    row = {"type": kind, "session": session}
+    if kind == "spawn":
+        origin, outcome = data.get("origin"), data.get("outcome")
+        run_id, index, model = data.get("run_id"), data.get("agent_index"), data.get("model")
+        if (origin not in SPAWN_ORIGINS or outcome not in SPAWN_OUTCOMES
+                or (run_id is not None and not _record_text(run_id, allow_empty=True))
+                or (index is not None and (type(index) is not int or index < 1))
+                or (model is not None and not _record_text(model, allow_empty=True))):
+            return None
+        return dict(row, origin=origin, outcome=outcome, run_id=run_id, agent_index=index, model=model)
+    if kind == "breaker":
+        task_id, run_id = data.get("task_id"), data.get("run_id")
+        outcome, reason = data.get("outcome"), data.get("reason")
+        if (not _record_text(task_id) or outcome not in BREAKER_OUTCOMES
+                or (run_id is not None and not _record_text(run_id))
+                or (reason is not None and not _record_text(reason))):
+            return None
+        return dict(row, task_id=task_id, run_id=run_id, outcome=outcome, reason=reason)
+    if kind == "wake":
+        trigger, outcome = data.get("trigger"), data.get("outcome")
+        if trigger in WAKE_TRIGGERS and outcome in WAKE_OUTCOMES:
+            return dict(row, trigger=trigger, outcome=outcome)
+    return None
+
+
+def _record(args) -> int:
+    rows = []
+    skipped = 0
+    for number, line in enumerate(sys.stdin.buffer):
+        try:
+            row = _background_record(json.loads(line.decode("utf-8-sig" if number == 0 else "utf-8"),
+                                                parse_constant=_reject_json_constant))
+        except (ValueError, RecursionError):
+            row = None
+        if row is None:
+            skipped += 1
+        else:
+            rows.append(row)
+    if rows:
+        with _private_open(home() / "ledger.jsonl", "a", encoding="utf-8") as ledger:
+            fcntl.flock(ledger, fcntl.LOCK_EX)
+            _write_ledger_rows(ledger, rows)
+    print(json.dumps({"written": len(rows), "skipped": skipped}))
+    return 0
+
+
 def _check(args) -> int:
     known = any(isinstance(record, dict) and record.get("type") == "job"
                 and record.get("id") == args.job for record in read_ledger())
@@ -1481,6 +1555,7 @@ def fold(records: list, since: datetime.datetime) -> dict:
         "bucket_lockouts": {}, "downgrades": {"total": 0, "by_bucket": {}},
         "limit_jobs": 0, "account_week_jobs": 0, "codex_surplus_jobs": 0,
         "by_model": {}, "stops": 0, "nudges": dict.fromkeys(NUDGE_KINDS, 0),
+        "spawns": None, "breaker": None, "wakes": None,
         "decisions": {"total": 0, "ineligible": 0, "handed_off": 0, "run": 0, "stayed": 0},
         "used": {"yes": 0, "partly": 0, "no": 0, "unrated": 0},
     }
@@ -1491,7 +1566,27 @@ def fold(records: list, since: datetime.datetime) -> dict:
         if not isinstance(record, dict):
             continue
         timestamp = _parse_timestamp(record.get("ts"))
-        if timestamp is None or timestamp < since:
+        if timestamp is None:
+            continue
+        kind = record.get("type")
+        if kind in ("spawn", "breaker", "wake"):
+            row = _background_record(record)
+            if row is None:
+                continue
+            if summary["spawns"] is None:
+                summary["spawns"] = {}
+                summary["breaker"] = dict.fromkeys(BREAKER_OUTCOMES, 0)
+                summary["wakes"] = {trigger: dict.fromkeys(WAKE_OUTCOMES, 0) for trigger in WAKE_TRIGGERS}
+            if timestamp >= since:
+                if kind == "spawn":
+                    counts = summary["spawns"].setdefault(row["origin"], dict.fromkeys(SPAWN_OUTCOMES, 0))
+                    counts[row["outcome"]] += 1
+                elif kind == "breaker":
+                    summary["breaker"][row["outcome"]] += 1
+                else:
+                    summary["wakes"][row["trigger"]][row["outcome"]] += 1
+            continue
+        if timestamp < since:
             continue
         if record.get("type") == "lockout":
             counts = summary
@@ -1551,6 +1646,20 @@ def _report_text(summary, days):
     statuses = summary["by_status"]
     models = ", ".join("{} {}".format(model, count) for model, count in sorted(summary["by_model"].items()))
     tier_a, tier_b = summary["by_tier"]["A"], summary["by_tier"]["B"]
+    spawns, breaker, wakes = summary["spawns"], summary["breaker"], summary["wakes"]
+    if spawns is None:
+        background = ["agent starts: unavailable", "breaker stops: unavailable", "wake-ups: unavailable"]
+    else:
+        origins = ["{} (started {}, refused {}, unconfirmed {})".format(
+            origin, counts["started"], counts["refused"], counts["unconfirmed"])
+                   for origin, counts in sorted(spawns.items())]
+        wake_counts = ["{} (prompt {}, notice {})".format(trigger, counts["prompt"], counts["notice"])
+                       for trigger, counts in wakes.items()]
+        background = [
+            "agent starts: " + (", ".join(origins) or "none"),
+            "breaker stops: {stopped} stopped, {denied} denied, {error} errors".format(**breaker),
+            "wake-ups: " + ", ".join(wake_counts),
+        ]
     return "\n".join([
         "crossfeed report, last {} days".format(days),
         "lockouts: {}; locked: {}h{:02d}m; unknown resets: {}".format(
@@ -1561,6 +1670,7 @@ def _report_text(summary, days):
         "Codex surplus {codex_surplus_jobs}".format(**summary),
         "subagent calls: {total}; not eligible: {ineligible}; handed to Codex: {handed_off} (run: {run}); "
         "stayed on Claude: {stayed}".format(**summary["decisions"]),
+        *background,
         "jobs: {} (done {}, failed {}, limit {}, timeout {}, interrupted {}); codex tokens: {}; median: {}".format(
             summary["jobs"], statuses["done"], statuses["failed"], statuses["limit"], statuses["timeout"],
             statuses["interrupted"], summary["tokens"], median_text),
@@ -1599,6 +1709,8 @@ def main(argv) -> int:
     decision.set_defaults(handler=_decision)
     nudge = subcommands.add_parser("nudge")
     nudge.set_defaults(handler=_nudge)
+    record = subcommands.add_parser("record")
+    record.set_defaults(handler=_record)
     check = subcommands.add_parser("check")
     check.add_argument("job")
     check.add_argument("check_command", nargs=argparse.REMAINDER)

@@ -84,13 +84,15 @@ test('toConfig supplies defaults and splits eligible types', async () => {
 
 test('toConfig validates types and finite positive numbers', async () => {
   for (const value of [0, -1, Infinity, -Infinity, NaN, '12', null]) {
-    expect(toConfig({ stretchCalls: value, codexStopPercent: value, timeoutMinutes: value })).toEqual(DEFAULTS)
+    expect(toConfig({ stretchCalls: value, codexStopPercent: value, timeoutMinutes: value, shedPercent: value })).toEqual(DEFAULTS)
   }
   expect(toConfig({ mode: 1, effort: false, model: 1, eligibleTypes: ['a'] })).toEqual(DEFAULTS)
   expect(toConfig({ mode: 'always', effort: 'xhigh', model: 'm', stretchCalls: 2, codexStopPercent: 80, timeoutMinutes: 5 })).toEqual({
     ...DEFAULTS, mode: 'always', effort: 'xhigh', model: 'm', stretchCalls: 2, codexStopPercent: 80, timeoutMinutes: 5,
   })
   expect(toConfig({ mode: 'off', effort: '', model: '' }).mode).toBe('off')
+  expect(toConfig({ shedPercent: 100, wake: false })).toEqual({ ...DEFAULTS, shedPercent: 100, wake: false })
+  expect(toConfig({ shedPercent: 101, wake: 'false' })).toEqual(DEFAULTS)
 })
 
 test('fit recognises the spellings the documentation lists', async () => {

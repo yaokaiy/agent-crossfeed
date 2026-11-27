@@ -42,6 +42,106 @@ function cleanStatus(core: Core, now = BASE): void {
   expect(core.describe(now).includes('\n')).toBe(true)
 }
 
+test('the breaker replaces an undated cutoff when a later reading establishes a new window', async () => {
+  for (const [now, resetsAt] of [[BASE + 60 * MINUTE, RESET + 60 * MINUTE], [RESET + MINUTE, undefined]] as const) {
+    const core = createCore(DEFAULTS, SCRIPT)
+    core.measure({ fiveHour: { percentUsed: 85 } }, BASE)
+    core.measure({ fiveHour: { percentUsed: 5, resetsAt } }, now)
+    core.background.registerTask({ id: 'before-crossing' })
+    core.measure({ fiveHour: { percentUsed: 85, resetsAt } }, now + MINUTE)
+    core.background.registerTask({ id: 'after-crossing' })
+    expect(core.beginStops(now + MINUTE).map(stop => stop.task.id)).toEqual(['before-crossing'])
+  }
+})
+
+test('a reset learned for the same window preserves the breaker cutoff', async () => {
+  const core = createCore(DEFAULTS, SCRIPT)
+  core.background.registerTask({ id: 'before-crossing' })
+  core.measure({ fiveHour: { percentUsed: 85 } }, BASE)
+  core.background.registerTask({ id: 'after-crossing' })
+  measure(core, 85, BASE + MINUTE)
+  expect(core.beginStops(BASE + MINUTE).map(stop => stop.task.id)).toEqual(['before-crossing'])
+})
+
+test('resuming reuses an undated shed cutoff only in its own window', async () => {
+  const original = ['before-old-crossing']
+  const renewed = [...original, 'after-old-crossing']
+  for (const [now, resetsAt, eligible] of [
+    [BASE + 60 * MINUTE, RESET + 60 * MINUTE, renewed],
+    [RESET + MINUTE, undefined, renewed],
+    [BASE + 60 * MINUTE, RESET, original],
+    [BASE + 60 * MINUTE, undefined, original],
+  ] as const) {
+    const core = createCore(DEFAULTS, SCRIPT, 'first')
+    core.background.registerTask({ id: 'before-old-crossing' })
+    core.measure({ fiveHour: { percentUsed: 85 } }, BASE)
+    core.background.registerTask({ id: 'after-old-crossing' })
+    const saved = core.background.snapshot()
+
+    core.newConversation('second')
+    core.measure({ fiveHour: { percentUsed: 30, resetsAt } }, now)
+    core.newConversation('first', saved)
+    core.measure({ fiveHour: { percentUsed: 85, resetsAt } }, now + MINUTE)
+    core.background.registerTask({ id: 'after-resumed-crossing' })
+    expect(core.beginStops(now + MINUTE).map(stop => stop.task.id)).toEqual(eligible)
+  }
+})
+
+test('a pace warning without tasks leaves a later pace crossing eligible to wake', async () => {
+  const core = createCore(DEFAULTS, SCRIPT)
+  measure(core, 10)
+  measure(core, 50, BASE + 10 * MINUTE)
+  expect(core.takeNotices().filter(notice => notice.text.includes('window will fill before reset')).length).toBe(1)
+  core.background.registerTask({ id: 'workflow' })
+  measure(core, 50, BASE + 10 * MINUTE)
+  core.background.releaseWakes()
+  expect(core.background.takeWake(true)).toBe(undefined)
+  measure(core, 50, BASE + 20 * MINUTE)
+  measure(core, 80, BASE + 30 * MINUTE)
+  expect(core.takeNotices().filter(notice => notice.text.includes('window will fill before reset')).length).toBe(0)
+  core.background.releaseWakes()
+  expect(core.background.takeWake(true)?.row).toEqual({ type: 'wake', session: null, trigger: 'pace', outcome: 'prompt' })
+})
+
+test('off releases a discarded pace wake without reopening a delivered one', async () => {
+  const core = createCore(DEFAULTS, SCRIPT)
+  core.background.registerTask({ id: 'workflow' })
+  measure(core, 10)
+  measure(core, 50, BASE + 10 * MINUTE)
+  core.background.releaseWakes()
+  expect(core.background.hasWake()).toBe(true)
+  core.setMode('off')
+  expect(core.background.hasWake()).toBe(false)
+  core.setMode('auto')
+  measure(core, 50, BASE + 20 * MINUTE)
+  measure(core, 80, BASE + 30 * MINUTE)
+  core.background.releaseWakes()
+  expect(core.background.takeWake(true)?.row).toEqual({ type: 'wake', session: null, trigger: 'pace', outcome: 'prompt' })
+
+  core.setMode('off')
+  core.setMode('auto')
+  measure(core, 80, BASE + 40 * MINUTE)
+  measure(core, 90, BASE + 50 * MINUTE)
+  core.background.releaseWakes()
+  expect(core.background.takeWake(true)).toBe(undefined)
+})
+
+test('status explains the shed threshold, short-window lines and missing or expired readings', async () => {
+  const core = createCore({ ...DEFAULTS, shedPercent: 84 }, SCRIPT)
+  const line = (now: number) => core.describe(now).split('\n').filter(text => text.startsWith('Claude 5h short window'))
+  expect(line(BASE)).toEqual(['Claude 5h short window (shed line 84%): unknown (no 5-hour reading)'])
+  core.measure({ fiveHour: { percentUsed: 84 } }, BASE)
+  expect(line(BASE)).toEqual(['Claude 5h short window (shed line 84%): short (shed line)'])
+  expect(line(BASE + 10 * MINUTE)).toEqual(['Claude 5h short window (shed line 84%): unknown (reading without a reset expired after 10 minutes)'])
+  measure(core, 40, BASE + 11 * MINUTE)
+  expect(line(BASE + 11 * MINUTE)).toEqual(['Claude 5h short window (shed line 84%): not short'])
+  measure(core, 64, BASE + 21 * MINUTE)
+  expect(line(BASE + 21 * MINUTE)).toEqual(['Claude 5h short window (shed line 84%): short (pace line)'])
+  measure(core, 84, BASE + 31 * MINUTE)
+  expect(line(BASE + 31 * MINUTE)).toEqual(['Claude 5h short window (shed line 84%): short (shed and pace lines)'])
+  expect(line(RESET)).toEqual(['Claude 5h short window (shed line 84%): unknown (reading expired at reset)'])
+})
+
 test('tier A is denied in a fresh low-usage window with a quoted write command', async () => {
   const core = createCore(DEFAULTS, SCRIPT, 'session-1')
   core.setCodex(codex())
