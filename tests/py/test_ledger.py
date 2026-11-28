@@ -344,7 +344,7 @@ for number in range(200):
     def test_version(self):
         result = run_crossfeed(["--version"], env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, b"crossfeed 0.5.0\n")
+        self.assertEqual(result.stdout, b"crossfeed 0.5.1\n")
 
     def test_data_directory_and_job_files_are_private_with_permissive_umask(self):
         self.home.rmdir()

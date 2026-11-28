@@ -41,7 +41,7 @@ def app_server():
         if method == "initialize":
             assert request == {
                 "id": 1, "method": "initialize",
-                "params": {"clientInfo": {"name": "crossfeed", "version": "0.5.0"}},
+                "params": {"clientInfo": {"name": "crossfeed", "version": "0.5.1"}},
             }
             if mode == "garbage":
                 print("not json: 检查 naïve\r", flush=True)
