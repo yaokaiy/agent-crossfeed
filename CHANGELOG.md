@@ -4,6 +4,17 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- The README is now a short landing page. The routing rules, background-work
+  protection, measurements, limits and research moved to
+  [`docs/how-it-works.md`](docs/how-it-works.md), workflow stages to
+  [`docs/workflow-stages.md`](docs/workflow-stages.md), and the status line,
+  dispatcher, install notes and stored data to
+  [`docs/reference.md`](docs/reference.md).
+
 ## 0.5.1 - 2026-11-28
 
 ### Added
