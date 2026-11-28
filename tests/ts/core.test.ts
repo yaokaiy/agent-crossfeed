@@ -629,7 +629,7 @@ function decisionCore(session = 'session-1') {
 const RECORD_BASE = {
   session: 'session-1', mode: 'auto', agent_type: null, model: null, main_model: 'claude-opus-5-5', from_subagent: false,
   description: null, cause: null, burst: 0, pressure: 0, five_hour: 5, forecast: null, seven_day: null,
-  account_week: null, codex_surplus: 6.3, codex_headroom: 1, codex_weekly: 18, codex_age_s: 0, limit: null, brief_file: null,
+  account_week: null, codex_surplus: 10.6, codex_headroom: 1, codex_weekly: 18, codex_age_s: 0, limit: null, brief_file: null,
 }
 
 test('a hand-off decision is recorded with its tier, policy reason and readings', async () => {
@@ -703,7 +703,7 @@ test('a model-limit hand-off records the limit and its cause', async () => {
 test('a record keeps the exact headroom the decision used', async () => {
   const core = decisionCore()
   // Weekly use that leaves headroom just under the tier A threshold of 0.5.
-  core.setCodex({ windows: [{ minutes: 10080, usedPercent: 76.4305, resetsAt: BASE + 5 * 1440 * MINUTE }], limitReached: false, readAt: BASE })
+  core.setCodex({ windows: [{ minutes: 10080, usedPercent: 80.7145, resetsAt: BASE + 5 * 1440 * MINUTE }], limitReached: false, readAt: BASE })
   expect(core.route(A, BASE)).toBe(undefined)
   const record = core.lastRecord()
   expect(record?.reason).toBe('Codex headroom is low')
@@ -782,15 +782,15 @@ test('an Opus call snapshots both weeks, their reasons and the combined notice',
   expect(record.account_week?.state).toBe('ahead')
   expect(record.account_week?.percent).toBe(79)
   expect(Math.round(record.account_week?.line ?? 0)).toBe(66)
-  expect(record.codex_surplus).toBe(38.5)
-  expect(core.status(BALANCE_TIME).includes('7d 79% ahead · codex wk 40% +38')).toBe(true)
+  expect(record.codex_surplus).toBe(52.3)
+  expect(core.status(BALANCE_TIME).includes('7d 79% ahead · codex wk 40% +52')).toBe(true)
   const description = core.describe(BALANCE_TIME)
   for (const line of ['tier B calls: handed to Codex', 'Claude all-models weekly: 79% used, even pace 66%, ahead',
-    'Codex weekly surplus: 38.5 points (active)', 'hand-offs: on (account-week, codex-surplus)']) {
+    'Codex weekly surplus: 52.3 points (active)', 'hand-offs: on (account-week, codex-surplus)']) {
     expect(description.split('\n').includes(line)).toBe(true)
   }
   expect(core.takeNotices(BALANCE_TIME)).toEqual([{
-    text: 'crossfeed: hand-offs are on. Claude all-models weekly 79% used, an even pace would be 66% (resets 2026-11-23 22:00 UTC); Codex weekly 40% used, 38 points under an even pace to its 85% stop (resets 2026-11-22 01:27 UTC). Before you start execution with a result you can check, hand it to Codex; keep talking with the user, decisions and review here.',
+    text: 'crossfeed: hand-offs are on. Claude all-models weekly 79% used, an even pace would be 66% (resets 2026-11-23 22:00 UTC); Codex weekly 40% used, 52 points under an even pace to its reset (resets 2026-11-22 01:27 UTC). Before you start execution with a result you can check, hand it to Codex; keep talking with the user, decisions and review here.',
     nudge: { session: 'one', kind: 'balance-on', reasons: ['account-week', 'codex-surplus'], calls: null },
   }])
   expect(core.takeNotices(BALANCE_TIME)).toEqual([])
@@ -804,7 +804,7 @@ test('an Opus call snapshots both weeks, their reasons and the combined notice',
   expect(surplusRecord.account_week).toBe(null)
   core.setCodex(undefined)
   const surplusDenial = core.denial(surplusRoute, B, CWD, BALANCE_TIME, '/brief', surplusRecord)
-  expect(surplusDenial.split('\n')[1]).toBe('Why: tier B; Codex weekly 40% used, 38 points under an even pace to its 85% stop.')
+  expect(surplusDenial.split('\n')[1]).toBe('Why: tier B; Codex weekly 40% used, 52 points under an even pace to its reset.')
   expect(surplusDenial.includes('--cause codex-surplus')).toBe(true)
 })
 
@@ -844,7 +844,7 @@ test('the full account week routes even with low positive headroom while main-lo
 })
 
 test('Codex surplus uses the exact 15-point and half-headroom boundaries before rounding', async () => {
-  for (const [used, otherUsed, active] of [[27.5, 75, true], [27.501, 75, false], [27.5, 75.001, false]] as const) {
+  for (const [used, otherUsed, active] of [[35, 75, true], [35.001, 75, false], [35, 75.001, false]] as const) {
     const core = decisionCore()
     core.setCodex({ readAt: BASE, limitReached: false, windows: [
       { minutes: 10080, usedPercent: used, resetsAt: BASE + 3.5 * 1440 * MINUTE },
@@ -856,6 +856,65 @@ test('Codex surplus uses the exact 15-point and half-headroom boundaries before 
   }
 })
 
+test('near reset, surplus activates at half the configured stop times the fraction of the window left', async () => {
+  // 0.875 days left: the even pace is at 87.5%, the stop at 98.125% and the threshold 85 * 0.125 / 2 = 5.3125 points.
+  for (const [used, active] of [[82.1875, true], [82.188, false]] as const) {
+    const core = decisionCore()
+    core.setCodex({ readAt: BASE, limitReached: false, windows: [{ minutes: 10080, usedPercent: used, resetsAt: BASE + 0.875 * 1440 * MINUTE }] })
+    expect(core.route(B, BASE)?.cause).toBe(active ? 'codex-surplus' : undefined)
+    expect(core.describe(BASE).includes(active ? 'Codex weekly surplus: 5.3 points (active)' : 'Codex weekly surplus: 5.3 points (below activation threshold)')).toBe(true)
+  }
+  const core = decisionCore()
+  core.setCodex({ readAt: BASE, limitReached: false, windows: [{ minutes: 10080, usedPercent: 85, resetsAt: BASE + 0.875 * 1440 * MINUTE }] })
+  expect(core.route(A, BASE)?.tier).toBe('A')
+  expect(core.describe(BASE).includes('Codex headroom: 1')).toBe(true)
+  // A fraction that is not a power of two: 80% of the week left and 5% used is exactly 15 points.
+  core.setCodex({ readAt: BASE, limitReached: false, windows: [{ minutes: 10080, usedPercent: 5, resetsAt: BASE + 5.6 * 1440 * MINUTE }] })
+  expect(core.route(B, BASE)?.cause).toBe('codex-surplus')
+  // A stop of 96 with 30% of the week left: 55.6% used is exactly at the 14.4-point threshold.
+  const other = createCore({ ...DEFAULTS, codexStopPercent: 96 }, SCRIPT, 'session-1')
+  measure(other, 5)
+  other.setCodex({ readAt: BASE, limitReached: false, windows: [{ minutes: 10080, usedPercent: 55.6, resetsAt: BASE + 2.1 * 1440 * MINUTE }] })
+  expect(other.route(B, BASE)?.cause).toBe('codex-surplus')
+})
+
+test('a delivered on notice holds at exactly two thirds of a threshold that is not a binary fraction', async () => {
+  // A stop of 20 with 42% of the week left: the threshold is 4.2 points and withdrawal is below 2.8.
+  const core = createCore({ ...DEFAULTS, codexStopPercent: 20 }, SCRIPT, 'session-1')
+  measure(core, 5)
+  core.measure({ fiveHour: { percentUsed: 5 }, sevenDay: { percentUsed: 40, resetsAt: BASE + 3.5 * 1440 * MINUTE } }, BASE)
+  const setUsed = (usedPercent: number) => core.setCodex({
+    readAt: BASE, limitReached: false, windows: [{ minutes: 10080, usedPercent, resetsAt: BASE + 2.94 * 1440 * MINUTE }],
+  })
+  setUsed(53)
+  expect(core.takeNotices(BASE)[0]?.nudge?.reasons).toEqual(['codex-surplus'])
+  setUsed(55.2)
+  expect(core.takeNotices(BASE)).toEqual([])
+  setUsed(55.21)
+  expect(core.takeNotices(BASE)[0]?.text).toBe('crossfeed: hand-offs are off (the Claude week is on pace and the Codex surplus is under 2.8 points). Do execution yourself; hand work to Codex only when a subagent call is refused.')
+})
+
+test('near the reset a delivered on notice holds at two thirds of the smaller threshold and withdraws just below', async () => {
+  // A stop of 96 with 0.875 days left: the even pace is at 87.5%, the threshold 96 * 0.125 / 2 = 6 points, withdrawal below 4.
+  const core = createCore({ ...DEFAULTS, codexStopPercent: 96 }, SCRIPT, 'session-1')
+  measure(core, 5)
+  core.setMainModel('claude-opus-5-5', BASE)
+  core.measure({ fiveHour: { percentUsed: 5 }, sevenDay: { percentUsed: 40, resetsAt: BASE + 3.5 * 1440 * MINUTE } }, BASE)
+  const setUsed = (usedPercent: number) => core.setCodex({
+    readAt: BASE, limitReached: false, windows: [{ minutes: 10080, usedPercent, resetsAt: BASE + 0.875 * 1440 * MINUTE }],
+  })
+  setUsed(81.5)
+  expect(core.takeNotices(BASE)[0]?.nudge?.reasons).toEqual(['codex-surplus'])
+  setUsed(83.5)
+  expect(core.takeNotices(BASE)).toEqual([])
+  expect(core.route(B, BASE)).toBe(undefined)
+  setUsed(83.51)
+  expect(core.takeNotices(BASE)).toEqual([{
+    text: 'crossfeed: hand-offs are off (the Claude week is on pace and the Codex surplus is under 4 points). Do execution yourself; hand work to Codex only when a subagent call is refused.',
+    nudge: { session: 'session-1', kind: 'balance-off', reasons: [], calls: null },
+  }])
+})
+
 test('balance stays on through unknown readings and other reasons, then announces off and on once', async () => {
   const core = balanceCore()
   const kinds = (now: number) => core.takeNotices(now).flatMap(item => item.nudge ? [item.nudge.kind] : [])
@@ -863,12 +922,12 @@ test('balance stays on through unknown readings and other reasons, then announce
   expect(kinds(BALANCE_TIME)).toEqual(['balance-on'])
   expect(kinds(later)).toEqual([])
   core.measure({}, later)
-  core.setCodex({ readAt: later, windows: [{ ...codexWeek, usedPercent: 70 }], limitReached: false })
+  core.setCodex({ readAt: later, windows: [{ ...codexWeek, usedPercent: 92 }], limitReached: false })
   expect(kinds(later)).toEqual([])
   core.setCodex({ readAt: later, windows: [codexWeek], limitReached: false })
   expect(kinds(later)).toEqual([])
   core.measure({ fiveHour: { percentUsed: 85, resetsAt: later + 300 * MINUTE }, sevenDay: { ...accountWeek, percentUsed: 40 } }, later)
-  core.setCodex({ readAt: later, windows: [{ ...codexWeek, usedPercent: 70 }], limitReached: false })
+  core.setCodex({ readAt: later, windows: [{ ...codexWeek, usedPercent: 92 }], limitReached: false })
   expect(kinds(later)).toEqual([])
   core.setUsage({ readAt: later, buckets: [{ family: 'opus', label: 'Opus', usedPercent: 90 }] }, undefined, later)
   core.measure({ fiveHour: { percentUsed: 5 }, sevenDay: { ...accountWeek, percentUsed: 40 } }, later)
@@ -876,7 +935,7 @@ test('balance stays on through unknown readings and other reasons, then announce
   core.setUsage({ readAt: later, buckets: [] }, undefined, later)
   const off = core.userPrompt(later)
   expect(off.length).toBe(1)
-  expect(off[0]?.text).toBe('crossfeed: hand-offs are off (the Claude week is on pace and the Codex surplus is under 10 points). Do execution yourself; hand work to Codex only when a subagent call is refused.')
+  expect(off[0]?.text).toBe('crossfeed: hand-offs are off (the Claude week is on pace and the Codex surplus is under 2.113757 points). Do execution yourself; hand work to Codex only when a subagent call is refused.')
   expect(off[0]?.nudge).toEqual({ session: 'one', kind: 'balance-off', calls: null, reasons: [] })
   expect(kinds(later)).toEqual([])
   core.measure({ sevenDay: accountWeek }, later)
@@ -932,7 +991,7 @@ test('the last on notice survives unknown Codex headroom but turns off once fres
   const core = balanceCore()
   expect(core.takeNotices(BALANCE_TIME)[0]?.nudge?.kind).toBe('balance-on')
   const later = BALANCE_TIME + 16 * MINUTE
-  const lowQuota = { readAt: later, windows: [{ ...codexWeek, usedPercent: 82 }], limitReached: false }
+  const lowQuota = { readAt: later, windows: [{ ...codexWeek, usedPercent: 95 }], limitReached: false }
   core.setCodex({ ...lowQuota, readAt: BALANCE_TIME })
   expect(core.takeNotices(later)).toEqual([])
   core.setCodex({ ...lowQuota, windows: [] })
@@ -951,7 +1010,7 @@ test('reserve suppresses balance-off even with fresh low headroom', async () => 
   const core = balanceCore()
   expect(core.takeNotices(BALANCE_TIME)[0]?.nudge?.kind).toBe('balance-on')
   measure(core, 90, BALANCE_TIME)
-  core.setCodex({ readAt: BALANCE_TIME, windows: [{ ...codexWeek, usedPercent: 82 }], limitReached: false })
+  core.setCodex({ readAt: BALANCE_TIME, windows: [{ ...codexWeek, usedPercent: 95 }], limitReached: false })
   const notes = core.takeNotices(BALANCE_TIME)
   expect(notes.length).toBe(1)
   expect(notes[0]?.text.includes('reserve')).toBe(true)
@@ -964,7 +1023,7 @@ test('surplus hysteresis holds a delivered on at 14 and 10 points and turns off 
   const core = decisionCore()
   core.measure({ fiveHour: { percentUsed: 5 }, sevenDay: { percentUsed: 40, resetsAt: BASE + 3.5 * 1440 * MINUTE } }, BASE)
   const setSurplus = (points: number) => core.setCodex({
-    readAt: BASE, limitReached: false, windows: [{ minutes: 10080, usedPercent: 42.5 - points, resetsAt: BASE + 3.5 * 1440 * MINUTE }],
+    readAt: BASE, limitReached: false, windows: [{ minutes: 10080, usedPercent: 50 - points, resetsAt: BASE + 3.5 * 1440 * MINUTE }],
   })
   setSurplus(16)
   expect(core.takeNotices(BASE)[0]?.nudge?.reasons).toEqual(['codex-surplus'])
@@ -981,6 +1040,8 @@ test('surplus hysteresis holds a delivered on at 14 and 10 points and turns off 
 
 test('account-week hysteresis holds a delivered on at line plus 3 and 2 and turns off at plus 1', async () => {
   const core = decisionCore()
+  // A Codex week under the 10-point surplus that would hold the on notice by itself.
+  core.setCodex({ windows: [{ minutes: 10080, usedPercent: 25, resetsAt: BASE + 5 * 1440 * MINUTE }], limitReached: false, readAt: BASE })
   const setWeek = (points: number) => core.measure({
     fiveHour: { percentUsed: 5 }, sevenDay: { percentUsed: 50 + points, resetsAt: BASE + 3.5 * 1440 * MINUTE },
   }, BASE)
@@ -1018,7 +1079,7 @@ test('low headroom blocks pressure, family, balance and stretch advice until the
   expect(core.takeNotices(BALANCE_TIME)).toEqual([])
   core.toolCall('Read', false)
   expect(core.toolCall('Bash', false)).toBe(undefined)
-  expect(core.describe(BALANCE_TIME).includes('38.5 points (headroom below 0.5)')).toBe(true)
+  expect(core.describe(BALANCE_TIME).includes('52.3 points (headroom below 0.5)')).toBe(true)
   core.setCodex({ ...quota, windows: [codexWeek, { minutes: 400, usedPercent: 75 }] })
   const notices = core.userPrompt(BALANCE_TIME)
   expect(notices.map(item => item.nudge?.kind)).toEqual([undefined, undefined, 'balance-on'])

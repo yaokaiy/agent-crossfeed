@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import { DEFAULTS } from '../../hooks/config'
-import { CODEX_MAX_AGE, INITIAL_PRESSURE, codexSurplus, decide, forecast, headroom, headroomCause, pressure, shortWindow, updatePressure } from '../../hooks/policy'
+import { CODEX_MAX_AGE, INITIAL_PRESSURE, codexStop, codexSurplus, decide, forecast, headroom, headroomCause, pressure, shortWindow, updatePressure } from '../../hooks/policy'
 import type { ClaudeReading, CodexReading, PressureState, Tier } from '../../hooks/policy'
 
 const BASE = 1794902400000
@@ -240,19 +240,70 @@ test('Codex surplus needs a fresh reading and a live long window with a reset', 
     { ...week, readAt: BASE - CODEX_MAX_AGE - 1 }, { ...week, readAt: BASE + CODEX_MAX_AGE + 1 },
   ]) expect(codexSurplus(value, DEFAULTS, BASE)).toBe(undefined)
   for (const readAt of [BASE - CODEX_MAX_AGE, BASE, BASE + CODEX_MAX_AGE]) {
-    expect(codexSurplus({ ...week, readAt }, DEFAULTS, BASE)).toBe(22.5)
+    expect(codexSurplus({ ...week, readAt }, DEFAULTS, BASE)).toEqual({ points: 30, onAt: 15, offAt: 10 })
   }
 })
 
-test('surplus uses the longest window, its own duration and the configured stop', async () => {
+test('surplus uses the longest window and its own duration, and the stop sets the threshold near the reset', async () => {
   const window = { minutes: 14 * 1440, usedPercent: 40, resetsAt: BASE + 7 * DAY }
   const value = weekly(5, 1)
   value.windows.push(window)
   for (const windows of [value.windows, [...value.windows].reverse()]) {
-    expect(codexSurplus({ ...value, windows }, DEFAULTS, BASE)).toBe(2.5)
-    expect(codexSurplus({ ...value, windows }, { ...DEFAULTS, codexStopPercent: 100 }, BASE)).toBe(10)
+    expect(codexSurplus({ ...value, windows }, DEFAULTS, BASE)).toEqual({ points: 10, onAt: 15, offAt: 10 })
+    expect(codexSurplus({ ...value, windows }, { ...DEFAULTS, codexStopPercent: 100 }, BASE)).toEqual({ points: 10, onAt: 15, offAt: 10 })
   }
-  expect(codexSurplus(weekly(10, 8), DEFAULTS, BASE)).toBe(-10)
+  expect(codexSurplus(weekly(10, 8), DEFAULTS, BASE)).toEqual({ points: -10, onAt: 15, offAt: 10 })
+  expect(codexSurplus(weekly(70, 1.75), DEFAULTS, BASE)).toEqual({ points: 5, onAt: 10.625, offAt: 7.083333 })
+  expect(codexSurplus(weekly(80, 0.875), DEFAULTS, BASE)).toEqual({ points: 7.5, onAt: 5.3125, offAt: 3.541667 })
+  expect(codexSurplus(weekly(80, 0.875), { ...DEFAULTS, codexStopPercent: 50 }, BASE)).toEqual({ points: 7.5, onAt: 3.125, offAt: 2.083333 })
+  // Decimal inputs land exactly on decimal thresholds at a millionth of a point, whatever the binary fraction.
+  expect(codexSurplus(weekly(5, 5.6), DEFAULTS, BASE)).toEqual({ points: 15, onAt: 15, offAt: 10 })
+  expect(codexSurplus(weekly(55.6, 2.1), { ...DEFAULTS, codexStopPercent: 96 }, BASE)).toEqual({ points: 14.4, onAt: 14.4, offAt: 9.6 })
+  expect(codexSurplus(weekly(55.2, 2.94), { ...DEFAULTS, codexStopPercent: 20 }, BASE)).toEqual({ points: 2.8, onAt: 4.2, offAt: 2.8 })
+})
+
+test('stops match the literal fixtures that tests/py/test_quota.py checks for the dispatcher', async () => {
+  const week = (stop: number, msLeft?: number) => codexStop(
+    { minutes: 10080, usedPercent: 0, ...(msLeft === undefined ? {} : { resetsAt: BASE + msLeft }) }, { ...DEFAULTS, codexStopPercent: stop }, BASE)
+  expect(week(0.2, 2000)).toBe(99.99967)
+  expect(week(85, 0.875 * DAY)).toBe(98.125)
+  expect(week(85.1234)).toBe(85.1234)
+  expect(week(0.0001)).toBe(0.0001)
+  expect(week(85, 7 * DAY)).toBe(85)
+  // A reset a fraction of a millisecond short of a 361-minute window rounds to a whole millisecond: no time elapsed.
+  expect(codexStop({ minutes: 361, usedPercent: 0, resetsAt: BASE + 21659999.625 }, { ...DEFAULTS, codexStopPercent: 10 }, BASE)).toBe(10)
+  // Lengths and resets too large for milliseconds keep the configured stop, or clamp to the window.
+  expect(codexStop({ minutes: 1e308, usedPercent: 0 }, DEFAULTS, BASE)).toBe(85)
+  expect(codexStop({ minutes: 10080, usedPercent: 0, resetsAt: 1e308 }, DEFAULTS, BASE)).toBe(85)
+  expect(codexSurplus({ windows: [{ minutes: 1e308, usedPercent: 0, resetsAt: BASE + DAY }], limitReached: false, readAt: BASE }, DEFAULTS, BASE)).toBe(undefined)
+})
+
+test('headroom is exactly one half when the margin is half the taper', async () => {
+  // A stop of 80 with 96% of the week left is 80.8; the taper is 19.6 and 71% used leaves 9.8 points.
+  const codex = weekly(71, 6.72)
+  expect(headroom(codex, { ...DEFAULTS, codexStopPercent: 80 }, BASE)).toBe(0.5)
+  expect(decide({ tier: 'A', P: 0, g: headroom(codex, { ...DEFAULTS, codexStopPercent: 80 }, BASE), mode: 'auto', claudeKnown: true }).handOff).toBe(true)
+})
+
+test('the long-window stop rises from the configured stop to 100 at the reset', async () => {
+  for (const [days, stop] of [[undefined, 85], [14, 85], [7, 85], [3.5, 92.5], [1.75, 96.25], [0.875, 98.125], [0, 100]] as const) {
+    expect(codexStop(weekly(0, days).windows[0]!, DEFAULTS, BASE)).toBe(stop)
+  }
+  expect(codexStop(weekly(0, 3.5).windows[0]!, { ...DEFAULTS, codexStopPercent: 100 }, BASE)).toBe(100)
+  expect(codexStop({ minutes: 360, usedPercent: 0, resetsAt: BASE + DAY }, DEFAULTS, BASE)).toBe(90)
+  // With no time elapsed, or no reset, the stop is exactly the configured value, so use at it gives no headroom.
+  for (const stop of [0.1, 0.2, 85.5]) {
+    for (const days of [undefined, 7, 14]) {
+      expect(codexStop(weekly(0, days).windows[0]!, { ...DEFAULTS, codexStopPercent: stop }, BASE)).toBe(stop)
+      expect(headroom(weekly(stop, days), { ...DEFAULTS, codexStopPercent: stop }, BASE)).toBe(0)
+    }
+  }
+  // 85% used with 21 hours left keeps full headroom; at the stop it is zero and the cause names it.
+  expect(headroom(weekly(85, 0.875), DEFAULTS, BASE)).toBe(1)
+  expect(headroom(weekly(92.5, 0.875), DEFAULTS, BASE)).toBe(0.5)
+  expect(headroom(weekly(98.125, 0.875), DEFAULTS, BASE)).toBe(0)
+  expect(headroomCause(weekly(98.125, 0.875), DEFAULTS, BASE)).toBe('Codex weekly use is 98%')
+  expect(headroomCause(weekly(98, 0.875), DEFAULTS, BASE)).toBe(undefined)
 })
 
 test('expired windows neither consume headroom nor explain another window’s stop', async () => {
@@ -261,7 +312,7 @@ test('expired windows neither consume headroom nor explain another window’s st
   fresh.windows.unshift(expired)
   expect(headroom(fresh, DEFAULTS, BASE)).toBe(1)
   expect(headroomCause(fresh, DEFAULTS, BASE)).toBe(undefined)
-  const stopped = { ...fresh, windows: [expired, ...weekly(85, 1).windows] }
-  expect(headroomCause(stopped, DEFAULTS, BASE)).toBe('Codex weekly use is 85%')
+  const stopped = { ...fresh, windows: [expired, ...weekly(98, 1).windows] }
+  expect(headroomCause(stopped, DEFAULTS, BASE)).toBe('Codex weekly use is 98%')
   expect(headroomCause({ ...fresh, windows: [expired] }, DEFAULTS, BASE)).toBe('all Codex windows have reset')
 })

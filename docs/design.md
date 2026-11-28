@@ -175,26 +175,47 @@ subagent decisions.
 
 ### 4. Headroom: how much Codex quota is left?
 
-`g` is 1 while Codex's use is low and falls to 0 as it nears the
-`codexStopPercent` option (default 85). For a window longer than 6 hours,
-with `v` its percent used and `D` the days to its reset (7 when unknown):
+`g` is 1 while Codex's use is low and falls to 0 as it nears the window's
+stop. A window longer than 6 hours keeps `100 - codexStopPercent` points
+(option default 85) for your own Codex work over a whole window, and that
+reserve shrinks with the time left to use it. With `S` the configured
+stop, `v` the percent used, `length` the window length in milliseconds,
+`left` the milliseconds remaining (clamped to [0, `length`], rounded to a
+whole millisecond, `length` when the reset is unknown) and `D` the days
+to its reset (7 when unknown):
 
-`g = clamp((codexStopPercent - v) / (10 + 10 * clamp(D / 7, 0, 1)), 0, 1)`
+`stop = fine(S + (100 - S) * (length - left) / length)`
 
-so hand-offs taper over the last 10 to 20 points, sooner when the reset is
-far away. A window of 6 hours or less gives 0 at 90% used and 1 below. With
-several windows the smallest value counts, excluding any whose reset time
-has arrived. A fresh reported limit gives known headroom of 0. Absent a
+`g = fine(clamp((stop - v) / (10 + 10 * clamp(D / 7, 0, 1)), 0, 1))`
+
+where `fine(x) = floor(x * 1e6 + 0.5) / 1e6`, explained below.
+
+The stop is 85 when a weekly window starts, 92.5 halfway and 100 at the
+reset, so quota that would otherwise expire unused can still be handed
+off. Hand-offs taper over the last 10 to 20 points before the stop, sooner
+when the reset is far away. A window of 6 hours or less gives 0 at 90%
+used and 1 below. With several windows the smallest value counts,
+excluding any whose reset time has arrived. A fresh reported limit gives known headroom of 0. Absent a
 reported limit, an empty set of current windows gives unknown headroom.
 A missing reading or one dated more than 15 minutes from now also gives
 unknown headroom. Routing uses 0 for unknown headroom.
 
 For the surplus, take the longest Codex window over 360 minutes. It needs
 a future reset, a reading within 15 minutes of now and no reported limit.
-Let `E` be the elapsed fraction of that window, clamped to [0, 1].
-The surplus in percentage points is `codexStopPercent * E - usedPercent`.
-At 92.3% of the window elapsed, a stop of 85 and 40% used give about 38.5
-points. A surplus of at least 15 points is active when `g >= 0.5`.
+With `length` and `left` as above, the surplus in percentage points is
+`fine(100 * (length - left) / length - usedPercent)`: how far use is below
+an even pace that reaches 100% at the reset. With `f = left / length`, it
+turns on at `fine(min(15, S * left / length / 2))`, that is
+`min(15, S * f / 2)` points, so the closer the reset, the smaller a surplus
+has to be to count. It is active when it reaches that
+and `g >= 0.5`. At 92.3% of the window elapsed (`f` 0.077) and 40% used,
+the surplus is about 52.3 points and turns on at about 3.3.
+
+The stop, the headroom, the surplus and its thresholds are computed from
+whole milliseconds and rounded with `fine`, to a millionth of a
+percentage point, before they are compared or shown. The hook and `run`
+use the same operations in the same order, so they draw the same stop for
+the same reading at the same instant.
 
 When `g` is 0 the plugin keeps the cause: no reading, a reading that is too
 old, Codex's reported limit, or the window that is used up. `/crossfeed
@@ -364,7 +385,8 @@ goal, prior decisions, paths, constraints, check and expected answer.
 
 After a balance-on notice, known headroom below 0.5 triggers balance-off.
 With enough headroom, balance-off requires all reasons to have cleared,
-an `ok` account week below `L + 2` and a known surplus below 10 points.
+an `ok` account week below `L + 2` and a known surplus below two thirds
+of the points it turns on at (10 when that is 15).
 These lower thresholds apply only to withdrawing the notice. Unknown
 readings alone leave the last notice in place. Balance-off asks Claude
 to do execution itself unless a subagent call is refused. Selecting
@@ -567,7 +589,9 @@ plugin.
   without a reset time, when the reading is at most 15 minutes old.
   A reported limit stops the launch only with a reading that fresh and at
   least one counted window. Any counted window of at most 360 minutes
-  stops the launch at 90% used. Longer windows stop it at `--codex-stop`
+  stops the launch at 90% used. Longer windows stop it at the rising stop
+  from section 4, `fine(S + (100 - S) * (length - left) / length)` with
+  `S` from `--codex-stop`
   (default 85, finite, greater than 0 and at most 100). A stop prints
   the reason, records it and exits 75. The plugin uses 85 for an invalid
   `codexStopPercent` and includes the flag in every suggested `run`
@@ -754,9 +778,11 @@ change the options or open an issue with the numbers.
   cost in Claude usage.
 - Astra's weight in the Codex weekly allowance has yet to be measured.
   How often Claude follows the start-of-task rule is also unknown.
-- The 5-point all-models pace margin and the 15-point Codex surplus are
-  judgment calls. Concurrent launches can each pass the guard before
-  either job's usage appears in a reading.
+- The 5-point all-models pace margin, the surplus threshold
+  `min(15, codexStopPercent * f / 2)`, and the reserve that shrinks with
+  time remaining are judgment calls. Concurrent launches can each pass the
+  guard before either job's usage appears in a reading, and near the reset
+  the stop leaves little room for that overshoot.
 - Switching to or from `off` changes the next composed prompt and may
   cause a cache miss.
 - In a very heavy window, demand can be several times the window's capacity

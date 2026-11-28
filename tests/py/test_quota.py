@@ -89,6 +89,56 @@ class QuotaTests(CrossfeedCase):
                 if code == 75:
                     self.assertEqual(record["codex_weekly"], percent if minutes > 360 else None)
 
+    def test_long_window_stop_rises_from_the_configured_stop_to_100_at_the_reset(self):
+        for days, percent, args, code, stop in (
+            (7, 84.9, [], 0, None), (7, 85.1, [], 75, "85"),
+            (3.5, 92.4, [], 0, None), (3.5, 92.6, [], 75, "92.5"),
+            (0.875, 85, [], 0, None), (0.875, 98.1, [], 0, None), (0.875, 98.2, [], 75, "98.125"),
+            (0.875, 99.9, ["--codex-stop", "100"], 0, None), (0.875, 100, ["--codex-stop", "100"], 75, "100"),
+        ):
+            with self.subTest(days=days, percent=percent, args=args):
+                reset = time.time() + days * 86400
+                limits = {"secondary": {"window_minutes": 10080, "used_percent": percent, "resets_at": reset}}
+                result = self.run_with_limits(limits, *args)
+                self.assertEqual(result.returncode, code, result.stderr)
+                if stop is not None:
+                    # The wall clock moves the stop by millionths; exact values are checked with a fixed clock below.
+                    self.assertIn("at or above the {}".format(stop).encode(), result.stderr)
+
+    def test_stop_is_exact_at_the_configured_value_and_at_a_moving_threshold(self):
+        crossfeed = load_crossfeed()
+        now = 1_800_000_000.0
+        reset = now + 0.875 * 86400
+
+        def week(used, resets_at):
+            return {"minutes": 10080, "used_percent": used, "resets_at": resets_at}
+
+        self.assertEqual(crossfeed._window_stop(week(0, reset), 85, now), 98.125)
+        self.assertIsNone(crossfeed._stop_reason([week(98.124, reset)], False, 85, now))
+        self.assertTrue(crossfeed._stop_reason([week(98.125, reset)], False, 85, now).startswith(
+            "Codex weekly 98.125% used, at or above the 98.125% stop (resets "))
+        # The same literal fixtures as tests/ts/policy.pressure.test.ts, so the hook and the dispatcher agree.
+        for stop, resets_at, expected in ((0.2, now + 2, 99.99967), (85, now + 0.875 * 86400, 98.125),
+                                          (85.1234, None, 85.1234), (0.0001, None, 0.0001), (85, now + 7 * 86400, 85)):
+            self.assertEqual(crossfeed._window_stop(week(0, resets_at), stop, now), expected)
+        # A reset a fraction of a millisecond short of a 361-minute window: no time elapsed, as in the hook.
+        self.assertEqual(crossfeed._window_stop({"minutes": 361, "used_percent": 0, "resets_at": now + 21659.999625}, 10, now), 10)
+        # Values the parser accepts but milliseconds cannot hold keep the configured stop instead of raising.
+        self.assertEqual(crossfeed._window_stop({"minutes": 1e308, "used_percent": 0, "resets_at": None}, 85, now), 85)
+        self.assertEqual(crossfeed._window_stop(week(0, 1e308), 85, now), 85)
+        windows = crossfeed.parse_rate_limits({"secondary": {"windowDurationMins": 1e308, "usedPercent": 90, "resetsAt": 1e308}})
+        self.assertIn("at or above the 85% stop", crossfeed._stop_reason(windows, False, 85, now))
+        self.assertIn("at or above the 85.1234% stop", crossfeed._stop_reason([week(85.1234, None)], False, 85.1234, now))
+        self.assertIsNone(crossfeed._stop_reason([week(85.1231, None)], False, 85.1234, now))
+        self.assertIn("at or above the 0.0001% stop", crossfeed._stop_reason([week(0.0001, None)], False, 0.0001, now))
+        for stop in (0.1, 0.2, 85.5):
+            for resets_at in (None, now + 7 * 86400, now + 14 * 86400):
+                with self.subTest(stop=stop, resets_at=resets_at):
+                    self.assertEqual(crossfeed._window_stop(week(0, resets_at), stop, now), stop)
+                    self.assertIsNone(crossfeed._stop_reason([week(stop * 0.99, resets_at)], False, stop, now))
+                    self.assertIn("at or above the {:g}% stop".format(stop),
+                                  crossfeed._stop_reason([week(stop, resets_at)], False, stop, now))
+
     def test_unknown_quota_proceeds_and_resumed_launch_is_guarded(self):
         result = self.run_with_limits({})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -133,10 +183,10 @@ class QuotaTests(CrossfeedCase):
         brief.write_bytes(b"Brief\n")
         for age, reset, percent, limited, code in (
             (604800, stamp - 1, 100, True, 0), (0, stamp, 100, True, 0),
-            (604800, stamp + 1, 85, False, 75), (901, stamp + 1, 0, True, 0),
+            (604800, stamp + 1, 100, False, 75), (901, stamp + 1, 0, True, 0),
             (900, stamp + 1, 0, True, 75), (901, None, 85, True, 0),
             (900, None, 85, False, 75), (900, None, 0, True, 75),
-            (-300, stamp + 1, 85, False, 75), (-301, stamp + 1, 100, True, 0),
+            (-300, stamp + 1, 100, False, 75), (-301, stamp + 1, 100, True, 0),
         ):
             with self.subTest(age=age, reset=reset, limited=limited, percent=percent):
                 limits = {"secondary": {"window_minutes": 10080, "used_percent": percent, "resets_at": reset},

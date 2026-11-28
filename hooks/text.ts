@@ -103,16 +103,16 @@ export function dispatchCommand(a: { script: string; tier: 'A' | 'B'; dir: strin
   return `${parts.join(' ')}${stopFlag(a.codexStopPercent)} ${brief}`
 }
 
-function surplusFact(percent: number, points: number, stop: number): string {
-  return `Codex weekly ${Math.round(percent)}% used, ${Math.floor(points)} points under an even pace to its ${stop}% stop`
+function surplusFact(percent: number, points: number): string {
+  return `Codex weekly ${Math.round(percent)}% used, ${Math.floor(points)} points under an even pace to its reset`
 }
 
-export function denyText(a: { tier: 'A' | 'B'; reason: string; u: number; F?: number; codexPercent?: number; command: string; saved: boolean; delimiter?: string; limit?: LimitFact; cause?: FloorCause; account?: AccountWeek; surplus?: number; codexStopPercent?: number }): string {
+export function denyText(a: { tier: 'A' | 'B'; reason: string; u: number; F?: number; codexPercent?: number; command: string; saved: boolean; delimiter?: string; limit?: LimitFact; cause?: FloorCause; account?: AccountWeek; surplus?: number }): string {
   const pace = a.F === undefined ? '' : `, on pace for ${Math.round(a.F)}%`
   const codex = a.codexPercent === undefined ? '' : `; Codex weekly ${Math.round(a.codexPercent)}%`
   let why = `Why: tier ${a.tier} (${a.reason}). Claude 5h ${Math.round(a.u)}%${pace}${codex}.`
   if (a.cause === 'codex-surplus' && a.surplus !== undefined && a.codexPercent !== undefined) {
-    why = `Why: tier ${a.tier}; ${surplusFact(a.codexPercent, a.surplus, a.codexStopPercent ?? DEFAULTS.codexStopPercent)}.`
+    why = `Why: tier ${a.tier}; ${surplusFact(a.codexPercent, a.surplus)}.`
   } else {
     const limit = a.cause === 'account-week' && a.account ? { ...a.account, label: 'Claude all-models' } : a.limit
     if (limit?.percent !== undefined) {
@@ -185,18 +185,20 @@ function resetSuffix(resetsAt: number | undefined): string {
   return resetsAt === undefined ? '' : ` (resets ${new Date(resetsAt).toISOString().slice(0, 16).replace('T', ' ')} UTC)`
 }
 
-export function balanceOnText(account: AccountWeek, week: CodexWindow | undefined, activeSurplus: number | undefined, stop: number, always: boolean): string {
+export function balanceOnText(account: AccountWeek, week: CodexWindow | undefined, activeSurplus: number | undefined, always: boolean): string {
   const facts = []
   if ((account.state === 'ahead' || account.state === 'full') && account.percent !== undefined && account.line !== undefined) {
     facts.push(`Claude all-models weekly ${Math.round(account.percent)}% used, an even pace would be ${Math.round(account.line)}%${resetSuffix(account.resetsAt)}`)
   }
-  if (week && activeSurplus !== undefined) facts.push(surplusFact(week.usedPercent, activeSurplus, stop) + resetSuffix(week.resetsAt))
+  if (week && activeSurplus !== undefined) facts.push(surplusFact(week.usedPercent, activeSurplus) + resetSuffix(week.resetsAt))
   if (always) facts.push('crossfeed is set to always')
   return `crossfeed: hand-offs are on. ${facts.join('; ')}. Before you start execution with a result you can check, hand it to Codex; keep talking with the user, decisions and review here.`
 }
 
-export function balanceOffText(closeToStop: boolean): string {
-  const why = closeToStop ? 'Codex is close to its stop' : 'the Claude week is on pace and the Codex surplus is under 10 points'
+// offAt is the surplus below which a delivered on notice is withdrawn.
+export function balanceOffText(closeToStop: boolean, offAt = 10): string {
+  const why = closeToStop ? 'Codex is close to its stop'
+    : `the Claude week is on pace and the Codex surplus is under ${offAt} points`
   return `crossfeed: hand-offs are off (${why}). Do execution yourself; hand work to Codex only when a subagent call is refused.`
 }
 

@@ -59,7 +59,7 @@
     "codexStopPercent": {
       "type": "number",
       "title": "Codex stop percentage",
-      "description": "Stop handing off new work when a long Codex quota window reaches this percentage. Use a value greater than 0 and at most 100.",
+      "description": "Set the initial stop percentage for Codex windows longer than 6 hours. The stop rises to 100% at reset and stays at the configured value when the reset is unknown. Use a value greater than 0 and at most 100.",
       "default": 85
     },
     "shedPercent": {

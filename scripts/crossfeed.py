@@ -1365,17 +1365,40 @@ def _run_allocated_job(args, job_dir, now, brief, role, resume_thread, interrupt
     return record["exit"]
 
 
-def _stop_reason(windows, limit_reached, stop):
+def _fine(x):
+    """Round a quota stop to a millionth of a percentage point, with the same operations as `fine` in
+    hooks/policy.ts, so the hook and the dispatcher draw the same line."""
+    return math.floor(x * 1e6 + 0.5) / 1e6
+
+
+def _window_stop(window, stop, now):
+    """The use at which a window stops new jobs. A window over 6 hours keeps 100 - stop points
+    for the user's own Codex work over a whole window, shrinking with the time left to use them,
+    so its stop rises from `stop` at the window's start to 100 at its reset."""
+    if window["minutes"] <= 360:
+        return 90
+    # Whole milliseconds, clamped then rounded as in the hook, so a window with none elapsed stops at
+    # exactly `stop` and huge values never reach an integer conversion.
+    length = window["minutes"] * 60000
+    if not math.isfinite(length):
+        return _fine(stop)
+    reset = window.get("resets_at")
+    left = length if reset is None else math.floor(min(length, max(0, (reset - now) * 1000)) + 0.5)
+    return _fine(stop + (100 - stop) * (length - left) / length)
+
+
+def _stop_reason(windows, limit_reached, stop, now):
     if limit_reached and windows:
         return "Codex reported its limit"
     for window in windows:
         short = window["minutes"] <= 360
-        threshold = 90 if short else stop
+        threshold = _window_stop(window, stop, now)
         if window["used_percent"] < threshold:
             continue
         label = "{:g}-hour".format(window["minutes"] / 60) if short else "weekly"
         reason = "Codex {} {}% used, at or above the {}% stop".format(
-            label, str(window["used_percent"]).removesuffix(".0"), str(threshold).removesuffix(".0"))
+            label, str(window["used_percent"]).removesuffix(".0"),
+            "{:.6f}".format(threshold).rstrip("0").rstrip("."))
         if window.get("resets_at") is not None:
             try:
                 reset = datetime.datetime.fromtimestamp(window["resets_at"], datetime.timezone.utc)
@@ -1397,7 +1420,7 @@ def _launch_stopped(args, quota, now):
         reset = window.get("resets_at")
         if (reset is None and fresh) or (reset is not None and reset > now):
             windows.append(window)
-    reason = _stop_reason(windows, fresh and quota["limit_reached"], args.codex_stop)
+    reason = _stop_reason(windows, fresh and quota["limit_reached"], args.codex_stop, now)
     if reason is None:
         return None
     weekly = max((w for w in windows if w["minutes"] > 360), key=lambda w: w["minutes"], default=None)

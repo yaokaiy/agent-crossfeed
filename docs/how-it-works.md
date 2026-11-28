@@ -62,18 +62,24 @@ For each subagent call from the main loop crossfeed asks four questions.
    elapsed, or at 90% used, and full at 100%. For example, 55% used
    halfway through the week is ahead. This rule needs a known future reset.
 
-3. **Headroom.** How much Codex quota is left? A headroom value falls from
-   1 to 0 over the last 10 to 20 points before Codex's weekly stop
-   (85% by default). A short window of 6 hours or less gives zero
+3. **Headroom.** How much Codex quota is left before the reset? A
+   headroom value falls from 1 to 0 over the last 10 to 20 points before
+   Codex's weekly stop. The stop leaves room for your own Codex work, and
+   that room shrinks as the reset gets closer: with the default
+   `codexStopPercent` of 85 the stop is 85% when the week starts, 92.5%
+   halfway and 100% at the reset, so quota that would expire unused can
+   still be handed off. A short window of 6 hours or less gives zero
    headroom at 90%. In `auto`, tier A needs headroom of at least one half
-   and tier B needs positive headroom, which leaves quota for your own
-   Codex work. A job
-   that is already running is not stopped. Windows that have reset do not
-   count. On the longest window over 6 hours, crossfeed also checks the
-   surplus against an even pace to the configured stop. Halfway through
-   the week with an 85% stop, 25% used leaves 17.5 points (42.5 minus 25). A
-   surplus of at least 15 points with headroom of at least one half can
-   move tier B even at low pressure.
+   and tier B needs positive headroom. A job that is already running is
+   not stopped. Windows that have reset do not count. On the longest
+   window over 6 hours, crossfeed also checks the surplus against an even
+   pace that reaches 100% at the reset. Halfway through the week, 25% used
+   leaves a surplus of 25 points (50 minus 25). A surplus can move tier B
+   even at low pressure when headroom is at least one half and the surplus
+   reaches the smaller of 15 points and half of `codexStopPercent`
+   multiplied by the fraction of the window remaining. With 21 hours left
+   in a seven-day window and the default setting of 85, the threshold is
+   about 5.3 points.
 
 4. **Model limits.** Is a model's own weekly limit going too fast?
    crossfeed reads these limits from Claude Code's `/usage` (no model call)
@@ -132,7 +138,8 @@ gives a reminder with the reasons and a `run --kind task` command.
 After an on notice, known headroom below one half triggers “hand-offs are
 off.” With enough headroom, that notice waits until no reason holds, the
 Claude week is on pace and less than 2 points above the even-pace line,
-and the Codex surplus is below 10 points. Missing readings alone do not
+and the Codex surplus is below two thirds of the points it turns on at.
+Missing readings alone do not
 trigger it. The off notice asks Claude to do execution itself unless a
 subagent call is refused.
 
@@ -141,7 +148,7 @@ from that decision. For example, a command with `--cause codex-surplus`
 can have this explanation:
 
 ```
-Why: tier B; Codex weekly 40% used, 38 points under an even pace to its 85% stop.
+Why: tier B; Codex weekly 40% used, 52 points under an even pace to its reset.
 ```
 
 The exact rules and formulas are in [design.md](design.md).
@@ -222,8 +229,9 @@ yet.
 
 - Astra's weight in the Codex weekly allowance and how often Claude
   follows the start-of-task rule have yet to be measured. The 5-point
-  all-models pace threshold, the 15-point surplus, the 85% shed line and
-  the 15-minute pace line are judgment calls.
+  all-models pace threshold, the 15-point surplus and its smaller
+  threshold near the reset, the Codex reserve that shrinks with the time
+  left, the 85% shed line and the 15-minute pace line are judgment calls.
 - Concurrent launches can each pass the guard on the same quota reading.
 - Switching to or from `off` changes the next composed prompt and may
   cause a cache miss. The static instructions are present in `auto` and

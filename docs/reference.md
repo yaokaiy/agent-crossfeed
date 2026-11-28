@@ -24,7 +24,7 @@ Set them with `/plugin configure agent-crossfeed@agent-crossfeed`.
 | `premiumFallback` | `opus` | Model for subagents moved off a model whose weekly limit is ahead of pace. Leave empty to turn this off. |
 | `eligibleTypes` | `general-purpose,claude` | Comma-separated subagent types whose briefs can be handed to Codex. |
 | `stretchCalls` | `12` | Counted hands-on main-loop tool calls in one prompt before the one hand-off reminder, sent while hand-offs are on. |
-| `codexStopPercent` | `85` | Stop handing off new work when a long Codex quota window reaches this percentage. Use a value greater than 0 and at most 100. |
+| `codexStopPercent` | `85` | Stop handing off new work when a long Codex quota window reaches this percentage at its start. The stop rises in step with the time elapsed to 100 at the reset. Use a value greater than 0 and at most 100. |
 | `shedPercent` | `85` | Refuse new background Claude agents and try to stop this conversation's registered background tasks when the 5-hour window reaches this percentage. Use a value greater than 0 and at most 100. |
 | `wake` | `true` | Allow one wake-up prompt per 5-hour window for an idle coordinator with an attached surface. Reloading the plugin or resuming the conversation resets the allowance. Set to false to queue the message for Claude's next eligible main-loop tool result or ordinary prompt. |
 | `approveStages` | `false` | Let crossfeed start Codex with your Codex permissions for marked stages when Claude Code would ask. Explicit denials still apply. |
@@ -149,7 +149,8 @@ ID if Codex reported it, even during the final workspace snapshot.
 
 Before starting or resuming a job, `run` checks Codex's quota. A window
 of 6 hours or less stops the launch at 90%. A longer window stops it at
-`--codex-stop PERCENT` (default 85, greater than 0 and at most 100).
+`--codex-stop PERCENT` (default 85, greater than 0 and at most 100) when
+the window starts, rising with the time elapsed to 100% at its reset.
 The plugin includes the flag in its commands for a nondefault stop.
 A window counts until its reset. Without a reset it counts only on a
 reading at most 15 minutes old. A reported limit also stops the launch on

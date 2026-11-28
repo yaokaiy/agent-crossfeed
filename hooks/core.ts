@@ -503,9 +503,12 @@ export function createCore(config: Config, script: string, session?: string, sav
     const accountAhead = account.state === 'ahead' || account.state === 'full'
     const availableHeadroom = knownHeadroom(codex, config, now)
     const g = availableHeadroom ?? 0
-    const surplus = codexSurplus(codex, config, now)
-    const activeSurplus = surplus !== undefined && surplus >= 15 && g >= 0.5 ? surplus : undefined
-    return { account, accountAhead, g, availableHeadroom, surplus, activeSurplus }
+    const reckoned = codexSurplus(codex, config, now)
+    const surplus = reckoned?.points
+    const surplusOnAt = reckoned?.onAt
+    const surplusOffAt = reckoned?.offAt
+    const activeSurplus = reckoned !== undefined && reckoned.points >= reckoned.onAt && g >= 0.5 ? reckoned.points : undefined
+    return { account, accountAhead, g, availableHeadroom, surplus, surplusOnAt, surplusOffAt, activeSurplus }
   }
 
   function mainLoop(now: number, quotas = balance(now)) {
@@ -583,18 +586,18 @@ export function createCore(config: Config, script: string, session?: string, sav
     limitNotices = []
     if (balanceReasons.length && lastBalance !== 'on') {
       lastBalance = 'on'
-      queued.push({ text: balanceOnText(quotas.account, weeklyWindow(codex), quotas.activeSurplus, config.codexStopPercent, mode === 'always'),
+      queued.push({ text: balanceOnText(quotas.account, weeklyWindow(codex), quotas.activeSurplus, mode === 'always'),
         nudge: { session: session ?? null, kind: 'balance-on', reasons: balanceReasons, calls: null } })
     } else if (lastBalance === 'on' && steeringEnabled) {
-      const { account, availableHeadroom, surplus } = quotas
+      const { account, availableHeadroom, surplus, surplusOffAt } = quotas
       const closeToStop = availableHeadroom !== undefined && availableHeadroom < 0.5
       // The lower thresholds apply only to withdrawing advice already delivered.
       const backOnPace = open && !reasons.length && account.state === 'ok' &&
         account.percent !== undefined && account.line !== undefined && account.percent < account.line + 2 &&
-        surplus !== undefined && surplus < 10
+        surplus !== undefined && surplusOffAt !== undefined && surplus < surplusOffAt
       if (closeToStop || backOnPace) {
         lastBalance = 'off'
-        queued.push({ text: balanceOffText(closeToStop), nudge: { session: session ?? null, kind: 'balance-off', reasons: [], calls: null } })
+        queued.push({ text: balanceOffText(closeToStop, surplusOffAt), nudge: { session: session ?? null, kind: 'balance-off', reasons: [], calls: null } })
       }
     }
     return queued
@@ -821,11 +824,11 @@ export function createCore(config: Config, script: string, session?: string, sav
       })
       const readings = decided === undefined
         ? { u: reading.fiveHour?.percentUsed ?? 0, F: forecast(state, reading, now), codexPercent: weeklyWindow(codex)?.usedPercent,
-            account: accountWeekState(reading.sevenDay, sevenDayReadAt, now), surplus: codexSurplus(codex, config, now) }
+            account: accountWeekState(reading.sevenDay, sevenDayReadAt, now), surplus: codexSurplus(codex, config, now)?.points }
         : { u: decided.five_hour ?? 0, F: decided.forecast ?? undefined, codexPercent: decided.codex_weekly ?? undefined,
             account: decided.account_week ? { ...decided.account_week, line: decided.account_week.line ?? undefined } : undefined,
             surplus: decided.codex_surplus ?? undefined }
-      return denyText({ tier, reason, limit: limit ?? undefined, cause, ...readings, codexStopPercent: config.codexStopPercent, command, saved: briefFile !== undefined, delimiter })
+      return denyText({ tier, reason, limit: limit ?? undefined, cause, ...readings, command, saved: briefFile !== undefined, delimiter })
     },
 
     lastDecision: () => lastDecision,
@@ -881,11 +884,12 @@ export function createCore(config: Config, script: string, session?: string, sav
         const decision = decide({ tier, ...input })
         return `tier ${tier} calls: ${decision.handOff ? 'handed to Codex' : `stay on Claude (${decision.reason})`}`
       })
-      const { account, surplus } = quotas
+      const { account, surplus, surplusOnAt } = quotas
       const week = weeklyWindow(codex)
       const unavailable = cause ?? (!week ? 'no weekly window' : week.resetsAt === undefined ? 'weekly reset unknown' : 'weekly window has reset')
       const surplusStatus = surplus === undefined ? `unknown (${unavailable})`
-        : `${Number(surplus.toFixed(1))} points (${quotas.activeSurplus !== undefined ? 'active' : surplus < 15 ? 'below 15 points' : 'headroom below 0.5'})`
+        : `${Number(surplus.toFixed(1))} points (${quotas.activeSurplus !== undefined ? 'active'
+          : surplus < (surplusOnAt ?? 15) ? 'below activation threshold' : 'headroom below 0.5'})`
       return [
         status(now),
         ...tiers,

@@ -8,6 +8,20 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- The Codex stop now depends on the time left before Codex's reset. A long
+  window's stop starts at `codexStopPercent` (85 by default) and rises to
+  100% at reset, allowing more work to use the remaining quota.
+  Previously, the stop stayed at the configured percentage throughout the
+  window. This applies to routing and to the `run` launch check.
+- The Codex surplus is measured against an even pace that reaches 100% at
+  the reset rather than the stop. It can trigger hand-offs, with headroom
+  of at least 0.5, from 15 points or `codexStopPercent` times the fraction
+  of the window left, halved, whichever is less. With enough headroom, a
+  delivered on notice is withdrawn once the other hand-off reasons have
+  cleared, the Claude week is back on pace and the surplus falls strictly
+  below two thirds of its activation threshold. Decision records store the
+  new surplus value.
+
 - The README is now a short landing page. The routing rules, background-work
   protection, measurements, limits and research moved to
   [`docs/how-it-works.md`](docs/how-it-works.md), workflow stages to

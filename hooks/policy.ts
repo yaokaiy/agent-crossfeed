@@ -85,12 +85,42 @@ export function weeklyWindow(codex: CodexReading | undefined): CodexWindow | und
   return codex?.windows.filter(window => window.minutes > 360).sort((a, b) => b.minutes - a.minutes)[0]
 }
 
-export function codexSurplus(codex: CodexReading | undefined, config: Config, now: number): number | undefined {
+// Quota stops, headroom, surpluses and their thresholds are rounded to a millionth of a percentage point before
+// they are compared or shown. crossfeed.py's _fine does the same operations, so both draw the same line.
+export function fine(x: number): number {
+  return Math.floor(x * 1e6 + 0.5) / 1e6
+}
+
+// Whole milliseconds of a window still to run, from 0 to its length; all of it when the reset is unknown.
+// crossfeed.py's _window_stop clamps and rounds in the same order.
+function msLeft(window: CodexWindow, now: number): number {
+  const length = window.minutes * MINUTE
+  return window.resetsAt === undefined ? length : Math.floor(clamp(window.resetsAt - now, 0, length) + 0.5)
+}
+
+// The use at which a window stops new hand-offs. A window of 6 hours or less stops at 90%.
+// A longer one keeps 100 - codexStopPercent points for your own Codex work over a whole window,
+// shrinking with the time left to use them: the stop rises from codexStopPercent to 100 at the reset.
+export function codexStop(window: CodexWindow, config: Config, now: number): number {
+  if (window.minutes <= 360) return 90
+  const length = window.minutes * MINUTE
+  if (!Number.isFinite(length)) return fine(config.codexStopPercent)
+  return fine(config.codexStopPercent + (100 - config.codexStopPercent) * (length - msLeft(window, now)) / length)
+}
+
+// Points under an even pace that reaches 100% at the reset of the longest window over 6 hours.
+// onAt is the surplus that turns the balance rule on: 15 points, or codexStopPercent times the
+// fraction of the window left, halved, when that is less, so quota about to expire counts for more.
+// offAt, two thirds of onAt, is the surplus below which a delivered on notice is withdrawn.
+export function codexSurplus(codex: CodexReading | undefined, config: Config, now: number): { points: number; onAt: number; offAt: number } | undefined {
   if (!codex || codex.limitReached || Math.abs(codex.readAt - now) > CODEX_MAX_AGE) return undefined
   const week = weeklyWindow(codex)
   if (week?.resetsAt === undefined || now >= week.resetsAt) return undefined
-  const elapsed = clamp(1 - (week.resetsAt - now) / (week.minutes * MINUTE), 0, 1)
-  return config.codexStopPercent * elapsed - week.usedPercent
+  const length = week.minutes * MINUTE
+  if (!Number.isFinite(length)) return undefined
+  const left = msLeft(week, now)
+  const onAt = fine(Math.min(15, config.codexStopPercent * left / length / 2))
+  return { points: fine(100 * (length - left) / length - week.usedPercent), onAt, offAt: fine(onAt * 2 / 3) }
 }
 
 function usageRate(samples: PressureState['samples'], u: number, now: number): number | undefined {
@@ -371,7 +401,7 @@ export function knownHeadroom(codex: CodexReading | undefined, config: Config, n
   return Math.min(...windows.map(window => {
     if (window.minutes <= 360) return window.usedPercent >= 90 ? 0 : 1
     const days = window.resetsAt === undefined ? 7 : Math.max(0, (window.resetsAt - now) / (1440 * MINUTE))
-    return clamp((config.codexStopPercent - window.usedPercent) / (10 + 10 * clamp(days / 7, 0, 1)), 0, 1)
+    return fine(clamp((codexStop(window, config, now) - window.usedPercent) / (10 + 10 * clamp(days / 7, 0, 1)), 0, 1))
   }))
 }
 
@@ -395,7 +425,7 @@ export function headroomCause(codex: CodexReading | undefined, config: Config, n
   if (codex.readAt - now > CODEX_MAX_AGE) return `Codex reading is dated ${Math.round((codex.readAt - now) / MINUTE)} minutes ahead of the clock` + suffix
   const windows = currentWindows(codex, now)
   if (!windows.length) return 'all Codex windows have reset' + suffix
-  const window = windows.find(window => window.usedPercent >= (window.minutes <= 360 ? 90 : config.codexStopPercent))
+  const window = windows.find(window => window.usedPercent >= codexStop(window, config, now))
   if (!window) return 'no Codex headroom'
   const label = window.minutes === 10080 ? 'weekly' : `${window.minutes / 60}-hour`
   return `Codex ${label} use is ${Math.round(window.usedPercent)}%` + suffix
