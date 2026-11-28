@@ -1,12 +1,13 @@
-import type { EngineInterface, HookFailure, Register, SessionRateLimit } from 'claude-code'
+import type { Caught, EngineInterface, HookFailure, Register, SessionRateLimit, StreamNext, TurnStepChunk, TurnStepInput, TurnStepResult } from 'claude-code'
 import type { BackgroundState } from '../types'
 import type { Mode } from './config'
 import { DEFAULTS, toConfig } from './config'
 import { createCore } from './core'
-import type { BackgroundRow, Core, DecisionRecord, Notice, Nudge, StopResult } from './core'
-import type { AgentCall, ClaudeReading, CodexReading, UsageReading, Family } from './policy'
-import { CODEX_MAX_AGE, familyOf, shortProblem } from './policy'
-import { staticSection } from './text'
+import type { BackgroundRow, Core, DecisionRecord, Notice, Nudge, StageRoute, StopResult } from './core'
+import type { AgentCall, ClaudeReading, CodexReading, UsageReading, Family, StageContract } from './policy'
+import { ANSWER_FIELD_SCHEMA, CODEX_MAX_AGE, familyOf, shortProblem, stageAnswer, strictCompatible } from './policy'
+import type { StageChanges } from './text'
+import { readStageWarning, shellCommand, stageFailure, stageResult, staticSection } from './text'
 
 const ROW_CAP = 500
 
@@ -23,6 +24,20 @@ function failOpen<E, R>($: EngineInterface, e: E, next: ((event: E) => Promise<R
   return next(e)
 }
 
+export async function* failOpenStep(
+  $: EngineInterface, e: TurnStepInput, next: StreamNext<'turn.step'> & Caught, active: Core | undefined,
+  record: (row: BackgroundRow) => void,
+): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  logFailure($, `${next.event}: ${next.error.message ?? next.error.kind}`)
+  const route = active?.stages.get(e.agentId)
+  if (next.called || !active || !route || e.agentId === undefined) return yield* next(e)
+  if ('retry' in route) return yield* stageText(e, stageFailure(route.id, 'the stage already ran under another agent'), 0)
+  if (active.stages.endRun(route)) await showStatus($, active)
+  const previous = route.output
+  const index = previous?.turnId === e.turnId && previous.step === e.index ? previous.block + 1 : 0
+  return yield* failStageStep($, e, next, active, route, route.failure ?? 'stage hook failed', index, record)
+}
+
 // A clock that returns no usable time would poison every age the plugin keeps: fail the event instead.
 async function clock($: EngineInterface): Promise<number> {
   const now: unknown = await $.clock.now()
@@ -30,9 +45,9 @@ async function clock($: EngineInterface): Promise<number> {
   return now
 }
 
-async function showStatus($: EngineInterface, core: Core, now: number): Promise<void> {
+async function showStatus($: EngineInterface, core: Core, now?: number): Promise<void> {
   try {
-    await $.ui.status(core.status(now))
+    await $.ui.status(core.status(now ?? await clock($)))
   } catch { /* The status line must not block the event. */ }
 }
 
@@ -124,9 +139,20 @@ export async function readUsage($: EngineInterface, script: string, fresh: boole
 
 // Takes the readings that are due side by side and keeps each as soon as it arrives,
 // so neither probe delays the other or the other's result.
-async function refreshReadings($: EngineInterface, core: Core, script: string, now: number, due: { codex: boolean; usage: boolean }): Promise<void> {
+type CodexProbe = { pending?: Promise<void> }
+
+async function refreshReadings(
+  $: EngineInterface, core: Core, script: string, now: number, due: { codex: boolean; usage: boolean }, probe: CodexProbe,
+): Promise<void> {
+  let pending: Promise<void> | undefined
+  if (due.codex) {
+    pending = readCodex($, script).then(quota => core.setCodex(quota.reading, quota.problem, quota.at ?? now)).finally(() => {
+      if (probe.pending === pending) probe.pending = undefined
+    })
+    probe.pending = pending
+  }
   await Promise.all([
-    due.codex ? readCodex($, script).then(quota => core.setCodex(quota.reading, quota.problem, quota.at ?? now)) : undefined,
+    pending,
     due.usage ? readUsage($, script, false).then(usage => core.setUsage(usage.reading, usage.problem, usage.at ?? now)) : undefined,
   ])
 }
@@ -160,6 +186,170 @@ async function stashBrief($: EngineInterface, script: string, prompt: string): P
     logFailure($, `brief could not be saved: ${String(error)}`)
   }
   return undefined
+}
+
+async function prepareStage(
+  $: EngineInterface, core: Core, script: string, stage: StageContract, tier: 'A' | 'B',
+): Promise<{ argv: string[] } | { error: string }> {
+  let cwd: string
+  try {
+    cwd = await $.session.cwd()
+    if (!cwd.startsWith('/') || cwd.includes('\0')) return { error: 'could not determine the session directory' }
+  } catch {
+    return { error: 'could not determine the session directory' }
+  }
+  let schemaJson: string | undefined
+  let strict = false
+  if (stage.schema !== undefined) {
+    try { schemaJson = JSON.stringify(stage.schema) }
+    catch { return { error: 'could not encode the stage schema' } }
+    try { strict = strictCompatible(stage.schema) }
+    catch { /* An uncertain schema can still be sent in the brief. */ }
+  }
+  const prompt = schemaJson !== undefined && !strict
+    ? `${stage.brief}\n\nSchema:\n${schemaJson}\n\nYour final message is a JSON object with one field, \`answer\`: a string holding the JSON value that satisfies this schema.`
+    : stage.brief
+  const brief = await stashBrief($, script, prompt)
+  if (!brief) return { error: 'could not save the stage brief' }
+  const schema = schemaJson === undefined ? undefined
+    : await stashBrief($, script, strict ? schemaJson : JSON.stringify(ANSWER_FIELD_SCHEMA))
+  if (schemaJson !== undefined && !schema) return { error: 'could not save the stage schema' }
+  const argv = core.stageArgv(stage, tier, cwd, brief, schema)
+  try {
+    const check = await $.tool.check({ tool: 'Bash', input: { command: shellCommand(argv) } })
+    if (check.decision === 'allow' || (check.decision === 'ask' && core.approveStages)) return { argv }
+    if (check.decision === 'ask') {
+      const prefix = shellCommand(argv.slice(0, 4))
+      return { error: `Bash approval required. Enable approveStages in /plugin configure, or outside auto permission mode allow Bash(${prefix} *)` }
+    }
+    return { error: shortProblem(check.reason) ?? shortProblem(check.rule) ?? 'Bash permission denied' }
+  } catch {
+    return { error: 'could not check Bash permission for the stage command' }
+  }
+}
+
+async function readStageResult($: EngineInterface, path: string, signal: AbortSignal): Promise<string> {
+  // A single engine file read is capped at 4 MiB. Decode the complete UTF-8
+  // buffer after reading ranges so a range boundary cannot split a character.
+  const range = 4 * 1024 * 1024
+  const { kind, size } = await $.fs.stat(path)
+  if (kind !== 'file') throw new Error('stage result is not a file')
+  signal.throwIfAborted()
+  if (size <= range) return $.fs.read(path)
+  const body = new Uint8Array(size)
+  for (let offset = 0; offset < size; offset += range) {
+    signal.throwIfAborted()
+    const length = Math.min(range, size - offset)
+    const { base64 } = await $.fs.read(path, { as: 'bytes', offset, length })
+    const bytes = atob(base64)
+    if (bytes.length !== length) throw new Error('stage result changed while being read')
+    for (let index = 0; index < bytes.length; index++) body[offset + index] = bytes.charCodeAt(index)
+  }
+  return new TextDecoder().decode(body)
+}
+
+type StageAnswer = { text: string } | { input: unknown; json: string } | { error: string }
+
+function stringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(item => typeof item === 'string')
+}
+
+function stageChanges(value: unknown, write: boolean): StageChanges | undefined {
+  if (!isRecord(value) || !stringList(value.codex_edited)) return undefined
+  const codexEdited = value.codex_edited
+  if (!write) return { codexEdited }
+  if ((value.observed !== 'unavailable' && !stringList(value.observed)) || typeof value.head_moved !== 'boolean') return undefined
+  return { codexEdited, workspace: { observed: value.observed, headMoved: value.head_moved } }
+}
+
+async function* executeStage(
+  $: EngineInterface, route: StageRoute, signal: AbortSignal, onProgress: (progress: string) => Promise<void>,
+): AsyncGenerator<TurnStepChunk, StageAnswer> {
+  signal.throwIfAborted()
+  const env = route.row.session === null ? undefined : { CLAUDE_CODE_SESSION_ID: route.row.session }
+  const child = $.process.spawn({ argv: route.argv, env })
+  let stdout = ''
+  let stderrTail = ''
+  let firstStderr = true
+  const progressPrefix = 'crossfeed: progress '
+  const maxProgressLineLength = progressPrefix.length + 2 * 200 + 1 // UTF-16 units plus a possible CR.
+  const heartbeat = 'crossfeed: heartbeat'
+  for await (const chunk of child) {
+    if (chunk.stream === 'stdout') {
+      stdout += chunk.text
+      continue
+    }
+    const text = firstStderr ? chunk.text.replace(/^\uFEFF/, '') : chunk.text
+    firstStderr = false
+    const lines = (stderrTail + text).split('\n')
+    // Chunks can split lines. Keep only a possible progress or heartbeat line or a
+    // sentinel for a diagnostic that continues into the next chunk.
+    const tail = lines.pop() ?? ''
+    stderrTail = ((heartbeat + '\r').startsWith(tail) || progressPrefix.startsWith(tail) ||
+      (tail.startsWith(progressPrefix) && tail.length <= maxProgressLineLength)) ? tail : '!'
+    for (const raw of lines) {
+      const line = raw.replace(/\r$/, '')
+      const progress = line.startsWith(progressPrefix) ? line.slice(progressPrefix.length) : ''
+      if (line !== heartbeat && !progress) continue
+      await onProgress(progress)
+      const text = progress ? `Codex: ${progress}\n` : 'Waiting for the Codex job.\n'
+      yield { kind: 'thinking', index: 0, text }
+    }
+  }
+  const { code, signal: killedBy } = await child.result
+  signal.throwIfAborted()
+  let value: unknown
+  try { value = JSON.parse(stdout) } catch { /* Use the process status below when no JSON arrived. */ }
+  if (isRecord(value) && value.status === 'not-started') {
+    route.notStarted = true
+    const reason = shortProblem(value.error)
+    return { error: 'Codex job did not start' + (reason ? ': ' + reason : '') }
+  }
+  const write = route.kind === 'task'
+  const changes = stageChanges(value, write)
+  if (changes?.codexEdited.length && !write) {
+    route.readEdits = changes.codexEdited
+    if (route.schema !== undefined) {
+      try { await $.ui.toast(`Stage ${route.id}: ${readStageWarning(route.readEdits)}`) } catch { /* Best effort. */ }
+    }
+  }
+  if (code !== 0) {
+    const status = isRecord(value) ? shortProblem(value.status) : undefined
+    return { error: `Codex job ${status ?? 'failed'} (${killedBy ?? 'exit ' + code})` }
+  }
+  if (!changes || !isRecord(value) || value.status !== 'done' || value.exit !== 0 ||
+      typeof value.result_path !== 'string' || !value.result_path.startsWith('/') || !value.result_path.endsWith('/result.md')) {
+    return { error: 'invalid dispatcher response' }
+  }
+  const result = await readStageResult($, value.result_path, signal)
+  if (route.schema === undefined) return { text: stageResult(result, value.result_path, changes) }
+  const parsed = stageAnswer(result, route.schema)
+  return 'error' in parsed ? { error: parsed.error } : { input: parsed.value, json: parsed.json }
+}
+
+async function* stageText(e: TurnStepInput, answer: string, blockIndex: number): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  yield { kind: 'text', index: blockIndex, text: answer }
+  yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+  return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: null }
+}
+
+async function* failStageStep(
+  $: EngineInterface, e: TurnStepInput, next: StreamNext<'turn.step'>, active: Core, route: StageRoute,
+  reason: string, block: number, record: (row: BackgroundRow) => void,
+): AsyncGenerator<TurnStepChunk, TurnStepResult> {
+  let fallback = false
+  if (!next.signal.aborted) {
+    try { fallback = active.stageMayFallback(route, await clock($)) }
+    catch (error) { logFailure($, `stage fallback check failed: ${errorText(error)}`) }
+  }
+  const aborted = next.signal.aborted
+  const row = active.stages.fail(e.agentId!, route, aborted ? 'aborted' : reason, !aborted && fallback)
+  if (row) record(row)
+  if (aborted) return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: null }
+  if (fallback) return yield* next(e)
+  route.output = { turnId: e.turnId, step: e.index, block }
+  const warning = route.schema === undefined && route.readEdits?.length ? '\n' + readStageWarning(route.readEdits) : ''
+  return yield* stageText(e, stageFailure(route.id, reason) + warning, block)
 }
 
 function errorText(error: unknown): string {
@@ -339,6 +529,7 @@ export const register: Register = (on, options) => {
   // Track attempts separately from reading age: an unavailable or stale reading
   // must not trigger another subprocess on every call.
   let lastProbeAt = -Infinity
+  let codexProbe: CodexProbe = {}
   let lastUsageProbeAt = -Infinity
   let mode: Mode = 'auto'
   let codexStopPercent = DEFAULTS.codexStopPercent
@@ -405,6 +596,7 @@ export const register: Register = (on, options) => {
     await $.command.register({ name: 'crossfeed', description: 'Show crossfeed status, report or change routing mode.', argumentHint: '[status|report|auto|always|off]' })
     const now = await clock($)
     lastProbeAt = -Infinity
+    codexProbe = {}
     lastUsageProbeAt = -Infinity
     if (config.mode !== 'off') { lastProbeAt = now; lastUsageProbeAt = now }
     const [quota, lockout, usage] = await Promise.all([
@@ -449,7 +641,7 @@ export const register: Register = (on, options) => {
       scheduleWakes($, backgroundIO, core, script, current)
       const modelAsk = ++modelAsked
       applyModel(modelAsk, await mainModel($), now)
-      await refreshReadings($, core, script, now, { codex: needsCodex(now), usage: needsUsage(now) })
+      await refreshReadings($, core, script, now, { codex: needsCodex(now), usage: needsUsage(now) }, codexProbe)
       await showStatus($, core, await clock($))
     }
     return next(e)
@@ -479,7 +671,7 @@ export const register: Register = (on, options) => {
     // A model-limit reading that arrives during the probes is judged against the main model.
     const firstModelAsk = ++modelAsked
     applyModel(firstModelAsk, await mainModel($), now)
-    await refreshReadings($, core, script, now, { codex: needsCodex(now, e), usage: needsUsage(now) })
+    await refreshReadings($, core, script, now, { codex: needsCodex(now, e), usage: needsUsage(now) }, codexProbe)
     // Take the session's own readings at decision time: a measure event may not have fired
     // yet in a session's first turn, and the main model may have changed during the probes.
     const usageAsk = ++usageAsked
@@ -555,12 +747,67 @@ export const register: Register = (on, options) => {
     if (!core) return next(e)
     const active = core
     const reading = mode === 'off' ? undefined : claudeReading((await $.session.usage()).rateLimits)
-    const now = await clock($)
+    let now = await clock($)
     if (version !== conversationVersion) return next(e)
     if (reading && applyUsage(usageAsk, reading, now)) {
       runBreaker($, backgroundIO, active, script, session, now, () => mode !== 'off' && version === conversationVersion)
     }
+    const contract = active.stageContract(e)
+    let prepared: Awaited<ReturnType<typeof prepareStage>> | undefined
+    let stageDenial: string | undefined
+    if (contract && 'error' in contract) stageDenial = contract.error
+    if (contract && !('error' in contract)) {
+      if (active.codexAge(now) > 5 * 60000) {
+        if (codexProbe.pending) await codexProbe.pending
+        else if (Math.abs(now - lastProbeAt) > 5 * 60000) {
+          lastProbeAt = now
+          await refreshReadings($, active, script, now, { codex: true, usage: false }, codexProbe)
+        }
+        now = await clock($)
+      }
+      const plan = active.stagePlan(contract, e, now)
+      if (plan) {
+        if ('error' in plan) stageDenial = stageFailure(contract.id, plan.error)
+        else if (version === conversationVersion) {
+          prepared = await prepareStage($, active, script, contract, plan.tier)
+          now = await clock($)
+          const currentPlan = active.stagePlan(contract, e, now)
+          if (!currentPlan) prepared = undefined
+          else if ('error' in currentPlan) stageDenial = stageFailure(contract.id, currentPlan.error)
+          else if ('error' in prepared && contract.executor === 'codex') stageDenial = stageFailure(contract.id, prepared.error)
+        }
+      }
+    }
+    if (version !== conversationVersion) return next(e)
     const { row, deny, background } = active.admission(e, now)
+    if (row && contract && !('error' in contract) && prepared && 'argv' in prepared && !stageDenial) {
+      const route: StageRoute = { nonce: crypto.randomUUID(), id: contract.id, executor: contract.executor, kind: contract.kind,
+        schema: contract.schema, argv: prepared.argv, row }
+      const prompt = active.stages.issue(route, e.prompt)
+      let ran
+      try { ran = await next({ ...e, prompt }) }
+      catch (error) {
+        active.stages.revoke(route.nonce)
+        throw error
+      }
+      try {
+        if (ran.deny !== undefined || !ran.agentId) {
+          if (active.stages.revoke(route.nonce)) {
+            const outcome = active.stages.finish(route, ran.deny !== undefined ? 'refused' : 'unconfirmed')
+            if (outcome) queueRow($, backgroundIO.queue, script, outcome)
+          }
+        } else if (version === conversationVersion) {
+          active.stages.confirm(ran.agentId, route)
+          active.background.started(e, ran.agentId, background)
+          saveBackground($, backgroundIO.writes, session, active.background.snapshot())
+        }
+      } catch (error) { logFailure($, `stage spawn bookkeeping failed: ${errorText(error)}`) }
+      return ran
+    }
+    if (row && stageDenial) {
+      queueRow($, backgroundIO.queue, script, { ...row, outcome: 'refused' })
+      return { deny: stageDenial }
+    }
     if (deny) {
       if (row) queueRow($, backgroundIO.queue, script, { ...row, outcome: 'refused' })
       return { deny }
@@ -588,18 +835,97 @@ export const register: Register = (on, options) => {
     return ran
   }).catch(failOpen)
 
+  on('vcs.isolate', async (_$, e, next) => {
+    if (e.for === 'agent' && e.agentId !== undefined) core?.stages.isolate(e.agentId)
+    return next(e)
+  }).catch(failOpen)
+
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
       const version = conversationVersion
       if (conversationChanged) refreshConversation(version, ...await loadConversation($, backgroundIO.writes))
       if (version === conversationVersion) core?.background.startTurn(e.turnId)
+    } else {
+      core?.stages.bind(e.agentId, e.text)
     }
     return next(e)
   }).catch(failOpen)
 
+  on('turn.step', async function* ($, e, next) {
+    const active = core
+    const route = active?.stages.get(e.agentId)
+    if (!active || !route || e.agentId === undefined) return yield* next(e)
+    if ('retry' in route) return yield* stageText(e, stageFailure(route.id, 'the stage already ran under another agent'), 0)
+    const { turnId, index, agentId } = e
+    const { signal } = next
+    const record = (row: BackgroundRow) => queueRow($, backgroundIO.queue, script, row)
+    // Some engine builds only put the worktree information on vcs.isolate.
+    if (active.stages.isIsolated(agentId)) {
+      const deny = active.isolatedStageDenial(route, await clock($))
+      if (deny) return yield* failStageStep($, e, next, active, route, deny, 0, record)
+      const row = active.stages.stay(agentId, route)
+      if (row) record(row)
+      return yield* next(e)
+    }
+    let blockIndex = 0
+    let answer: StageAnswer
+    if (route.failure !== undefined) answer = { error: route.failure }
+    else if (route.toolSent) answer = { error: 'StructuredOutput was rejected' }
+    else if (route.answer !== undefined) answer = { text: route.answer }
+    else {
+      try {
+        signal.throwIfAborted()
+        if (!active.stages.start(agentId, route)) {
+          return yield* stageText(e, stageFailure(route.id, 'the stage dispatcher is already running'), 0)
+        }
+        try {
+          await showStatus($, active)
+          answer = yield* executeStage($, route, signal, async progress => {
+            blockIndex = 1
+            route.output = { turnId, step: index, block: 0 }
+            if (progress && active.stages.progress(route, progress)) await showStatus($, active)
+          })
+        } finally {
+          if (active.stages.endRun(route)) await showStatus($, active)
+        }
+      }
+      catch (error) {
+        if (!signal.aborted) logFailure($, `stage dispatch failed: ${errorText(error)}`)
+        answer = { error: 'stage dispatch failed' }
+      }
+    }
+    if (signal.aborted || 'error' in answer) {
+      return yield* failStageStep($, e, next, active, route, 'error' in answer ? answer.error : 'aborted', blockIndex, record)
+    }
+    route.output = { turnId, step: index, block: blockIndex }
+    if ('input' in answer) {
+      const tool = { id: 'toolu_crossfeed_' + route.nonce.replace(/-/g, ''), name: 'StructuredOutput', input: answer.input }
+      route.toolSent = true
+      yield { kind: 'tool', index: blockIndex, id: tool.id, name: tool.name }
+      yield { kind: 'input', index: blockIndex, json: answer.json }
+      yield { kind: 'stop', stopReason: 'tool_use', usage: null }
+      return { turnId, index, answer: '', toolUses: [tool], stopReason: 'tool_use', usage: null }
+    }
+    route.answer = answer.text
+    return yield* stageText(e, answer.text, blockIndex)
+  }).catch(async function* ($, e, next) {
+    return yield* failOpenStep($, e, next, core, row => queueRow($, backgroundIO.queue, script, row))
+  })
+
   on('turn.complete', async ($, e, next) => {
     const version = conversationVersion
     const ran = await next(e)
+    if (e.agentId !== undefined && core) {
+      try {
+        const active = core
+        const route = active.stages.get(e.agentId)
+        // The canceled step's own status call can fail after its signal aborts.
+        const refresh = route && !('retry' in route) && (active.stages.endRun(route) || e.isAborted || e.reason === 'aborted')
+        const row = active.stages.complete(e.agentId, e.reason === 'answer' && !e.isAborted)
+        if (row) queueRow($, backgroundIO.queue, script, row)
+        if (refresh) await showStatus($, active)
+      } catch (error) { logFailure($, `stage completion bookkeeping failed: ${errorText(error)}`) }
+    }
     if (e.agentId === undefined && core && version === conversationVersion) {
       try {
         core.background.completeTurn(e.turnId)

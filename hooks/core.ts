@@ -1,8 +1,9 @@
 import type { BackgroundState, BackgroundTask as Task } from '../types'
+import { DEFAULTS } from './config'
 import type { Config, Mode } from './config'
-import { CODEX_MAX_AGE, FIVE_HOUR_WINDOW_MS, INITIAL_PRESSURE, accountWeekState, bucketState, codexSurplus, familyOf, fallbackFor, rewriteModel, subagentFamily, decide, eligible, fit, forecast, headroomCause, knownHeadroom, shortProblem, pressure, shortWindow, spawnOrigin, updatePressure, weeklyWindow } from './policy'
-import type { AgentCall, BucketState, ClaudeReading, CodexReading, UsageReading, BucketView, Family, FiveHour, FloorCause, HandOffReason, PressureState, ShortWindow, Spawn, SpawnOrigin, Tier } from './policy'
-import { balanceOffText, balanceOnText, limitLines, limitNotice, denyText, dispatchCommand, heredocDelimiter, paceWarning, pressureNotice, reserveNotice, shortWindowStatus, spawnDenial, statusLine, stretchReminder, wakeText } from './text'
+import { CODEX_MAX_AGE, FIVE_HOUR_WINDOW_MS, INITIAL_PRESSURE, accountWeekState, bucketState, codexSurplus, familyOf, fallbackFor, rewriteModel, subagentFamily, decide, eligible, fit, forecast, headroomCause, knownHeadroom, parseStage, shortProblem, pressure, shortWindow, spawnOrigin, updatePressure, weeklyWindow } from './policy'
+import type { AgentCall, BucketState, ClaudeReading, CodexReading, UsageReading, BucketView, Family, FiveHour, FloorCause, HandOffReason, PressureState, ShortWindow, Spawn, SpawnOrigin, StageContract, Tier } from './policy'
+import { balanceOffText, balanceOnText, limitLines, limitNotice, denyText, dispatchCommand, heredocDelimiter, paceWarning, pressureNotice, reserveNotice, shortWindowStatus, spawnDenial, stageMarker, statusLine, stretchReminder, wakeText } from './text'
 
 import type { LimitFact, WakeStop } from './text'
 
@@ -10,8 +11,28 @@ export type Route = { tier: 'A' | 'B'; reason: string; limit?: LimitFact; cause?
 export type Nudge = { session: string | null; kind: 'balance-on' | 'balance-off' | 'stretch'; reasons: HandOffReason[]; calls: number | null }
 export type Notice = { text: string; nudge?: Nudge }
 type SpawnModel = Pick<Spawn, 'subagentType' | 'model' | 'fork' | 'parentModel'>
+type StageOutcome = 'stage-codex' | 'stage-fallback' | 'stage-failed'
 type SpawnRow = { type: 'spawn'; session: string | null; origin: SpawnOrigin; run_id: string | null;
-  agent_index: number | null; model: string | null; outcome: 'started' | 'refused' | 'unconfirmed' }
+  agent_index: number | null; model: string | null; outcome: 'started' | 'refused' | 'unconfirmed' | StageOutcome; codex_edited?: number }
+type SpawnFacts = Omit<SpawnRow, 'outcome' | 'codex_edited'>
+type StageSpawn = Spawn & { prompt: string }
+export type StageRoute = {
+  nonce: string
+  id: string
+  executor: StageContract['executor']
+  kind: StageContract['kind']
+  schema?: StageContract['schema']
+  argv: readonly string[]
+  row: SpawnFacts
+  answer?: string
+  toolSent?: boolean
+  failure?: string
+  recorded?: boolean
+  notStarted?: boolean
+  output?: { turnId: string; step: number; block: number }
+  readEdits?: string[]
+}
+const STAGE_WORKTREE_REFUSAL = 'stage uses worktree isolation; Codex would run in the session checkout'
 type BreakerRow = { type: 'breaker'; session: string | null; task_id: string; run_id: string | null;
   outcome: 'stopped' | 'denied' | 'error'; reason: string | null }
 type WakeRow = { type: 'wake'; session: string | null; trigger: 'pace' | 'breaker'; outcome: 'prompt' | 'notice' }
@@ -19,6 +40,104 @@ export type BackgroundRow = SpawnRow | BreakerRow | WakeRow
 export type StopResult = { outcome: BreakerRow['outcome'] | 'ended'; reason?: string }
 type Stop = { task: Task; session: string | null; conversation: number; window: number; reading: ShortWindow; wakeReady: boolean }
 type Wake = { trigger: WakeRow['trigger']; reading: ShortWindow; stops: WakeStop[]; ready: boolean }
+
+function createStages() {
+  const issued = new Map<string, StageRoute>()
+  // A retry can arrive after the original turn has ended or fallen back.
+  const launched = new Map<string, { agentId: string; id: string }>()
+  const agents = new Map<string, StageRoute | { retry: true; id: string }>()
+  const unbound = new Map<string, StageRoute>()
+  const running = new Map<StageRoute, string | undefined>()
+  const isolated = new Set<string>()
+
+  function finish(route: StageRoute, outcome: SpawnRow['outcome']): SpawnRow | undefined {
+    if (route.recorded) return undefined
+    route.recorded = true
+    return { ...route.row, outcome, ...(route.readEdits?.length ? { codex_edited: route.readEdits.length } : {}) }
+  }
+
+  return {
+    reset() { issued.clear(); launched.clear(); agents.clear(); unbound.clear(); running.clear(); isolated.clear() },
+    isolate: (agentId: string) => { isolated.add(agentId) },
+    isIsolated: (agentId: string) => isolated.has(agentId),
+    issue(route: StageRoute, prompt: string): string {
+      issued.set(route.nonce, route)
+      return prompt + '\n\n' + stageMarker(route.nonce)
+    },
+    revoke(nonce: string) { return issued.delete(nonce) },
+    confirm(agentId: string, route: StageRoute) {
+      if (issued.has(route.nonce)) unbound.set(agentId, route)
+    },
+    bind(agentId: string, text: string) {
+      if (agents.has(agentId)) return
+      // The workflow harness indents the prompt, and the hook's marker comes after its brief.
+      const markers = [...text.matchAll(/^[^\S\r\n]*crossfeed-route: ([a-f0-9-]+)[^\S\r\n]*\r?$/gm)]
+      for (const [, nonce] of markers.reverse()) {
+        if (nonce === undefined) continue
+        const route = issued.get(nonce)
+        if (route) {
+          issued.delete(nonce)
+          unbound.delete(agentId)
+          agents.set(agentId, route)
+          return
+        }
+        const job = launched.get(nonce)
+        if (job) {
+          if (job.agentId !== agentId) agents.set(agentId, { retry: true, id: job.id })
+          return
+        }
+      }
+    },
+    get: (agentId: string | undefined) => agentId === undefined ? undefined : agents.get(agentId),
+    start(agentId: string, route: StageRoute): boolean {
+      if (launched.has(route.nonce)) return false
+      launched.set(route.nonce, { agentId, id: route.id })
+      running.set(route, undefined)
+      return true
+    },
+    progress(route: StageRoute, text: string): boolean {
+      if (!running.delete(route)) return false
+      running.set(route, text)
+      return true
+    },
+    endRun: (route: StageRoute) => running.delete(route),
+    status() {
+      let latest: StageRoute | undefined
+      let latestProgress: { id: string; progress: string } | undefined
+      // Updates move a stage to the end. A new start has no action to supersede actual progress.
+      for (const [route, progress] of running) {
+        latest = route
+        if (progress !== undefined) latestProgress = { id: route.id, progress }
+      }
+      return latest && { count: running.size, ...(latestProgress ?? { id: latest.id, progress: 'started' }) }
+    },
+    finish,
+    stay(agentId: string, route: StageRoute) {
+      agents.delete(agentId)
+      return finish(route, 'started')
+    },
+    fail(agentId: string, route: StageRoute, reason: string, fallback: boolean) {
+      route.failure = reason
+      if (fallback) agents.delete(agentId)
+      return finish(route, fallback ? 'stage-fallback' : 'stage-failed')
+    },
+    complete(agentId: string, answered: boolean) {
+      isolated.delete(agentId)
+      const route = agents.get(agentId)
+      if (!route) {
+        const missed = unbound.get(agentId)
+        if (!missed) return undefined
+        unbound.delete(agentId)
+        issued.delete(missed.nonce)
+        return finish(missed, 'started')
+      }
+      agents.delete(agentId)
+      if ('retry' in route) return undefined
+      const success = answered && route.failure === undefined && (route.toolSent || route.answer !== undefined)
+      return finish(route, success ? 'stage-codex' : 'stage-failed')
+    },
+  }
+}
 
 function createBackgroundProtection(config: Config, initialSession?: string, saved?: BackgroundState) {
   let session = initialSession
@@ -72,6 +191,7 @@ function createBackgroundProtection(config: Config, initialSession?: string, sav
   }
 
   return {
+    windowAt,
     snapshot: () => current,
     registerTask,
     registerAgent(agentId: string) {
@@ -149,7 +269,7 @@ function createBackgroundProtection(config: Config, initialSession?: string, sav
       const latest = windowAt(state, now)
       const deny = mode !== 'off' && background && latest && (latest.shed || latest.pace)
         ? spawnDenial(latest, !!spawn.workflow) : undefined
-      const row: Omit<SpawnRow, 'outcome'> | undefined = mode === 'off' ? undefined : {
+      const row: SpawnFacts | undefined = mode === 'off' ? undefined : {
         type: 'spawn', session: session ?? null, origin: spawnOrigin(spawn), run_id: spawn.workflow?.runId ?? null,
         agent_index: spawn.workflow?.agentIndex ?? null, model: spawn.model ?? null,
       }
@@ -257,6 +377,13 @@ export type Core = {
   newConversation(session: string | undefined, background?: BackgroundState): void
   background: ReturnType<typeof createBackgroundProtection>
   admission(spawn: Spawn, now: number): ReturnType<Core['background']['admission']>
+  stages: ReturnType<typeof createStages>
+  stageContract(spawn: StageSpawn): ReturnType<typeof parseStage>
+  stagePlan(stage: StageContract, spawn: StageSpawn, now: number): { tier: 'A' | 'B' } | { error: string } | undefined
+  stageArgv(stage: StageContract, tier: 'A' | 'B', cwd: string, brief: string, schema?: string): string[]
+  approveStages: boolean
+  stageMayFallback(route: StageRoute, now: number): boolean
+  isolatedStageDenial(route: StageRoute, now: number): string | undefined
   beginStops(now: number): Stop[]
   setUsage(reading: UsageReading | undefined, problem: string | undefined, now: number): void
   usageAge(now: number): number
@@ -296,6 +423,7 @@ function recentStays(stays: number[], now: number): number[] {
 export function createCore(config: Config, script: string, session?: string, saved?: BackgroundState): Core {
   let mode = config.mode
   const background = createBackgroundProtection(config, session, saved)
+  const stages = createStages()
   let usage: UsageReading | undefined
   let usageProblem: string | undefined
   let usageAttempted = false
@@ -407,6 +535,11 @@ export function createCore(config: Config, script: string, session?: string, sav
     return { input, basePressure, floor }
   }
 
+  function windowIsShort(now: number): boolean {
+    const window = background.windowAt(state, now)
+    return !!(window?.shed || window?.pace)
+  }
+
   function status(now: number): string {
     const quotas = balance(now)
     return statusLine({
@@ -422,6 +555,7 @@ export function createCore(config: Config, script: string, session?: string, sav
       codexStale: codex !== undefined && codexAge(now) > CODEX_MAX_AGE,
       P: pressure(state, reading),
       reserve: (reading.fiveHour?.percentUsed ?? 0) >= 90,
+      stages: stages.status(),
     })
   }
 
@@ -479,10 +613,47 @@ export function createCore(config: Config, script: string, session?: string, sav
   return {
     background,
     admission: (spawn, now) => background.admission(spawn, state, now),
+    stages,
+    approveStages: config.approveStages,
+    stageContract: spawn => mode === 'off' ? undefined : parseStage(spawn),
+    stagePlan(stage, spawn, now) {
+      if (mode === 'off') return undefined
+      if (spawn.isolation === 'worktree') return stage.executor === 'codex' ? { error: STAGE_WORKTREE_REFUSAL } : undefined
+      const quotas = balance(now)
+      if (quotas.g <= 0) {
+        return stage.executor === 'codex'
+          ? { error: headroomCause(codex, config, now, codexProblem) ?? 'no Codex headroom' }
+          : undefined
+      }
+      const tier = stage.kind === 'task' ? 'A' : 'B'
+      if (stage.executor === 'codex' || windowIsShort(now)) return { tier }
+      const limit = familyFact(subagentFamily(spawn.model, spawn.parentModel), now)
+      const { input } = routingPolicy(now, recentStays(stayedCalls, now).length, limit, quotas)
+      return decide({ tier, ...input }).handOff ? { tier } : undefined
+    },
+    stageArgv(stage, tier, cwd, brief, schema) {
+      const argv = ['python3', '-I', script, 'run', '--kind', stage.kind, '--tier', tier,
+        '--json', '--slots', '8', '--heartbeat', '60', '--dir', cwd, '--brief-file', brief]
+      if (stage.kind === 'task') argv.push('--write')
+      if (schema !== undefined) argv.push('--output-schema', schema)
+      if (config.codexStopPercent !== DEFAULTS.codexStopPercent) argv.push('--codex-stop', String(config.codexStopPercent))
+      if (config.model) argv.push('--model', config.model)
+      if (config.effort !== DEFAULTS.effort) argv.push('--effort', config.effort)
+      if (config.timeoutMinutes !== DEFAULTS.timeoutMinutes) argv.push('--timeout', String(config.timeoutMinutes))
+      return argv
+    },
+    stageMayFallback: (route, now) =>
+      route.executor === 'auto' && route.notStarted === true && !route.output && !route.failure && !windowIsShort(now),
+    isolatedStageDenial(route, now) {
+      if (route.executor === 'codex') return STAGE_WORKTREE_REFUSAL
+      const window = background.windowAt(state, now)
+      return mode !== 'off' && window && (window.shed || window.pace) ? spawnDenial(window, !!route.row.run_id) : undefined
+    },
     beginStops: now => background.beginStops(state, now),
     newConversation(nextSession, savedBackground) {
       session = nextSession
       background.newConversation(nextSession, savedBackground)
+      stages.reset()
       pendingPressure = undefined
       pendingReserve = undefined
       lastBalance = undefined

@@ -87,9 +87,46 @@ def execute():
         assert isinstance(json.loads(schema.read_text(encoding="utf-8")), dict)
     result = Path(sys.argv[sys.argv.index("-o") + 1])
     brief = sys.stdin.buffer.read()
+    if mode == "slow":
+        time.sleep(1.2)
+    if mode == "progress":
+        items = [
+            {"type": "command_execution", "command": "printf ok\r\npwd", "exit_code": 3},
+            {"type": "web_search", "query": "查找\nexample"},
+            {"type": "file_change", "status": "completed", "changes": [{"path": "a.txt", "kind": "update"}, {"path": "检查.txt", "kind": "add"}]},
+            {"type": "mcp_tool_call", "server": "local", "tool": "lookup"},
+            {"type": "web_search", "query": "界" * 220},
+            {"type": "command_execution", "command": "bad item", "exit_code": None},
+            {"type": "file_change", "status": "completed", "changes": [None, {"path": "bad item"}]},
+            {"type": "mcp_tool_call", "server": "bad item"},
+            {"type": "reasoning", "text": "not progress"},
+        ]
+        reply({"type": "item.started", "item": items[0]})
+        for item in items:
+            reply({"type": "item.completed", "item": item})
+    if mode == "failed-patch":
+        reply({"type": "item.completed", "item": {"type": "file_change", "status": "failed",
+                                                   "changes": [{"path": "never-created", "kind": "add"}]}})
+    if mode == "hold":
+        reply({"type": "thread.started", "thread_id": "fake-thread-1"})
+        reply({"type": "turn.completed", "usage": {"input_tokens": 12}})
+        release = Path(os.environ["FAKE_CODEX_RELEASE"])
+        Path(os.environ["FAKE_CODEX_READY"]).touch()
+        deadline = time.monotonic() + 15
+        while not release.exists():
+            if time.monotonic() >= deadline:
+                return 1
+            time.sleep(0.02)
+        result.write_text("Released.\n", encoding="utf-8")
+        return 0
     if mode == "hang":
+        reply({"type": "thread.started", "thread_id": "fake-thread-1"})
         child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(600)"])
         def terminate(signum, frame):
+            if os.environ.get("FAKE_CODEX_INTERRUPT_LEDGER"):
+                ledger = Path(os.environ["CROSSFEED_HOME"]) / "ledger.jsonl"
+                rows = ledger.read_text(encoding="utf-8").splitlines() if ledger.exists() else []
+                Path(os.environ["FAKE_CODEX_INTERRUPT_LEDGER"]).write_text("\n".join(rows), encoding="utf-8")
             child.wait()
             raise SystemExit(0)
 
@@ -141,6 +178,11 @@ def execute():
         if mode == "dirty":
             with (directory / "dirty.txt").open("a", encoding="utf-8") as dirty:
                 dirty.write("changed again\n")
+        edited = [{"path": "new file ü.txt", "kind": "add"}, {"path": "tracked.txt", "kind": "update"}]
+        if mode == "dirty":
+            edited.append({"path": "dirty.txt", "kind": "update"})
+        print(json.dumps({"type": "item.completed", "item": {"type": "file_change", "status": "completed", "changes": edited}}),
+              flush=True)
         if mode == "commit":
             # Test-only synthetic history: no git commit, hooks, or signing.
             def git(*args, data=None):
@@ -168,6 +210,8 @@ def execute():
         result.write_text("line of result\n" * 10000, encoding="utf-8")
     elif mode == "boundary":
         result.write_bytes(b"x" * 8192)
+    elif mode == "unicode-result":
+        result.write_bytes("\ufeff检查 naïve\r\n下一行\r\n".encode("utf-8"))
     else:
         result.write_text(text, encoding="utf-8")
     reply({"type": "turn.completed", "usage": {

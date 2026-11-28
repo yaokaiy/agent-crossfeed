@@ -33,8 +33,8 @@ Goals:
 1. Fewer and shorter 5-hour lockouts for the same work, shown by numbers.
 2. Fewer weeks in which a model's own weekly limit runs out before its
    reset, and fewer hours without that model, for the same work.
-3. No setup beyond installing: no edits to settings, the status line or
-   instruction files.
+3. Crossfeed uses the user's existing Codex configuration. Workspace
+   writes must be configured for `codex exec`.
 4. Every job the dispatcher finishes leaves a record: what ran, how long it
    took, how many Codex tokens it used, and, when a check was run, whether
    it passed.
@@ -58,7 +58,9 @@ Constraints the design works under:
   without a recorded check are counted as unchecked.
 - Quota updates must preserve the prompt cache. Live readings go in
   notices and refusals.
-- A failure of the plugin itself must not block the user's work.
+- A hook fault before admission lets the original event continue. After
+  routing to Codex, a fault fails the stage unless an `auto` stage meets
+  the documented fallback conditions.
 
 ## The decision
 
@@ -68,6 +70,10 @@ keeps "which model suits this task" apart from "how tight is the budget" (see
 [References](#references)).
 
 ### 1. Eligibility
+
+The following eligibility and worktree rules apply to main-loop Agent
+hand-offs. Marked workflow stages use the separate admission rules in
+“Workflow stages on Codex.”
 
 A call can be redirected only when all of these hold:
 
@@ -301,11 +307,12 @@ cause is `limit`, `account-week` or `codex-surplus`, in that order.
 The command passes it as `--cause`. Other hand-offs have no recorded cause.
 
 **Background admission.** Outside `off`, crossfeed refreshes Claude usage at
-every agent start. It refuses workflow agents, background starts and
-descendants of background work while the 5-hour window is short. Synchronous
+every agent start. It evaluates a declared workflow stage first. It refuses
+background Claude starts, including workflow agents and descendants of
+background work, while the 5-hour window is short. Synchronous
 starts in the main loop's foreground chain can still run. Admitted starts
-then follow the model rule in section 5. A workflow refusal explains how
-the coordinator can resume the run after reset.
+then follow the model rule in section 5.
+A short-window refusal explains how the coordinator can resume the workflow after reset.
 
 The window is short at `shedPercent` (default 85%), or when rising usage
 measured over at least 10 minutes would fill it within 15 minutes and
@@ -396,7 +403,7 @@ session id. Readings and the pressure state are kept.
    capped at 60 lines and 8 KB, with the job id and, where it can, the list
    of files that changed.
 5. After a write job, the main agent runs the brief's check through
-   `crossfeed.py check`, which records pass or fail, and reports to the user. After a read-only
+   `crossfeed.py check`, which records pass or fail, and reports to the user. After a read
    job that succeeded, it verifies the job's claims and records through
    `crossfeed.py used` whether it used the result.
 
@@ -410,7 +417,96 @@ checked to be absent from the brief.
 
 The system-prompt section depends only on the script path and configured
 stop in `auto` and `always`. In `off` the hook omits it. Live readings
-appear in refusals and notices.
+appear in refusals and notices. The section explains the workflow stage
+contract and advises launching heavy workflows one at a time while
+hand-offs are on.
+
+## Workflow stages on Codex
+
+A `workflow-subagent` can declare a stage in the raw prompt passed to
+`agent()`. Use exactly one fenced `crossfeed-stage` block containing a JSON
+object with `v` set to 1 and a nonempty string `id`. `executor` is `auto`
+by default and also accepts `codex`. `kind` is `review` by default and also
+accepts `research` and `task`. The optional `schema` object is the JSON
+Schema supplied to `agent()` and is required by `executor: codex`.
+An invalid or duplicate block refuses the start. Admission in `off`
+passes through. The contract opens with at least three backticks and no
+more than three leading spaces. The info string starts with
+`crossfeed-stage` and contains no backticks. The closing fence has at least
+as many backticks and permits trailing spaces and tabs. The parser accepts
+LF, CRLF and CR line endings and skips other fenced code blocks.
+
+Crossfeed considers a Codex route for `executor: codex`, or for `auto` if
+the Claude window is short or the subagent decision would hand off the
+tier now. A `task` uses tier A. A `review` or `research` uses tier B.
+Every route needs a session directory, known positive Codex headroom and a saved
+brief (the prompt with the block removed). Concurrent stage admissions that
+need fresh quota await the same probe. Crossfeed saves a strict-compatible schema
+through the same `stash` command. It asks `$.tool.check` for the session's Bash verdict
+on the exact `python3 -I <script> run ...` command. An `allow` admits the
+route. An `ask` admits it when the user enables `approveStages` (off by
+default). A `deny` always blocks the route. A failed prerequisite
+returns `auto` to ordinary admission and refuses `executor: codex`.
+An `ask` refusal names the option and the Bash rule for use outside
+Claude Code's auto permission mode.
+
+At admission the hook appends an issued route marker to the agent's
+prompt. `turn.start` finds that marker in the harness text and associates
+the route with the agent ID before the first `turn.step`. The streaming
+step hook starts the exact dispatcher argv with `$.process.spawn` and
+passes `--slots 8 --heartbeat 60`. The dispatcher waits for a slot before
+quota preflight. Claude Code aborts and retries a workflow step after 10
+minutes without output. The dispatcher emits a heartbeat every minute,
+including during the slot wait. It also reports completed commands,
+searches, file changes, and MCP tool calls. The hook streams these as
+thinking and places the answer in the next block. While a stage runs on
+Codex, the `/workflows` panel shows it as an idle agent under its Claude
+model. The status line counts active stage dispatchers, including those
+waiting for a slot, and shows the latest reported action among them or
+`started` if none has reported an action. A route launches once.
+A retry under a new agent ID gets a failure response and the original
+agent supplies the outcome row.
+Stages use the user's Codex permissions. A `task` gets `--write` and
+may edit files in place. Worktree-isolated stages use ordinary admission
+for `auto`, and an explicit Codex request is refused because the dispatcher
+runs in the session checkout. A `review` or `research` is a read job and the brief
+instructs Codex to leave project files alone. Leave stages that need
+Claude-only MCP tools, skills, or agent types unmarked. The hook reads the
+complete `result.md` and returns the text with the result path and Codex's
+reported edits. A text `task` answer also includes the workspace
+comparison and flags a HEAD change when detected. A structured `task`
+returns the schema value through `agent()` and keeps the comparison in the
+job record. Read stages take no snapshot. A reported Codex edit yields a
+warning in the text answer or a toast for a structured answer. The stage
+row records the number of those edits.
+
+For a structured stage the hook passes the original schema to Codex
+when it meets the strict subset. That subset requires an object at the
+root, required properties and closed objects at every object node,
+supported keywords, and references local to the schema's `$defs`. It
+allows five levels of nesting, 100 object properties, 250 enum values
+and 15,000 characters of serialized schema in total. For
+other schemas the hook includes the schema in the brief and passes a
+fixed strict schema with one string field, `answer`, which holds the JSON
+value as text, the way tool-call arguments travel. The hook parses the
+whole final message (and, when wrapped, the `answer` text) as JSON, with
+no search through prose or Markdown, and sends the value unchanged in one
+`StructuredOutput` call.
+Claude Code validates against the workflow's schema. Successful stages
+request zero Claude model steps. Workflows that expose only a placeholder
+prompt cannot declare stages.
+
+An `auto` stage can fall back to Claude when the window is open, the
+dispatcher confirms Codex never started, and the hook has yielded
+nothing. Edit and snapshot reporting is independent of this decision.
+This rule also applies if the step hook faults or the engine calls it
+again. A dispatcher failure after launch, a missing JSON
+answer, or a new step after `StructuredOutput` fails the stage. A
+structured stage keeps answering without the tool so `agent()` raises
+after the engine's nudge. A text stage returns the failure message.
+On cancellation, the engine stops the
+process tree and the dispatcher's exit releases the slot. The per-start
+outcomes `stage-codex`, `stage-fallback` and `stage-failed` appear in the report.
 
 ## The dispatcher
 
@@ -431,16 +527,28 @@ plugin.
   starts `node` from there. A `$CROSSFEED_CODEX` that is not an executable
   file is an error, not a reason to look further. If the launch passes
   the quota guard and Codex cannot be found, `run` exits with 127 and
-  says where it looked.
-- **Sandbox.** It asks Codex for its read-only sandbox by default and for
-  `workspace-write` in the given directory with `--write`. What those
-  sandboxes permit, including network access, is decided by Codex and the
-  user's Codex configuration.
+  says where it looked. Any error creating the Codex process returns
+  `not-started` with the reason in the machine response.
+- **Permissions.** Fresh and resumed jobs use the user's Codex
+  configuration. Crossfeed passes no sandbox or approval flags.
+  Workspace writes are a setup prerequisite because `codex exec`
+  defaults to read-only. If you use a named Codex permissions profile,
+  enable workspace writes and any needed network access in that profile.
+  Otherwise, set or update the top-level `sandbox_mode =
+  "workspace-write"` in `~/.codex/config.toml`. If you use the legacy
+  `sandbox_mode = "workspace-write"` setting, enable network access by
+  setting `network_access = true` in the existing
+  `[sandbox_workspace_write]` table or creating that table once.
+- **Project instructions.** Every job, including a resume, sets
+  `project_doc_fallback_filenames=["CLAUDE.md"]` so Codex can use the
+  project's Claude instructions when its usual instruction file is absent.
 - **Preamble.** Every brief is preceded by fixed rules: stay in the
   directory for changes, read the paths named in the brief, never push,
-  commit or post, print no secrets, and answer in at most 40 lines with
-  the conclusion, the evidence and what is not done. The preamble gives
-  Codex instructions within its configured sandbox.
+  commit or post, and print no secrets. Read jobs are told to leave
+  project files alone and may write temporary files. Write jobs are
+  asked to work inside the workspace and run the brief's check. Ordinary runs request at most 40
+  lines with the conclusion, evidence and what is not done. A `--json`
+  run requests the answer format specified by the brief.
 - **Effort.** Reasoning effort defaults to `high` and is an option.
 - **Model.** On a fresh job, a nonempty `--model` wins. Otherwise
   `--kind review`, `--kind research` and `--kind subagent --tier B` use
@@ -464,11 +572,39 @@ plugin.
   the reason, records it and exits 75. The plugin uses 85 for an invalid
   `codexStopPercent` and includes the flag in every suggested `run`
   command, including resumes, when the configured value differs from 85.
+- **Slots.** `run --slots N` takes a positive integer. The dispatcher
+  waits before quota preflight for an exclusive lock on one of `slot-1`
+  through `slot-N` in the data directory's private `slots/` folder. It
+  holds the lock until exit. Workflow stage dispatchers sharing a data
+  directory use the same eight slots.
 - **Time limit.** 30 minutes by default for Codex execution after the
   quota check. During an allocated job, a timeout or a handled SIGINT,
   SIGTERM or SIGHUP stops the Codex process group if it started. The job
-  is recorded as `timeout` or `interrupted`. An interrupt during
-  preflight can end `run` without a job record.
+  is recorded as `timeout` or `interrupted`. Under `--json`, the dispatcher
+  writes the interrupted end row before stopping the group. Signals also
+  interrupt a pending workspace snapshot. The early row retains the
+  thread ID and completed edit events received by then. A pending write
+  comparison is recorded as unavailable.
+  Ordinary runs collect tokens, thread ID and file changes before writing
+  the end row.
+  An interrupt before job allocation can end `run` without a job record.
+- **Machine-readable output.** `run --json` prints a single object on stdout
+  with `id`, `status`, `exit`, `result_path`, capped `result`, and
+  `codex_edited`. A write job also includes `observed` and `head_moved`.
+  The ledger uses the same edit and comparison fields. Codex's successful
+  file-change events supply the edit paths. Paths inside the job directory
+  are shown relative to it, preserving the event's filename. A read
+  job's warning uses those paths. Shell edits may escape that warning.
+  Job rows record `write` and a legacy `sandbox` label for the role so
+  0.5.0 readers can count and resume jobs.
+  A preflight refusal has status `not-started` with an `error` reason,
+  null `id` and `result_path`, and an empty `result`. Stderr carries the
+  heartbeat and progress records. Human summaries stay in CLI mode.
+  With `--json`, `--heartbeat SECONDS` sends a line to stderr at each
+  interval from the slot wait through completion. The interval is a
+  positive integer. The flag also streams one stderr line per completed
+  command, web search, file change, or MCP tool call, with up to 200
+  characters of text per line.
 - **Failures are told apart.** Codex's own usage-limit message gives exit
   code 75 and a line telling the model to do the work itself; hand-offs stop
   once a later quota reading reports the limit. Any other failure of a Codex
@@ -476,13 +612,14 @@ plugin.
   automatically. An exit
   code of 0 without a result is a failure. An error event during a run that
   still finished with a result is not.
-- **Change list.** For a `--write` job in a git repository the dispatcher
-  records the modified and untracked files, with content digests, before
-  and after, and lists the paths that differ, at most 10 by name. It says
-  when nothing differs and warns when `HEAD` changed. A change that was
-  committed during the job shows only as that warning. Paths it identifies
-  as symbolic links or special files are not opened. `--worktree` jobs and
-  directories outside git get no change list.
+- **Change reports.** For a write job in a Git repository the dispatcher
+  snapshots modified and untracked files before and after the run, using
+  content digests and executable bits. Paths it identifies as symbolic
+  links or special files are skipped during content hashing. Snapshots
+  can include changes from other agents in the checkout. The workspace
+  comparison is `"unavailable"` for managed worktrees, directories
+  outside Git, or failed snapshots. A failed snapshot leaves the job's
+  outcome intact. Human-readable output lists up to 10 paths per line.
 - **Ledger.** `ledger.jsonl` in the data directory, append-only, written
   under a file lock: one line when a job ends, one per check, one per
   lockout, one per subagent moved to a cheaper model (`downgrade`), one per
@@ -502,6 +639,9 @@ plugin.
   <word>` stores why a job was handed off.
   Decisions include `account_week` (percent, even-pace line and state) and
   `codex_surplus` in points to one decimal, with null for missing data.
+  Jobs record a boolean `write` role, which a resume inherits. For
+  older rows without `write`, `sandbox: "workspace-write"` identifies a
+  write job. The role also determines which jobs count toward result use.
   Jobs record the selected model (null for the Codex default) and
   `model_source` (`flag`, `judgment`, `codex-default` or `resume`).
   A resume copies the earlier model field and continues the Codex thread
@@ -561,11 +701,14 @@ Claude Code's function-hook API is early access. Keeping every decision out
 of `register.ts` means an API change touches one thin file, and a second
 adapter for another host can reuse the rest.
 
-Codex jobs are started by the main agent as background shell commands, not
-by the plugin. They belong to Claude Code's own task tracking, survive a
-plugin reload, and need no daemon.
+The main agent starts ordinary hand-offs as background shell commands.
+They belong to Claude Code's task tracking and survive a plugin reload.
+The hook starts declared workflow stages after the permission check, and
+their processes belong to the workflow step.
 
-If a hook throws, it logs the failure and lets the original event continue.
+If a hook throws, it logs the failure. A hook fault before admission lets
+the original event continue. After routing to Codex, a fault fails the
+stage unless an `auto` stage meets the documented fallback conditions.
 
 ## How to tell whether it works
 
@@ -582,9 +725,10 @@ If a hook throws, it logs the failure and lets the original event continue.
   Codex and of those how many are linked by their saved brief to a job that
   has ended, and how many stayed on Claude (eligible calls it did not hand
   off, including any that another hook refused afterwards);
-- **agent starts** by origin and outcome, **breaker stops** and **wake-ups**.
+- **agent starts** by origin and outcome, including Codex stage outcomes,
+  **breaker stops** and **wake-ups**.
   These counts are unavailable on ledgers without the new rows;
-- **read-only results**: how many successful read-only jobs the model
+- **read job results used**: how many successful read jobs the model
   rated as used, partly used or not used, and how many it did not rate;
 - **model limits**: lockouts per limit and the time from each to its reset,
   plus subagents moved to a cheaper model.

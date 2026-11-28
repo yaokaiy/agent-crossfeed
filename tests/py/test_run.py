@@ -1,12 +1,15 @@
 import datetime
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import io
 import json
 import os
 from pathlib import Path
+from select import select
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -263,9 +266,9 @@ class RunTests(CrossfeedCase):
         self.assertIn(b"ok:", result.stdout)
         record, = self.records()
         self.assertEqual(set(record), {
-            "v", "type", "ts", "id", "session", "kind", "tier", "dir", "sandbox", "worktree",
+            "v", "type", "ts", "id", "session", "kind", "tier", "dir", "write", "sandbox", "worktree",
             "effort", "model", "model_source", "cause", "started", "wall_s", "status", "exit", "tokens", "codex_thread",
-            "changed", "head_moved", "resume_of", "brief_file", "artifact", "round", "role_file", "output_schema",
+            "codex_edited", "resume_of", "brief_file", "artifact", "round", "role_file", "output_schema",
         })
         self.assertEqual(record["type"], "job")
         self.assertEqual(record["status"], "done")
@@ -280,17 +283,15 @@ class RunTests(CrossfeedCase):
         self.assertEqual(record["tokens"], {"input": 12000, "cached": 500, "output": 321, "reasoning": 21})
         self.assertTrue(record["codex_thread"])
         self.assertEqual(record["effort"], "high")
-        self.assertEqual(record["sandbox"], "read-only")
+        self.assertIs(record["write"], False)
         self.assertEqual(record["dir"], str(self.root.resolve()))
         self.assertIsNone(record["resume_of"])
-        self.assertIsNone(record["changed"])
-        self.assertFalse(record["head_moved"])
         state = json.loads((self.job_dir() / "state.json").read_text())
         self.assertEqual(state["status"], "done")
         self.assertEqual({path.name for path in self.job_dir().iterdir()},
                          {"brief.md", "events.jsonl", "stderr.log", "result.md", "state.json"})
         lines = result.stdout.decode().splitlines()
-        self.assertIn("codex tokens 12321", lines[-3])
+        self.assertTrue(any("codex tokens 12321" in line for line in lines))
         self.assertTrue(lines[-2].startswith("[crossfeed] full result: "))
         self.assertEqual(lines[-1],
                          "[crossfeed] once you have checked its claims, record whether you used this result: "
@@ -298,16 +299,16 @@ class RunTests(CrossfeedCase):
 
     def test_argv_passed_to_codex(self):
         argv_file = self.root / "argv.json"
-        for args, sandbox in (([], "read-only"),
-                              (["--write", "--effort", "xhigh", "--model", "m", "--worktree"], "workspace-write")):
-            with self.subTest(sandbox=sandbox):
+        for args in ([], ["--write", "--effort", "xhigh", "--model", "m", "--worktree"]):
+            with self.subTest(args=args):
                 result = self.run_job(args, FAKE_CODEX_ARGV=str(argv_file))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 argv = json.loads(argv_file.read_text())
                 self.assertEqual(argv[1:4], ["exec", "--skip-git-repo-check", "--json"])
-                self.assertEqual(argv[argv.index("-s") + 1], sandbox)
+                self.assertNotIn("-s", argv)
                 self.assertEqual(argv[argv.index("-C") + 1], str(self.root.resolve()))
                 self.assertEqual(argv[-1], "-")
+                self.assertIn('project_doc_fallback_filenames=["CLAUDE.md"]', argv)
                 if args:
                     self.assertIn('model_reasoning_effort="xhigh"', argv)
                     self.assertEqual(argv[argv.index("-m") + 1], "m")
@@ -315,6 +316,28 @@ class RunTests(CrossfeedCase):
                 else:
                     self.assertIn('model_reasoning_effort="high"', argv)
                     self.assertNotIn("-m", argv)
+
+    def test_fresh_and_resumed_jobs_use_user_permissions_for_both_roles(self):
+        argv_file = self.root / "argv.json"
+        for write in (False, True):
+            with self.subTest(write=write):
+                flags = ["--write"] if write else []
+                fresh = self.run_job(flags, FAKE_CODEX_ARGV=str(argv_file))
+                self.assertEqual(fresh.returncode, 0, fresh.stderr)
+                job = self.records()[-1]
+                outputs = [(fresh, json.loads(argv_file.read_text()), job)]
+                resumed = self.run_job(["--resume", job["id"]], FAKE_CODEX_ARGV=str(argv_file))
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                outputs.append((resumed, json.loads(argv_file.read_text()), self.records()[-1]))
+                for result, argv, record in outputs:
+                    for flag in ("-s", "--sandbox", "-a", "--ask-for-approval"):
+                        self.assertNotIn(flag, argv)
+                    overrides = [argv[index + 1] for index, arg in enumerate(argv) if arg == "-c"]
+                    self.assertEqual(overrides, ['model_reasoning_effort="high"', 'project_doc_fallback_filenames=["CLAUDE.md"]'])
+                    self.assertIs(record["write"], write)
+                    self.assertEqual(record["sandbox"], "workspace-write" if write else "read-only")
+                    self.assertNotIn("profile", record)
+                    self.assertIn(b"; write; codex tokens " if write else b"; read; codex tokens ", result.stdout)
 
     def assert_run_model(self, args, model, source, **env):
         argv_file = self.root / "model-argv.json"
@@ -464,10 +487,13 @@ class RunTests(CrossfeedCase):
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             with self.subTest(signal=signum):
                 pidfile = self.root / (str(signum) + ".pid")
+                observed = self.root / (str(signum) + ".jsonl")
+                output_args = ["--json"] if signum == signal.SIGTERM else []
                 dispatcher = subprocess.Popen(
-                    [sys.executable, "-I", str(CROSSFEED), "run", "--dir", str(self.root)],
+                    [sys.executable, "-I", str(CROSSFEED), "run", "--dir", str(self.root), *output_args],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    env=dict(self.env, FAKE_CODEX="hang", FAKE_CODEX_PIDFILE=str(pidfile)))
+                    env=dict(self.env, FAKE_CODEX="hang", FAKE_CODEX_PIDFILE=str(pidfile),
+                             FAKE_CODEX_INTERRUPT_LEDGER=str(observed)))
                 group = None
                 try:
                     dispatcher.stdin.write(b"Hang until interrupted.\n")
@@ -482,13 +508,34 @@ class RunTests(CrossfeedCase):
                     dispatcher.send_signal(signum)
                     stdout, stderr = dispatcher.communicate(timeout=30)
                     self.assertEqual(dispatcher.returncode, 130, (stdout, stderr))
-                    self.assertIn(b"[crossfeed] job ", stdout)
-                    self.assertIn(b"[crossfeed] interrupted; Codex was stopped.\n", stdout)
+                    if output_args:
+                        self.assertEqual(stderr, b"")
+                    else:
+                        self.assertIn(b"[crossfeed] job ", stdout)
+                        self.assertIn(b"[crossfeed] interrupted; Codex was stopped.\n", stdout)
                     self.assertNotIn(b"Traceback", stderr)
                     record = self.records()[-1]
                     self.assertEqual((record["status"], record["exit"]), ("interrupted", 130))
+                    at_signal = [json.loads(line) for line in observed.read_text().splitlines()]
+                    if output_args:
+                        self.assertEqual(at_signal[-1], record)
+                        self.assertEqual(record["codex_thread"], "fake-thread-1")
+                        self.assertIn(record["sandbox"], ("read-only", "workspace-write"))
+                    else:
+                        self.assertNotIn(record["id"], [row["id"] for row in at_signal])
+                    self.assertEqual(sum(row["id"] == record["id"] for row in self.records()), 1)
+                    if output_args:
+                        self.assertEqual(json.loads(stdout), {
+                            "id": record["id"], "status": "interrupted", "exit": 130,
+                            "result_path": str(self.job_dir() / "result.md"), "result": "", "codex_edited": [],
+                        })
                     state = json.loads((self.job_dir() / "state.json").read_text())
                     self.assertEqual((state["status"], state["exit"]), ("interrupted", 130))
+                    if signum == signal.SIGTERM:
+                        argv = self.root / "resumed-argv"
+                        resumed = self.run_job(["--resume", record["id"]], FAKE_CODEX_ARGV=str(argv))
+                        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                        self.assertEqual(json.loads(argv.read_text())[1:4], ["exec", "resume", "fake-thread-1"])
                     with self.assertRaises(ProcessLookupError):
                         os.kill(descendant, 0)
                     with self.assertRaises(ProcessLookupError):
@@ -502,6 +549,253 @@ class RunTests(CrossfeedCase):
                     if dispatcher.poll() is None:
                         dispatcher.kill()
                     dispatcher.communicate()
+
+    def test_slots_wait_before_quota_and_release_on_exit_or_sigkill(self):
+        brief = self.root / "brief.md"
+        brief.write_text("Review this.\n")
+        command = [sys.executable, "-I", str(CROSSFEED), "run", "--json", "--slots", "1",
+                   "--dir", str(self.root), "--brief-file", str(brief)]
+        for killed in (False, True):
+            with self.subTest(killed=killed), contextlib.ExitStack() as processes:
+                release, ready, probe = (self.root / "{}-{}".format(killed, name)
+                                         for name in ("release", "ready", "quota-pid"))
+                jobs = self.home / "jobs"
+                before = set(jobs.glob("*/result.md"))
+                holder = processes.enter_context(subprocess.Popen(
+                    command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env=dict(self.env, FAKE_CODEX="hold", FAKE_CODEX_RELEASE=str(release), FAKE_CODEX_READY=str(ready))))
+                waiter = None
+                held_result = None
+                try:
+                    deadline = time.monotonic() + 8
+                    while not ready.exists() and holder.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(ready.exists(), "first dispatcher never started Codex")
+                    held_result, = set(jobs.glob("*/result.md")) - before
+                    slots = self.home / "slots"
+                    self.assertEqual(stat.S_IMODE(slots.stat().st_mode), 0o700)
+                    self.assertEqual(stat.S_IMODE((slots / "slot-1").stat().st_mode), 0o600)
+                    waiter = processes.enter_context(subprocess.Popen(
+                        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        env=dict(self.env, FAKE_CODEX_APPSERVER_PIDFILE=str(probe))))
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        waiter.wait(timeout=0.4)
+                    self.assertFalse(probe.exists(), "waiter checked quota before taking a slot")
+                    if killed:
+                        holder.kill()
+                    else:
+                        release.touch()
+                    out, err = holder.communicate(timeout=8)
+                    self.assertEqual(holder.returncode, -signal.SIGKILL if killed else 0, (out, err))
+                    out, err = waiter.communicate(timeout=8)
+                    self.assertEqual(waiter.returncode, 0, (out, err))
+                    self.assertEqual(json.loads(out)["status"], "done")
+                    self.assertTrue(probe.exists())
+                finally:
+                    release.touch()
+                    if killed and held_result is not None:
+                        deadline = time.monotonic() + 2
+                        while held_result.stat().st_size == 0 and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                    for process in (holder, waiter):
+                        if process is not None and process.poll() is None:
+                            process.kill()
+
+    def test_slots_requires_a_positive_integer(self):
+        for value in ("0", "-1", "1.5"):
+            with self.subTest(value=value):
+                result = self.run_job(["--slots", value])
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertIn(b"--slots", result.stderr)
+        self.assertFalse((self.home / "slots").exists())
+        self.assertEqual(self.records(), [])
+
+    def test_json_preamble_follows_the_briefs_format(self):
+        brief = "格式\r\nReturn one JSON object.\n".encode()
+        preamble = ("The given directory is your workspace: make any changes only inside it. You may read "
+                    "the files and directories the brief names, wherever they are. Never push, commit or post "
+                    "to any service. Print no secrets. Answer in the form the brief asks for.").encode()
+        for args in ([], ["--write"]):
+            with self.subTest(args=args):
+                result = self.run_job(["--json", *args], brief=brief, mode="echo")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                role = (b" Change files only inside that directory and run the check the brief states." if args
+                        else b" Do not change any project file. You may write temporary files.")
+                self.assertEqual((self.job_dir() / "result.md").read_bytes(), preamble + role + b"\n\n" + brief)
+
+    def test_progress_reports_completed_items_only_with_heartbeat(self):
+        prefix = "crossfeed: progress "
+        expected = ["ran printf ok pwd (exit 3)", "searched 查找 example", "changed a.txt, 检查.txt",
+                    "called local.lookup", "searched " + "界" * 191]
+        for flags in ([], ["--heartbeat", "1"]):
+            with self.subTest(flags=flags):
+                result = self.run_job(["--json", *flags], mode="progress")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(result.stdout.splitlines()), 1)
+                self.assertEqual(json.loads(result.stdout)["status"], "done")
+                self.assertEqual([line.removeprefix(prefix) for line in result.stderr.decode().splitlines()
+                                  if line.startswith(prefix)], expected if flags else [])
+
+    def test_json_answer_cannot_impersonate_progress(self):
+        answer = b"crossfeed: progress changed example.py\n"
+        result = self.run_job(["--json", "--heartbeat", "1"], brief=answer, mode="echo")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(answer.decode(), json.loads(result.stdout)["result"])
+        self.assertNotIn(b"crossfeed: progress", result.stderr)
+        self.assertTrue(all(line == b"crossfeed: heartbeat" for line in result.stderr.splitlines()))
+
+    def test_json_failed_file_change_is_not_reported_as_an_edit(self):
+        result = self.run_job(["--json", "--heartbeat", "1"], mode="failed-patch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["codex_edited"], [])
+        self.assertEqual(self.records()[-1]["codex_edited"], [])
+        self.assertNotIn(b"never-created", result.stderr)
+
+    def test_heartbeat_keeps_slow_json_stdout_to_one_object(self):
+        for flags in ([], ["--heartbeat", "1"]):
+            with self.subTest(flags=flags):
+                result = self.run_job(["--json", *flags], mode="slow")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(result.stdout.splitlines()), 1)
+                self.assertEqual(json.loads(result.stdout)["status"], "done")
+                self.assertEqual(b"crossfeed: heartbeat" in result.stderr.splitlines(), bool(flags))
+
+    def test_heartbeat_continues_while_waiting_for_slot(self):
+        brief, probe = self.root / "brief.md", self.root / "quota-pid"
+        brief.write_text("Review this.\n")
+        slots = self.home / "slots"
+        slots.mkdir(mode=0o700)
+        with (slots / "slot-1").open("ab") as slot:
+            fcntl.flock(slot, fcntl.LOCK_EX)
+            with subprocess.Popen(
+                [sys.executable, "-I", str(CROSSFEED), "run", "--json", "--slots", "1", "--heartbeat", "1",
+                 "--dir", str(self.root), "--brief-file", str(brief)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=dict(self.env, FAKE_CODEX_APPSERVER_PIDFILE=str(probe)),
+            ) as dispatcher:
+                try:
+                    self.assertTrue(select([dispatcher.stderr], [], [], 6)[0], "no heartbeat while the slot was held")
+                    self.assertEqual(dispatcher.stderr.readline(), b"crossfeed: heartbeat\n")
+                    self.assertFalse(probe.exists(), "dispatcher checked quota while the slot was held")
+                    fcntl.flock(slot, fcntl.LOCK_UN)
+                    stdout, stderr = dispatcher.communicate(timeout=8)
+                    self.assertEqual(dispatcher.returncode, 0, (stdout, stderr))
+                    self.assertEqual(json.loads(stdout)["status"], "done")
+                finally:
+                    if dispatcher.poll() is None:
+                        dispatcher.kill()
+
+    def test_heartbeat_requires_json_and_a_positive_integer(self):
+        for flags, reason in ((["--heartbeat", "1"], b"requires --json"),
+                              (["--json", "--heartbeat", "0"], b"must be at least 1"),
+                              (["--json", "--heartbeat", "1.5"], b"invalid int value")):
+            with self.subTest(flags=flags):
+                result = self.run_job(flags)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                if flags == ["--json", "--heartbeat", "0"]:
+                    self.assertIn(reason.decode(), json.loads(result.stdout)["error"])
+                    self.assertEqual(result.stderr, b"")
+                else:
+                    self.assertIn(reason, result.stderr)
+                self.assertNotIn(b"crossfeed: heartbeat", result.stderr)
+        self.assertEqual(self.records(), [])
+
+    def test_json_done_preserves_unicode_and_caps_result(self):
+        for mode in ("unicode-result", "big", "boundary"):
+            with self.subTest(mode=mode):
+                result = self.run_job(["--json"], mode=mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(result.stdout.splitlines()), 1)
+                data = json.loads(result.stdout)
+                record = self.records()[-1]
+                path = self.home / "jobs" / record["id"] / "result.md"
+                expected = {"unicode-result": "\ufeff检查 naïve\n下一行\n", "big": "line of result\n" * 60,
+                            "boundary": ""}[mode]
+                self.assertEqual(data, {"id": record["id"], "status": "done", "exit": 0,
+                                        "result_path": str(path), "result": expected,
+                                        "codex_edited": []})
+                self.assertEqual(result.stderr, b"")
+                if mode == "unicode-result":
+                    self.assertEqual(path.read_bytes(), "\ufeff检查 naïve\r\n下一行\r\n".encode("utf-8"))
+
+    def test_json_missing_codex_reports_not_started(self):
+        absent = str(self.root / "missing-codex")
+        for flags in ([], ["--json"]):
+            with self.subTest(flags=flags):
+                result = self.run_job(flags, CROSSFEED_CODEX=absent)
+                self.assertEqual(result.returncode, 127, result.stderr)
+                if flags:
+                    data = json.loads(result.stdout)
+                    self.assertEqual((data["status"], data["exit"]), ("not-started", 127))
+                    self.assertEqual(data["codex_edited"], [])
+                    self.assertIn(absent, data["error"])
+                    self.assertEqual(result.stderr, b"")
+                else:
+                    self.assertIn(absent.encode(), result.stdout)
+
+    def test_json_process_creation_error_reports_not_started_and_keeps_cli_exit(self):
+        shim = self.root / "broken-interpreter"
+        shim.write_text("#!" + str(self.root / "absent-interpreter") + "\n", encoding="utf-8")
+        shim.chmod(0o700)
+        for output in ([], ["--json"]):
+            with self.subTest(output=output):
+                result = self.run_job(output, CROSSFEED_CODEX=str(shim))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                if output:
+                    data = json.loads(result.stdout)
+                    self.assertEqual((data["status"], data["exit"]), ("not-started", 1))
+                    self.assertIn("could not start codex", data["error"])
+                    self.assertEqual(result.stderr, b"")
+                else:
+                    self.assertIn(b"could not start codex", result.stdout)
+                self.assertEqual(self.records()[-1]["status"], "failed")
+
+    def test_current_job_rows_support_legacy_reader_role_rules(self):
+        new_jobs = []
+        for write in (False, True):
+            result = self.run_job(["--write"] if write else [])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            row = self.records()[-1]
+            legacy_row = {key: value for key, value in row.items() if key != "write"}
+            self.assertEqual(legacy_row["sandbox"], "workspace-write" if write else "read-only")
+            new_jobs.append(legacy_row)
+        self.assertEqual(sum(row["sandbox"] == "read-only" and row["status"] == "done" for row in new_jobs), 1)
+        for row in new_jobs:
+            self.assertIn(row["sandbox"], ("read-only", "workspace-write"))
+            self.assertTrue(row["codex_thread"])
+            result = self.run_job(["--resume", row["id"]], mode="echo")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIs(self.records()[-1]["write"], row["sandbox"] == "workspace-write")
+
+    def test_json_reports_failed_empty_result_and_timeout(self):
+        for mode, args, status, code in (("fail", [], "failed", 1), ("emptyresult", [], "failed", 1),
+                                         ("hang", ["--timeout", "0.02"], "timeout", 124)):
+            with self.subTest(mode=mode):
+                result = self.run_job(["--json", *args], mode=mode, FAKE_CODEX_PIDFILE=str(self.root / "child"))
+                self.assertEqual(result.returncode, code, result.stderr)
+                record = self.records()[-1]
+                path = self.home / "jobs" / record["id"] / "result.md"
+                self.assertEqual(json.loads(result.stdout), {
+                    "id": record["id"], "status": status, "exit": code, "result_path": str(path), "result": "",
+                    "codex_edited": [],
+                })
+                self.assertEqual(result.stderr, b"")
+
+    def test_json_quota_refusal_and_empty_brief_have_no_job(self):
+        limits = {"secondary": {"window_minutes": 10080, "used_percent": 86}}
+        for brief, code in ((b"Review this.\n", 75), (b"", 2)):
+            with self.subTest(code=code):
+                result = self.run_job(["--json"], brief=brief, FAKE_CODEX_RATE_LIMITS=json.dumps(limits))
+                data = json.loads(result.stdout)
+                self.assertIn("85% stop" if code == 75 else "brief must not be empty", data.pop("error"))
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(data, {
+                    "id": None, "status": "not-started", "exit": code, "result_path": None, "result": "",
+                    "codex_edited": [],
+                })
+                self.assertEqual(result.stderr, b"")
+        self.assertFalse((self.home / "jobs").exists())
+        self.assertEqual([row["type"] for row in self.records()], ["stop"])
 
     def test_big_result_is_capped(self):
         result = self.run_job(mode="big")

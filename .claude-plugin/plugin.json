@@ -22,7 +22,7 @@
     "effort": {
       "type": "string",
       "title": "Codex reasoning effort",
-      "description": "Codex reasoning effort for jobs handed out from a refused subagent call.",
+      "description": "Codex reasoning effort for subagent hand-offs and workflow stages.",
       "options": [
         "low",
         "medium",
@@ -35,7 +35,7 @@
     "model": {
       "type": "string",
       "title": "Codex model",
-      "description": "Model for jobs handed out from a refused subagent call. Leave empty to let crossfeed choose: its judgment model for tier B hand-offs when Codex lists it, otherwise Codex's own default.",
+      "description": "Codex model for subagent hand-offs and workflow stages. Leave empty to use the judgment model for eligible reviews, research and tier B subagent jobs when available, or the Codex default otherwise.",
       "default": ""
     },
     "premiumFallback": {
@@ -74,10 +74,16 @@
       "description": "Send a prompt to the idle coordinator when background work puts the 5-hour window at risk or the breaker acts.",
       "default": true
     },
+    "approveStages": {
+      "type": "boolean",
+      "title": "Approve workflow stages",
+      "description": "Let crossfeed start Codex with your Codex permissions for marked stages when Claude Code would ask. Explicit denials still apply.",
+      "default": false
+    },
     "timeoutMinutes": {
       "type": "number",
       "title": "Job timeout in minutes",
-      "description": "Codex time limit, in minutes, for jobs handed out from a refused subagent call.",
+      "description": "Codex execution time limit in minutes for subagent hand-offs and workflow stages.",
       "default": 30
     }
   }

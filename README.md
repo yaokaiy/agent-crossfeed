@@ -109,8 +109,29 @@ Or from a shell:
 claude plugin install agent-crossfeed --marketplace yaokaiy/agent-crossfeed
 ```
 
-There is nothing else to set up. A line under the prompt shows what
-crossfeed sees:
+Make sure `codex exec` can edit files in the workspace; its default is
+read-only. If you use a named Codex permissions profile, enable workspace
+writes and any needed network access in that profile. Otherwise, set or
+update the top-level `sandbox_mode = "workspace-write"` in
+`~/.codex/config.toml`:
+
+```toml
+sandbox_mode = "workspace-write"
+```
+
+If you use the legacy `sandbox_mode = "workspace-write"` setting, enable
+network access by setting `network_access = true` in the existing
+`[sandbox_workspace_write]` table or creating that table once:
+
+```toml
+[sandbox_workspace_write]
+network_access = true
+```
+
+Crossfeed uses your Codex configuration and passes no sandbox or approval
+flags. It tells review jobs to leave project files alone and warns when
+Codex reports a completed file edit. A line under the prompt shows what crossfeed
+sees:
 
 ```
 crossfeed auto · claude 5h 62% (pace 104%) · 7d 41% · codex wk 17% · pressure 0.4
@@ -138,14 +159,15 @@ no model turns. When it exits, Claude Code notifies Claude, which reads its
 output:
 
 ```
-[crossfeed] job 20260101-120000-ab12 done in 1m32s; tier A; kind subagent; sandbox workspace-write; codex tokens 48210
-[crossfeed] changed 2 file(s): calc.py, test_calc.py
+[crossfeed] job 20260101-120000-ab12 done in 1m32s; tier A; kind subagent; write; codex tokens 48210
+[crossfeed] codex edits: calc.py, test_calc.py
+[crossfeed] workspace changes during the run: calc.py, test_calc.py
 [crossfeed] full result: .../jobs/20260101-120000-ab12/result.md
 [crossfeed] record the outcome: python3 -I .../scripts/crossfeed.py check 20260101-120000-ab12 -- <your check command>
 ```
 
 After a write job, Claude is told to run the brief's check through
-`crossfeed.py check`, which records pass or fail, and then to report to you. After a read-only job
+`crossfeed.py check`, which records pass or fail, and then to report to you. After a read job
 that succeeded, such as a review, it is told to verify the job's claims and
 record through `crossfeed.py used` whether it used the result.
 
@@ -160,7 +182,6 @@ Why: tier B; Codex weekly 40% used, 38 points under an even pace to its 85% stop
 ## How it routes
 
 For each subagent call from the main loop crossfeed asks four questions.
-A workflow's agents are not handed to Codex; see **Background work** below.
 
 1. **Fit.** What kind of task is this? The answer comes from keyword rules
    on the call's description and brief.
@@ -254,15 +275,68 @@ and the Codex surplus is below 10 points. Missing readings alone do not
 trigger it. The off notice asks Claude to do execution itself unless a
 subagent call is refused.
 
-**Background work.** Codex hand-offs are decided on the main loop's Agent
-calls, and a workflow's agents start on Claude. A few workflows running at
-once can fill the 5-hour window before the pressure rule reacts, so
+### Workflow stages on Codex
+
+An eligible workflow stage can opt in by adding a fenced
+`crossfeed-stage` block to the prompt passed to `agent()`:
+
+````markdown
+```crossfeed-stage
+{"v":1,"id":"review-diff","executor":"auto","kind":"review"}
+```
+````
+
+`executor` defaults to `auto`. It can route to Codex when the Claude
+window is short or when the routing policy would hand off the stage
+(`task` is tier A and `review` and `research` are tier B). The default
+`kind` is `review`. Include `schema` with the JSON Schema passed to
+`agent()` for a structured answer. `executor: codex` requires `schema`
+and fails if Codex cannot run the stage. Every Codex launch needs known
+positive headroom and a Bash verdict of `allow`, or `ask` with
+`approveStages` enabled. A `deny` always blocks the Codex launch.
+Stages use your Codex permissions. A `task` runs with `--write` and may
+edit the project in place. A stage using worktree isolation stays on the
+ordinary Claude path with `auto`. An explicit Codex request for that stage
+is refused. `review` and `research` are instructed to leave project files
+alone. Leave stages that need Claude-only MCP tools, skills or agent
+types unmarked.
+
+A text stage returns the full answer, the result path, and edits reported
+by Codex. A text `task` answer also includes the workspace comparison and
+flags a HEAD change when detected. A structured `task` returns the schema
+value through `agent()` and keeps the comparison in the job record. A read stage
+with a reported edit gets a warning in its text answer or a toast for a
+structured answer. Crossfeed passes a schema to Codex unchanged if it
+meets the strict requirements, including required properties, closed
+objects, and limits on nesting and size. Any other schema goes into the
+brief, and Codex answers under a fixed strict schema with one string
+field, `answer`, that holds the JSON value. Either way crossfeed sends the
+value unchanged for Claude Code to validate against the workflow's schema.
+
+A heartbeat every minute prevents
+Claude Code's 10-minute silence timeout, and each route launches at most
+one Codex job even if the engine retries it. An `auto` stage can fall
+back to Claude while the window has room if the dispatcher confirms Codex
+never started and the step has emitted nothing. A rejected structured answer
+fails the stage. If the directory, saved brief or permission verdict is
+unavailable, `auto` uses ordinary Claude admission and an explicit Codex
+request is refused.
+While stages run on Codex, the `/workflows` panel shows each one as an
+idle agent under its Claude model. crossfeed's status line counts active
+stage dispatchers, including those waiting for a slot, and shows the
+latest reported action among them or `started` if none has reported an
+action.
+
+Launch heavy workflows one at a time while hand-offs are on.
+
+**Background work.** A few workflows running at once can fill the 5-hour
+window before the pressure rule reacts, so
 crossfeed also checks every agent start Claude Code exposes. The window is
 short at `shedPercent` (85% by default), or when the current pace would
 fill it within 15 minutes and before its reset. While it is short,
-crossfeed refuses workflow agents, background agents and the agents they
-start. This check lets a subagent the main loop waits for through; the
-usual hand-off rules still apply to it. At the first reading at or above
+crossfeed refuses new background Claude work, including workflow agents
+and descendants of background work. A subagent the main loop waits for
+passes this check and follows the usual hand-off rules. At the first reading at or above
 the shed line, the breaker selects the background workflows, agents and
 teammates this conversation has registered and tries to stop them with
 TaskStop. It reports explicit denials and retries those tasks on later
@@ -289,17 +363,14 @@ The exact rules and formulas are in [docs/design.md](docs/design.md).
   reaches or passes `stretchCalls` while hand-offs are on.
 - Subagents moved off a model whose weekly limit is ahead, each one logged
   and recorded.
-- Protection against background fan-out: new background agents are refused
-  while the 5-hour window is short, and at the shed line the breaker tries
-  to stop this conversation's registered background tasks.
+- While the 5-hour window is short, crossfeed refuses new background Claude agents. Eligible workflow stages can still run on Codex. At the shed line, the breaker tries to stop this conversation’s registered background tasks.
 - A local record of each routing decision outside `off` mode (a decision
   whose write fails is logged and left out), with its reason and the
   readings it rested on, and of every finished job: how long it took, the
   Codex token count it reported, and, when recorded, whether its check
   passed or its result was used. `/crossfeed report` sums up the last 7
   days, including the lockouts it saw.
-- It fails open. If the plugin itself errors, the subagent call goes ahead
-  on Claude, unchanged.
+- A hook fault before admission lets the original call proceed. After a stage routes to Codex, a dispatch fault fails the stage unless `auto` can fall back while the window is open.
 - A small footprint: no daemon, no database, no MCP server. The dispatcher
   is one Python file that uses only the standard library, and it also works
   [without the plugin](#the-dispatcher).
@@ -309,7 +380,7 @@ The exact rules and formulas are in [docs/design.md](docs/design.md).
 | Command | Effect |
 | --- | --- |
 | `/crossfeed` or `/crossfeed status` | Claude's all-models pace and state, Codex surplus and headroom, pressure, current main-loop hand-off reasons, the 5-hour short-window state, tier decisions and the last subagent decision |
-| `/crossfeed report` | the last 7 days of lockouts, model downgrades, subagent decisions, jobs by cause and model, stopped launches, notices and reminders, tokens, first checks, use of read-only results, agent starts by origin and outcome, breaker stops and wake-ups. Agent-start, breaker and wake-up counts show as unavailable until the ledger contains a valid event of one of those kinds. |
+| `/crossfeed report` | the last 7 days of lockouts, model downgrades, subagent decisions, jobs by cause and model, stopped launches, notices and reminders, tokens, first checks, use of read job results, agent starts by origin and outcome, breaker stops and wake-ups. Agent-start, breaker and wake-up counts show as unavailable until the ledger contains a valid event of one of those kinds. |
 | `/crossfeed always` | this session, hand off eligible tier A and B calls with positive Codex headroom and either a Claude 5-hour reading or an ahead or full limit for the call's model family |
 | `/crossfeed auto` | back to the default (this session) |
 | `/crossfeed off` | stop steering, keep the record (this session) |
@@ -329,15 +400,16 @@ Set them with `/plugin configure agent-crossfeed@agent-crossfeed`.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `mode` | `auto` | auto routes on both quotas; always hands off every eligible tier A and B call while Codex has headroom and Claude's 5-hour usage is known (or the call's model limit is ahead or full); off stops steering. |
-| `effort` | `high` | Codex reasoning effort for jobs handed out from a refused subagent call. |
-| `model` | empty | Model for jobs handed out from a refused subagent call. Leave empty to let crossfeed choose: its judgment model for tier B hand-offs when Codex lists it, otherwise Codex's own default. |
+| `effort` | `high` | Codex reasoning effort for subagent hand-offs and workflow stages. |
+| `model` | empty | Codex model for subagent hand-offs and workflow stages. Leave empty to use the judgment model for eligible reviews, research and tier B subagent jobs when available, or the Codex default otherwise. |
 | `premiumFallback` | `opus` | Model for subagents moved off a model whose weekly limit is ahead of pace. Leave empty to turn this off. |
 | `eligibleTypes` | `general-purpose,claude` | Comma-separated subagent types whose briefs can be handed to Codex. |
 | `stretchCalls` | `12` | Counted hands-on main-loop tool calls in one prompt before the one hand-off reminder, sent while hand-offs are on. |
 | `codexStopPercent` | `85` | Stop handing off new work when a long Codex quota window reaches this percentage. Use a value greater than 0 and at most 100. |
 | `shedPercent` | `85` | Refuse new background Claude agents and try to stop this conversation's registered background tasks when the 5-hour window reaches this percentage. Use a value greater than 0 and at most 100. |
 | `wake` | `true` | Allow one wake-up prompt per 5-hour window for an idle coordinator with an attached surface. Reloading the plugin or resuming the conversation resets the allowance. Set to false to queue the message for Claude's next eligible main-loop tool result or ordinary prompt. |
-| `timeoutMinutes` | `30` | Codex time limit, in minutes, for jobs handed out from a refused subagent call. |
+| `approveStages` | `false` | Let crossfeed start Codex with your Codex permissions for marked stages when Claude Code would ask. Explicit denials still apply. |
+| `timeoutMinutes` | `30` | Codex execution time limit in minutes for subagent hand-offs and workflow stages. |
 
 ## The dispatcher
 
@@ -355,17 +427,27 @@ python3 -I scripts/crossfeed.py report
 ```
 
 `run` tells Codex to keep changes inside the workspace, permits reads of
-paths named in the brief, forbids pushing, committing or posting, and
-requests an answer of at most 40 lines. It runs `codex exec` with the
-read-only sandbox by default or `workspace-write` with `--write`, and
-prints up to 60 lines of the result. For a write job in a git repository it
-compares the modified and untracked files before and after, lists the ones
-that changed, and warns when `HEAD` moved. Jobs run with `--worktree` and
-directories outside git get no change list. `--brief-file PATH` reads the
+paths named in the brief, and forbids pushing, committing, posting, or
+printing secrets. Ordinary runs request an answer of at most 40 lines.
+`run --json` asks Codex to use the brief's answer format. The command
+saves the full result in `result.md` and returns a capped preview.
+Every job reports `codex_edited` from Codex's completed file-change
+events. Read jobs take no workspace snapshot. Their edit warning uses
+those events, which do not cover edits made through shell commands.
+Write jobs also report `observed` and `head_moved` from Git snapshots.
+The comparison can include other agents' changes. It is unavailable
+for managed worktrees, directories outside Git, or failed snapshots.
+A failed snapshot leaves the job outcome intact. `--brief-file PATH` reads the
 brief from a file instead of standard input, and `stash` saves standard
 input to such a file and prints its path; the plugin uses the pair. Without
 `--session`, `run` records the session from `CLAUDE_CODE_SESSION_ID`, which
 Claude Code sets in the shells it starts.
+
+Fresh and resumed jobs use your Codex configuration. `--write` tells Codex
+to make changes within the workspace and run the check in the brief.
+A read job can use temporary files and is told to leave project files
+alone. A resume keeps the original job's role. Every job, including a resume,
+lets Codex use `CLAUDE.md` as a fallback for project instructions.
 
 A fresh job uses an explicit nonempty `--model` first. Otherwise
 `--kind review`, `--kind research` and `--kind subagent --tier B` select
@@ -411,6 +493,16 @@ Jobs Claude starts itself use `run`'s defaults of `--effort high` and
 `--timeout 30` unless the command specifies other values. The timeout
 covers Codex execution after the quota check.
 
+`run --slots N` waits in the dispatcher for one of N exclusive locks
+before checking quota. The lock files `slot-1` through `slot-N` are in
+`slots/` under the crossfeed data directory. Workflow stages use
+`--slots 8`, shared by dispatchers with the same data directory. A slot
+is released when its dispatcher exits.
+`run --json` uses stderr for heartbeat and progress records when enabled
+with `--heartbeat SECONDS`. If Codex never started, stdout carries the
+reason in the JSON response. An interrupted JSON job records its thread
+ID if Codex reported it, even during the final workspace snapshot.
+
 Before starting or resuming a job, `run` checks Codex's quota. A window
 of 6 hours or less stops the launch at 90%. A longer window stops it at
 `--codex-stop PERCENT` (default 85, greater than 0 and at most 100).
@@ -423,8 +515,11 @@ more than 5 minutes ahead, `run` reports unknown quota and proceeds.
 Exit codes of `run`: 0 done, 1 failed, 2 usage error, 75 the launch guard
 stopped the job or Codex reported its limit, 124 timeout, 127 Codex not
 found, 130 for an interrupt handled during an allocated job. A timeout
-or a handled interrupt stops the Codex process group if it started. An
-interrupt during preflight can end `run` without a job record.
+or a handled interrupt stops the Codex process group if it started.
+With `run --json`, a handled interrupt writes the job's end row before
+stopping that group. The ordinary text command collects final accounting
+before writing its end row. An interrupt before job allocation can end
+`run` without a job record.
 
 `check` runs your check command and records pass or fail for the job. The
 verdict comes from the command's exit status, not from the model. `used`
@@ -458,10 +553,10 @@ then on `PATH`, then in the usual install directories listed in
 else and Claude Code runs with a `PATH` that lacks it, set `CROSSFEED_CODEX`
 to the executable's path.
 
-Claude Code asks you to approve the dispatcher command when it runs, as it
-does for any shell command. To skip that prompt for hand-offs, allow the
-dispatcher's `run` command in your Claude Code settings, using the script
-path shown in the refusal message:
+Claude Code asks you to approve the dispatcher command when Claude runs it
+for a hand-off, as it does for any shell command. For ordinary hand-offs,
+you can allow the dispatcher's `run` command using the script path shown
+in the refusal:
 
 ```json
 {
@@ -470,6 +565,11 @@ path shown in the refusal message:
   }
 }
 ```
+
+Workflow stages check Bash permission before launch. In Claude Code's auto
+permission mode, a matching allow rule can still return `ask`. Enable
+`approveStages` if you want crossfeed to launch marked stages on that
+verdict.
 
 Do not allow `check` the same way: it runs whatever command you give it.
 
@@ -483,12 +583,13 @@ To remove it: `claude plugin uninstall agent-crossfeed@agent-crossfeed`.
 
 ## Safety and data
 
-- If a hook of the plugin throws, the subagent call goes ahead on Claude,
-  unchanged. If only saving the brief fails, the call is still handed off
-  and Claude is told to pass the brief on standard input instead.
-- crossfeed asks Codex for its read-only sandbox, or for `workspace-write`
-  with `--write`. What those sandboxes permit is decided by Codex and your
-  Codex configuration, not by crossfeed.
+- If a hook of the plugin throws before it handles a call, the original
+  event continues. An Agent hand-off can send a brief on standard input
+  when saving it fails. Workflow stages require saved inputs and either
+  an `allow` verdict or `ask` with `approveStages` enabled.
+- Codex configuration controls permissions for every job. Crossfeed
+  instructs read jobs to leave project files alone and reports any
+  edits it detects.
 - crossfeed passes a brief to your Codex CLI and to nothing else. Codex then
   handles it as your Codex configuration says.
 - What crossfeed stores stays on your machine, in `$CROSSFEED_HOME`, else
@@ -497,8 +598,9 @@ To remove it: `claude plugin uninstall agent-crossfeed@agent-crossfeed`.
   mode (the call's type and model, the first 100 characters of its
   description and the brief's length, not the brief), finished job, check,
   rating, lockout, nudge, stopped launch, agent start, breaker outcome and wake-up, the saved
-  briefs, and each job's event log and result. The dispatcher creates its
-  files so only you can read them. A check is recorded by program name,
+  briefs and any workflow stage schemas saved with them, and each job's
+  event log and result. The dispatcher creates its files so only you can
+  read them. A check is recorded by program name,
   without its arguments. Claude Code separately stores registered task IDs,
   agent lineage and the breaker cutoff in this conversation's plugin state.
 

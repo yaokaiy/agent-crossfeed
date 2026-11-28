@@ -4,7 +4,9 @@
 import argparse
 import contextlib
 import datetime
+import errno
 import fcntl
+from functools import partial
 import hashlib
 import json
 import math
@@ -21,20 +23,27 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-PREAMBLE_READ = (
+PREAMBLE_RULES = (
     "The given directory is your workspace: make any changes only inside it. You may read "
     "the files and directories the brief names, wherever they are. "
-    "Never push, commit or post to any service. Print no secrets. Answer in at most 40 lines with the conclusion, the evidence "
+    "Never push, commit or post to any service. Print no secrets."
+)
+PREAMBLE_STAGE = PREAMBLE_RULES + " Answer in the form the brief asks for."
+PREAMBLE_FORMAT = (
+    " Answer in at most 40 lines with the conclusion, the evidence "
     "(file and line, or command output), and what is not done."
 )
-PREAMBLE_WRITE = PREAMBLE_READ + (
-    " Change files only inside that directory and run the check the brief states."
-)
+READ_ROLE = " Do not change any project file. You may write temporary files."
+WRITE_ROLE = " Change files only inside that directory and run the check the brief states."
+PREAMBLE_READ = PREAMBLE_RULES + PREAMBLE_FORMAT + READ_ROLE
+PREAMBLE_WRITE = PREAMBLE_RULES + PREAMBLE_FORMAT + WRITE_ROLE
+_STAGE_STDERR_LOCK = threading.Lock()
 
 
 # Returned by _execute_job in place of an exit status when codex was not found.
@@ -344,6 +353,55 @@ def _private_open(path, mode, **kwargs):
     return open(path, mode, opener=opener, **kwargs)
 
 
+@contextlib.contextmanager
+def _run_slot(count):
+    directory = home() / "slots"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    while True:
+        for number in range(1, count + 1):
+            with _private_open(directory / "slot-{}".format(number), "ab") as slot:
+                try:
+                    fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as error:
+                    if error.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise
+                else:
+                    # The open descriptor owns the lock, including across quota preflight.
+                    yield
+                    return
+        time.sleep(0.1)
+
+
+@contextlib.contextmanager
+def _run_heartbeat(seconds):
+    if seconds is None:
+        yield
+        return
+    stopped = threading.Event()
+
+    def emit():
+        while not stopped.wait(seconds):
+            if not _stage_stderr("crossfeed: heartbeat"):
+                return
+
+    worker = threading.Thread(target=emit, daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        worker.join()
+
+
+def _stage_stderr(line):
+    try:
+        with _STAGE_STDERR_LOCK:
+            os.write(sys.stderr.fileno(), (line + "\n").encode("utf-8", errors="replace"))
+        return True
+    except OSError:
+        return False
+
+
 def append_ledger(record: dict) -> None:
     with _private_open(home() / "ledger.jsonl", "a", encoding="utf-8") as ledger:
         fcntl.flock(ledger, fcntl.LOCK_EX)
@@ -650,155 +708,299 @@ def _signal_group(pid, signum):
         pass
 
 
-def _stop_process_group(child):
+def _stop_process_group(child, grace=5):
     _signal_group(child.pid, signal.SIGTERM)
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         child.poll()  # Reap the direct child while waiting for its descendants.
         try:
             os.killpg(child.pid, 0)
         except ProcessLookupError:
             break
+        except PermissionError:
+            # A signal-zero probe can be denied while the group leader is exiting on macOS.
+            pass
         time.sleep(min(0.05, max(0, deadline - time.monotonic())))
     _signal_group(child.pid, signal.SIGKILL)
     child.wait()
 
 
+class _JobInterrupted(BaseException):
+    pass
+
+
+class _JobSignals:
+    requested = False
+    interruptible = False
+
+    def request(self, signum, frame):
+        self.requested = True
+        if self.interruptible:
+            raise _JobInterrupted
+
+    @contextlib.contextmanager
+    def check(self, enabled):
+        # Only unwind where the caller already owns any running children.
+        try:
+            self.interruptible = enabled
+            if enabled and self.requested:
+                raise _JobInterrupted
+            yield
+        finally:
+            self.interruptible = False
+
+
 @contextlib.contextmanager
 def _job_interrupts():
-    # A flag avoids exceptions between spawning a child and retaining its PID.
-    interrupted = [False]
-
-    def interrupt(signum, frame):
-        interrupted[0] = True
-
+    interrupted = _JobSignals()
     previous = {}
     try:
         for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            previous[signum] = signal.signal(signum, interrupt)
+            previous[signum] = signal.signal(signum, interrupted.request)
         yield interrupted
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
 
 
-def _execute_job(command, directory, job_dir, brief, timeout_s, interrupted):
-    with _private_open(job_dir / "events.jsonl", "wb") as events, _private_open(job_dir / "stderr.log", "wb") as errors:
+def _file_change_paths(item):
+    if not isinstance(item, dict) or item.get("type") != "file_change" or item.get("status") != "completed":
+        return []
+    entries = item.get("changes")
+    if not isinstance(entries, list):
+        return []
+    paths = []
+    for entry in entries:
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if not _record_text(path) or not path.strip() or "\0" in path:
+            return []
+        paths.append(path)
+    return paths
+
+
+def _edited_paths(directory, edited):
+    """Codex's own edit paths, relative to the job directory when inside it, like the observed changes."""
+    base = os.path.realpath(directory)
+    shown = set()
+    for path in edited:
+        parent, name = os.path.split(path)
+        full = os.path.join(os.path.realpath(parent), name) if os.path.isabs(path) else None
+        if full is not None and os.path.commonpath((full, base)) == base:
+            shown.add(os.path.relpath(full, base))
+        else:
+            shown.add(path)
+    return sorted(shown)
+
+
+def _item_progress(item):
+    if not isinstance(item, dict):
+        return None
+    kind = item.get("type")
+    if kind == "command_execution":
+        command, code = item.get("command"), item.get("exit_code")
+        if isinstance(command, str) and command.strip() and type(code) is int:
+            return "ran {} (exit {})".format(command, code)
+    elif kind == "web_search":
+        query = item.get("query")
+        if isinstance(query, str) and query.strip():
+            return "searched " + query
+    elif kind == "file_change":
+        paths = _file_change_paths(item)
+        if paths:
+            return "changed " + ", ".join(paths)
+    elif kind == "mcp_tool_call":
+        server, tool = item.get("server"), item.get("tool")
+        if all(isinstance(part, str) and part.strip() for part in (server, tool)):
+            return "called {}.{}".format(server, tool)
+    return None
+
+
+def _follow_events(events, edited, progress, record, final=False):
+    end = os.fstat(events.fileno()).st_size
+    while events.tell() < end and (line := events.readline(end - events.tell())):
+        if not final and not line.endswith(b"\n"):
+            events.seek(-len(line), os.SEEK_CUR)
+            return
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "thread.started" and _record_text(event.get("thread_id")):
+            record["codex_thread"] = event["thread_id"]
+        elif event.get("type") == "item.completed":
+            item = event.get("item")
+            edited.update(_file_change_paths(item))
+            text = _item_progress(item) if progress else None
+            if text:
+                _stage_stderr("crossfeed: progress " + " ".join(text.splitlines())[:200])
+
+
+def _thread_from_events(path, limit=65536):
+    """The thread id Codex reported first, read back from the job's event log."""
+    try:
+        with path.open("rb") as stream:
+            head = stream.read(limit)
+    except OSError:
+        return None
+    for line in head.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if isinstance(event, dict) and event.get("type") == "thread.started" and _record_text(event.get("thread_id")):
+            return event["thread_id"]
+    return None
+
+
+def _execute_job(args, job_dir, brief, resume_thread, interrupted, finish_interrupted, edited, record, launch):
+    events_path = job_dir / "events.jsonl"
+    with contextlib.ExitStack() as files:
+        events = files.enter_context(_private_open(events_path, "wb"))
+        errors = files.enter_context(_private_open(job_dir / "stderr.log", "wb"))
+        reader = files.enter_context(events_path.open("rb"))
+        progress = args.heartbeat is not None
         with _private_open(job_dir / "result.md", "wb"):
             pass
         # Resolved apart from the launch: Popen also raises FileNotFoundError for
         # other reasons, and only a missing codex is exit code 127.
         try:
-            command = [resolve_codex(), *command[1:]]
+            codex_bin = resolve_codex()
         except FileNotFoundError as error:
             errors.write((" ".join(str(error).splitlines()) + "\n").encode("utf-8"))
-            return CODEX_NOT_FOUND, False
+            return CODEX_NOT_FOUND, False, False
+        env = _codex_environment(codex_bin)
+        if interrupted.requested:
+            return 130, False, False
+        command = _codex_command(args, job_dir, resume_thread, codex_bin)
         try:
-            child = subprocess.Popen(command, cwd=directory, stdin=subprocess.PIPE,
+            child = subprocess.Popen(command, cwd=args.dir, stdin=subprocess.PIPE,
                                      stdout=events, stderr=errors, start_new_session=True, umask=0o077,
-                                     env=_codex_environment(command[0]))
+                                     env=env)
         except OSError as error:
             errors.write(("could not start codex: {}\n".format(error)).encode("utf-8"))
-            return 1, False
+            return 1, False, False
+        launch["started"] = True
         try:
-            deadline = time.monotonic() + timeout_s
-            pending = brief
-            while True:
-                if interrupted[0]:
-                    _stop_process_group(child)
-                    return 130, False
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    _stop_process_group(child)
-                    return 124, True
-                try:
-                    child.communicate(input=pending, timeout=min(0.1, remaining))
-                    if interrupted[0]:
-                        _stop_process_group(child)
-                        return 130, False
-                    return child.returncode, False
-                except subprocess.TimeoutExpired:
-                    # communicate retains any unwritten input across retries.
-                    pending = None
+            try:
+                deadline = time.monotonic() + args.timeout * 60
+                pending = brief
+                while not interrupted.requested:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        with interrupted.check(args.json):
+                            _stop_process_group(child)
+                            _follow_events(reader, edited, progress, record, final=True)
+                        return 124, True, True
+                    try:
+                        child.communicate(input=pending, timeout=min(0.1, remaining))
+                        if not interrupted.requested:
+                            with interrupted.check(args.json):
+                                _follow_events(reader, edited, progress, record, final=True)
+                            return child.returncode, False, True
+                    except subprocess.TimeoutExpired:
+                        # communicate retains any unwritten input across retries.
+                        pending = None
+                        with interrupted.check(args.json):
+                            _follow_events(reader, edited, progress, record)
+            except _JobInterrupted:
+                pass
+            try:
+                # The host can kill a JSON stage dispatcher within seconds of its signal.
+                if finish_interrupted is not None:
+                    _follow_events(reader, edited, False, record)
+                    finish_interrupted()
+            finally:
+                _stop_process_group(child, grace=0.25 if args.json else 5)
+            if not args.json:
+                _follow_events(reader, edited, False, record, final=True)
+            return 130, False, True
         finally:
             child.stdin.close()
 
 
-def _codex_command(args, job_dir, resume_thread):
-    sandbox = "workspace-write" if args.write else "read-only"
+def _codex_command(args, job_dir, resume_thread, codex_bin):
     if resume_thread:
-        command = ["codex", "exec", "resume", resume_thread, "--skip-git-repo-check", "--json",
-                   "-c", 'sandbox_mode="{}"'.format(sandbox)]
+        command = [codex_bin, "exec", "resume", resume_thread, "--skip-git-repo-check", "--json"]
     else:
-        command = ["codex", "exec", "--skip-git-repo-check", "--json", "-s", sandbox, "-C", args.dir]
+        command = [codex_bin, "exec", "--skip-git-repo-check", "--json", "-C", args.dir]
         if args.model:
             command.extend(["-m", args.model])
         if args.worktree:
             command.append("--worktree")
-    command.extend(["-c", 'model_reasoning_effort="{}"'.format(args.effort), "-o", str(job_dir / "result.md")])
+    command.extend(["-c", 'model_reasoning_effort="{}"'.format(args.effort),
+                    "-c", 'project_doc_fallback_filenames=["CLAUDE.md"]', "-o", str(job_dir / "result.md")])
     if args.output_schema is not None:
         command.extend(["--output-schema", args.output_schema])
     return command + ["-"]
 
 
-def _print_changes(change_list, error):
-    if error:
-        print("[crossfeed] change list unavailable: {}".format(error))
+def _job_writes(record):
+    return record.get("write", record.get("sandbox") == "workspace-write") is True
+
+
+def _shown_paths(paths):
+    extra = " (+{} more)".format(len(paths) - 10) if len(paths) > 10 else ""
+    return (", ".join(paths[:10]) or "none") + extra
+
+
+def _print_changes(changes, unavailable_reason, show, write):
+    edited = changes["codex_edited"]
+    show("[crossfeed] codex edits: " + _shown_paths(edited))
+    if edited and not write:
+        show("[crossfeed] warning: this read job edited {} file(s): {}".format(len(edited), _shown_paths(edited)))
+    if not write:
         return
-    if change_list is None:
-        print("[crossfeed] not a git repository: no change list")
-        return
-    paths = change_list["changed"]
-    if paths:
-        extra = " (+{} more)".format(len(paths) - 10) if len(paths) > 10 else ""
-        print("[crossfeed] changed {} file(s): {}{}".format(len(paths), ", ".join(paths[:10]), extra))
+    observed = changes["observed"]
+    if observed == "unavailable":
+        show("[crossfeed] workspace changes: unavailable ({})".format(unavailable_reason))
     else:
-        print("[crossfeed] no files changed")
-    if change_list["head_moved"]:
-        print("[crossfeed] WARNING: HEAD moved during the job, so a commit was made")
+        show("[crossfeed] workspace changes during the run: " + _shown_paths(observed))
+    if changes["head_moved"]:
+        show("[crossfeed] warning: HEAD moved during the run")
 
 
-def _print_job(record, job_dir, result, errors, timeout_minutes, change_list, change_error, error_events):
+def _print_job(record, job_dir, capped, errors, timeout_minutes, change_list, unavailable_reason, error_events, output):
+    show = partial(print, file=output)
     if record["status"] == "done":
-        text, truncated = cap_text(result)
-        if text and not text.endswith("\n") and len(text.encode("utf-8")) == 8192:
-            text, truncated = cap_text(result, max_bytes=8191)
+        text, truncated = capped
         if text:
-            print(text, end="" if text.endswith("\n") else "\n")
+            show(text, end="" if text.endswith("\n") else "\n")
         if truncated:
-            print("[crossfeed] result truncated: full text in {}".format(job_dir / "result.md"))
+            show("[crossfeed] result truncated: full text in {}".format(job_dir / "result.md"))
     minutes, seconds = divmod(int(record["wall_s"]), 60)
-    print("[crossfeed] job {} {} in {}m{:02d}s; tier {}; kind {}; sandbox {}; codex tokens {}".format(
+    write = _job_writes(record)
+    show("[crossfeed] job {} {} in {}m{:02d}s; tier {}; kind {}; {}; codex tokens {}".format(
         record["id"], record["status"], minutes, seconds, record["tier"], record["kind"],
-        record["sandbox"], record["tokens"]["input"] + record["tokens"]["output"]))
+        "write" if write else "read", record["tokens"]["input"] + record["tokens"]["output"]))
     if record["artifact"] is not None:
-        print("[crossfeed] artifact {} round {}".format(record["artifact"], record["round"]))
+        show("[crossfeed] artifact {} round {}".format(record["artifact"], record["round"]))
     if record["status"] == "done" and error_events:
-        print("[crossfeed] codex reported {} recoverable error event(s); see {}".format(
+        show("[crossfeed] codex reported {} recoverable error event(s); see {}".format(
             error_events, job_dir / "events.jsonl"))
     if record["worktree"]:
-        print("[crossfeed] worktree job: changes are in Codex's managed worktree, not in {}".format(record["dir"]))
-    elif record["sandbox"] == "workspace-write":
-        _print_changes(change_list, change_error)
+        show("[crossfeed] worktree job: changes are in Codex's managed worktree, not in {}".format(record["dir"]))
+    _print_changes(change_list, unavailable_reason, show, write)
     if record["status"] == "done":
-        print("[crossfeed] full result: {}".format(job_dir / "result.md"))
+        show("[crossfeed] full result: {}".format(job_dir / "result.md"))
         script = shlex.quote(str(Path(__file__).resolve()))
-        if record["sandbox"] == "read-only":
-            print("[crossfeed] once you have checked its claims, record whether you used this result: "
+        if not write:
+            show("[crossfeed] once you have checked its claims, record whether you used this result: "
                   "python3 -I {} used {} <yes|partly|no>".format(script, record["id"]))
         else:
-            print("[crossfeed] record the outcome: python3 -I {} check {} -- <your check command>".format(
+            show("[crossfeed] record the outcome: python3 -I {} check {} -- <your check command>".format(
                 script, record["id"]))
     elif record["status"] == "failed":
-        print("[crossfeed] last log lines:")
+        show("[crossfeed] last log lines:")
         for line in errors[-20:]:
-            print(line)
+            show(line)
     elif record["status"] == "limit":
-        print("[crossfeed] Codex reported its usage limit. Do not retry on Codex; do this work on Claude.")
+        show("[crossfeed] Codex reported its usage limit. Do not retry on Codex; do this work on Claude.")
     elif record["status"] == "interrupted":
-        print("[crossfeed] interrupted; Codex was stopped.")
+        show("[crossfeed] interrupted; Codex was stopped.")
     else:
-        print("[crossfeed] stopped after {:g} minutes.".format(timeout_minutes))
+        show("[crossfeed] stopped after {:g} minutes.".format(timeout_minutes))
 
 
 def _git(directory, *args):
@@ -821,7 +1023,7 @@ def _file_digest(path):
                 digest.update(chunk)
     except FileNotFoundError:
         return "deleted"
-    return digest.hexdigest()
+    return ("executable:" if mode & stat.S_IXUSR else "") + digest.hexdigest()
 
 
 def _directory_digest(path):
@@ -951,6 +1153,13 @@ def _output_schema_path(value):
 
 def _prepare_run(args):
     thread = None
+    if args.slots is not None and args.slots < 1:
+        raise ValueError("--slots must be at least 1")
+    if args.heartbeat is not None:
+        if not args.json:
+            raise ValueError("--heartbeat requires --json")
+        if args.heartbeat < 1:
+            raise ValueError("--heartbeat must be at least 1")
     if not _finite_number(args.codex_stop) or not 0 < args.codex_stop <= 100:
         raise ValueError("--codex-stop must be a finite percent greater than 0 and at most 100")
     if args.cause is not None and re.fullmatch(r"[A-Za-z0-9-]{1,32}", args.cause) is None:
@@ -970,12 +1179,19 @@ def _prepare_run(args):
         if prior is None:
             raise ValueError("unknown job: {}".format(args.resume))
         thread = prior.get("codex_thread")
+        # An interrupt records the end before stopping Codex and folding its log.
+        if not thread and prior.get("status") == "interrupted" and re.fullmatch(r"\d{8}-\d{6}-[a-f0-9]{4}", args.resume):
+            try:
+                with (home() / "jobs" / args.resume / "events.jsonl").open("rb") as events:
+                    thread = parse_events(events)["thread"]
+            except OSError:
+                pass
         if not isinstance(thread, str) or not thread:
             raise ValueError("job has no Codex thread: {}".format(args.resume))
-        if not isinstance(prior.get("dir"), str) or not prior["dir"] or prior.get("sandbox") not in ("read-only", "workspace-write"):
-            raise ValueError("job has no valid directory or sandbox: {}".format(args.resume))
+        if not isinstance(prior.get("dir"), str) or not prior["dir"]:
+            raise ValueError("job has no valid directory: {}".format(args.resume))
         args.dir = prior["dir"]
-        args.write = prior["sandbox"] == "workspace-write"
+        args.write = _job_writes(prior)
         args.model = prior.get("model")
         args.model_source = "resume"
         args.cause = prior.get("cause")
@@ -1001,12 +1217,14 @@ def _prepare_run(args):
 def _job_status(code, timed_out, result, errors):
     if timed_out:
         return "timeout", 124
+    if code == CODEX_NOT_FOUND:
+        return "failed", 127
     if code and is_usage_limit(errors):
         return "limit", 75
     if code:
         if not errors:
             errors.append("codex exited {} without error details".format(code))
-        return "failed", 127 if code == CODEX_NOT_FOUND else 1
+        return "failed", 1
     if not result:
         errors.append("[crossfeed] Codex exited 0 without a result.")
         return "failed", 1
@@ -1027,58 +1245,123 @@ def _finish_job(job_dir, record):
         _write_ledger(ledger, record)
 
 
-def _run_allocated_job(args, job_dir, now, brief, role, resume_thread, interrupted):
+def _print_run_json(status, exit_code, job_dir=None, result="", change_list=None, error=None):
+    response = {
+        "id": job_dir.name if job_dir is not None else None,
+        "status": status, "exit": exit_code,
+        "result_path": os.path.abspath(job_dir / "result.md") if job_dir is not None else None,
+        "result": result, "codex_edited": [],
+    }
+    if change_list is not None:
+        response.update(change_list)
+    if error is not None:
+        response["error"] = error
+    print(json.dumps(response))
+    return exit_code
+
+
+def _snapshot_or_unavailable(directory):
+    try:
+        return snapshot(directory), None
+    except Exception as error:
+        return None, str(error)
+
+
+def _run_allocated_job(args, job_dir, now, brief, role, resume_thread, interrupted, launch):
     start = time.monotonic()
     record = {
         "type": "job", "id": job_dir.name, "session": args.session or None, "kind": args.kind,
         "brief_file": args.brief_file, "artifact": args.artifact, "round": None,
         "role_file": args.role_file, "output_schema": args.output_schema,
-        "tier": args.tier, "dir": args.dir, "sandbox": "workspace-write" if args.write else "read-only",
+        "tier": args.tier, "dir": args.dir, "write": args.write,
+        "sandbox": "workspace-write" if args.write else "read-only",
         "worktree": args.worktree, "effort": args.effort, "model": args.model,
         "model_source": args.model_source, "cause": args.cause,
         "started": now.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), "wall_s": 0,
         "status": "running", "exit": None,
         "tokens": {"input": 0, "cached": 0, "output": 0, "reasoning": 0},
-        "codex_thread": resume_thread, "changed": None, "head_moved": False, "resume_of": args.resume,
+        "codex_thread": resume_thread, "resume_of": args.resume,
     }
     errors = []
     error_events = 0
     result = ""
-    change_list = change_error = None
+    change_list = {"codex_edited": []}
+    if args.write:
+        change_list.update(observed="unavailable", head_moved=False)
+    record.update(change_list)
+    unavailable_reason = "managed worktree" if args.worktree else "not a git repository"
+    edited = set()
     code, timed_out = 1, False
+    finalized = False
+
+    def finish(status, exit_code):
+        nonlocal finalized
+        record["status"], record["exit"] = status, exit_code
+        record["wall_s"] = time.monotonic() - start
+        record.update(change_list, codex_edited=_edited_paths(args.dir, edited))
+        if not record.get("codex_thread"):
+            # A signal can land between reading thread.started and saving it.
+            record["codex_thread"] = _thread_from_events(job_dir / "events.jsonl")
+        _finish_job(job_dir, record)
+        finalized = True
+
+    def finish_interrupted():
+        finish("interrupted", 130)
+
     try:
-        with _private_open(job_dir / "brief.md", "wb") as stream:
-            stream.write(brief)
-        write_state(job_dir, record)
-        before = snapshot(args.dir) if args.write and not args.worktree else None
-        preamble = PREAMBLE_WRITE if args.write else PREAMBLE_READ
+        before = None
+        with interrupted.check(args.json):
+            with _private_open(job_dir / "brief.md", "wb") as stream:
+                stream.write(brief)
+            write_state(job_dir, record)
+            if args.write and not args.worktree:
+                before, snapshot_error = _snapshot_or_unavailable(args.dir)
+                unavailable_reason = snapshot_error or unavailable_reason
+        preamble = PREAMBLE_STAGE if args.json else PREAMBLE_WRITE if args.write else PREAMBLE_READ
+        if args.json:
+            preamble += WRITE_ROLE if args.write else READ_ROLE
         prompt = b"\n\n".join((preamble.encode("utf-8"), brief) if role is None
                              else (preamble.encode("utf-8"), role, brief))
-        code, timed_out = _execute_job(_codex_command(args, job_dir, resume_thread), args.dir, job_dir,
-                                      prompt, args.timeout * 60, interrupted)
-        with (job_dir / "events.jsonl").open("rb") as events:
-            parsed = parse_events(events)
-        error_events = len(parsed["errors"])
-        record["tokens"] = parsed["tokens"]
-        record["codex_thread"] = parsed["thread"] or resume_thread
-        stderr = (job_dir / "stderr.log").read_text(encoding="utf-8", errors="replace")
-        errors = [line for message in parsed["errors"] for line in message.splitlines()] + stderr.splitlines()
-        result_path = job_dir / "result.md"
-        result = result_path.read_text(encoding="utf-8", errors="replace") if result_path.exists() else ""
-        after = snapshot(args.dir) if args.write and not args.worktree else None
-        if before is not None and after is not None:
-            change_list = changes(before, after)
-            record["changed"] = len(change_list["changed"])
-            record["head_moved"] = change_list["head_moved"]
+        code, timed_out, _ = _execute_job(args, job_dir, prompt, resume_thread,
+                                         interrupted, finish_interrupted if args.json else None, edited, record, launch)
+        with interrupted.check(args.json):
+            with (job_dir / "events.jsonl").open("rb") as events:
+                parsed = parse_events(events)
+            error_events = len(parsed["errors"])
+            record["tokens"] = parsed["tokens"]
+            record["codex_thread"] = parsed["thread"] or record["codex_thread"]
+            stderr = (job_dir / "stderr.log").read_text(encoding="utf-8", errors="replace")
+            errors = [line for message in parsed["errors"] for line in message.splitlines()] + stderr.splitlines()
+            result_path = job_dir / "result.md"
+            result = result_path.read_text(encoding="utf-8", errors="replace") if result_path.exists() else ""
+            if before is not None and launch["started"]:
+                after, snapshot_error = _snapshot_or_unavailable(args.dir)
+                if after is not None:
+                    observed = changes(before, after)
+                    change_list.update(observed=observed["changed"], head_moved=observed["head_moved"])
+                else:
+                    unavailable_reason = snapshot_error or unavailable_reason
+    except _JobInterrupted:
+        pass
     except OSError as error:
         code = 1
         errors.append("crossfeed: {}".format(error))
-        if args.write and change_list is None:
-            change_error = str(error)
-    record["status"], record["exit"] = ("interrupted", 130) if interrupted[0] else _job_status(code, timed_out, result, errors)
-    record["wall_s"] = time.monotonic() - start
-    _finish_job(job_dir, record)
-    _print_job(record, job_dir, result, errors, args.timeout, change_list, change_error, error_events)
+    if not finalized:
+        if interrupted.requested:
+            finish_interrupted()
+        else:
+            finish(*_job_status(code, timed_out, result, errors))
+    capped = cap_text(result) if record["status"] == "done" else ("", False)
+    text, _ = capped
+    if text and not text.endswith("\n") and len(text.encode("utf-8")) == 8192:
+        capped = cap_text(result, max_bytes=8191)
+    change_list["codex_edited"] = record["codex_edited"]
+    if args.json:
+        refused = not launch["started"] and record["status"] != "interrupted"
+        status = "not-started" if refused else record["status"]
+        return _print_run_json(status, record["exit"], job_dir, capped[0], change_list,
+                               error="\n".join(errors) if refused and errors else None)
+    _print_job(record, job_dir, capped, errors, args.timeout, change_list, unavailable_reason, error_events, sys.stdout)
     return record["exit"]
 
 
@@ -1105,8 +1388,9 @@ def _stop_reason(windows, limit_reached, stop):
 
 def _launch_stopped(args, quota, now):
     if quota["source"] == "none" or quota["age_s"] < -300:
-        print("crossfeed: Codex quota is unknown; proceeding.", file=sys.stderr)
-        return False
+        if not args.json:
+            print("crossfeed: Codex quota is unknown; proceeding.", file=sys.stderr)
+        return None
     fresh = quota["age_s"] <= 900
     windows = []
     for window in quota["windows"]:
@@ -1115,24 +1399,27 @@ def _launch_stopped(args, quota, now):
             windows.append(window)
     reason = _stop_reason(windows, fresh and quota["limit_reached"], args.codex_stop)
     if reason is None:
-        return False
+        return None
     weekly = max((w for w in windows if w["minutes"] > 360), key=lambda w: w["minutes"], default=None)
-    print("crossfeed: not started: {}. Do this work yourself.".format(reason), file=sys.stderr)
     append_ledger({"type": "stop", "session": args.session or None, "kind": args.kind, "tier": args.tier,
                    "resume_of": args.resume, "reason": reason,
                    "codex_weekly": weekly["used_percent"] if weekly else None})
-    return True
+    return "not started: {}. Do this work yourself.".format(reason)
 
 
 def _run(args) -> int:
+    def not_started(code, reason):
+        if args.json:
+            return _print_run_json("not-started", code, error=reason)
+        print("crossfeed: {}".format(reason), file=sys.stderr)
+        return code
+
     try:
         brief = Path(args.brief_file).read_bytes() if args.brief_file is not None else sys.stdin.buffer.read()
     except OSError as error:
-        print("crossfeed: could not read brief: {}".format(error), file=sys.stderr)
-        return 2
+        return not_started(2, "could not read brief: {}".format(error))
     if not brief.strip():
-        print("crossfeed: brief must not be empty", file=sys.stderr)
-        return 2
+        return not_started(2, "brief must not be empty")
     try:
         resume_thread = _prepare_run(args)
         role = None
@@ -1143,19 +1430,26 @@ def _run(args) -> int:
         if args.output_schema is not None:
             args.output_schema = _output_schema_path(args.output_schema)
     except ValueError as error:
-        print("crossfeed: {}".format(error), file=sys.stderr)
-        return 2
-    try:
-        quota = read_quota()
-        now = datetime.datetime.now(datetime.timezone.utc)
-        if _launch_stopped(args, quota, now.timestamp()):
-            return 75
-        job_dir = _create_job_dir(now)
-        with _job_interrupts() as interrupted:
-            return _run_allocated_job(args, job_dir, now, brief, role, resume_thread, interrupted)
-    except OSError as error:
-        print("crossfeed: {}".format(error), file=sys.stderr)
-        return 1
+        return not_started(2, str(error))
+    with _run_heartbeat(args.heartbeat):
+        job_dir = None
+        # Set at the process-creation boundary: any failure before it, here or in
+        # the job's own setup and bookkeeping, is a non-start.
+        launch = {"started": False}
+        try:
+            with _run_slot(args.slots) if args.slots is not None else contextlib.nullcontext():
+                quota = read_quota()
+                now = datetime.datetime.now(datetime.timezone.utc)
+                refusal = _launch_stopped(args, quota, now.timestamp())
+                if refusal is not None:
+                    return not_started(75, refusal)
+                with _job_interrupts() as interrupted:
+                    job_dir = _create_job_dir(now)
+                    return _run_allocated_job(args, job_dir, now, brief, role, resume_thread, interrupted, launch)
+        except OSError as error:
+            if args.json and job_dir is not None and launch["started"]:
+                return _print_run_json("failed", 1, job_dir, error=str(error))
+            return not_started(1, str(error))
 
 
 def _stash(args) -> int:
@@ -1248,7 +1542,7 @@ def _nudge(args) -> int:
 
 
 SPAWN_ORIGINS = ("workflow", "fork", "teammate", "resume", "agent-tool", "other")
-SPAWN_OUTCOMES = ("started", "refused", "unconfirmed")
+SPAWN_OUTCOMES = ("started", "refused", "unconfirmed", "stage-codex", "stage-fallback", "stage-failed")
 BREAKER_OUTCOMES = ("stopped", "denied", "error")
 WAKE_TRIGGERS = ("pace", "breaker")
 WAKE_OUTCOMES = ("prompt", "notice")
@@ -1280,6 +1574,11 @@ def _background_record(data):
                 or (index is not None and (type(index) is not int or index < 1))
                 or (model is not None and not _record_text(model, allow_empty=True))):
             return None
+        if "codex_edited" in data:
+            count = data["codex_edited"]
+            if type(count) is not int or count < 0:
+                return None
+            row["codex_edited"] = count
         return dict(row, origin=origin, outcome=outcome, run_id=run_id, agent_index=index, model=model)
     if kind == "breaker":
         task_id, run_id = data.get("task_id"), data.get("run_id")
@@ -1617,7 +1916,7 @@ def fold(records: list, since: datetime.datetime) -> dict:
         elif (record.get("type") == "job" and isinstance(record.get("id"), str)
               and record.get("status") in ("done", "failed", "limit", "timeout", "interrupted")):
             _fold_job(summary, record, checks, walls)
-            if record["status"] == "done" and record.get("sandbox") == "read-only":
+            if record["status"] == "done" and not _job_writes(record):
                 summary["used"][uses.get(record["id"], "unrated")] += 1
     if walls:
         summary["median_wall_s"] = float(statistics.median(walls))
@@ -1650,8 +1949,8 @@ def _report_text(summary, days):
     if spawns is None:
         background = ["agent starts: unavailable", "breaker stops: unavailable", "wake-ups: unavailable"]
     else:
-        origins = ["{} (started {}, refused {}, unconfirmed {})".format(
-            origin, counts["started"], counts["refused"], counts["unconfirmed"])
+        origins = ["{} ({})".format(origin, ", ".join(
+            "{} {}".format(outcome, counts[outcome]) for outcome in SPAWN_OUTCOMES))
                    for origin, counts in sorted(spawns.items())]
         wake_counts = ["{} (prompt {}, notice {})".format(trigger, counts["prompt"], counts["notice"])
                        for trigger, counts in wakes.items()]
@@ -1679,7 +1978,7 @@ def _report_text(summary, days):
         "nudges: balance on {balance-on}, balance off {balance-off}, stretch {stretch}".format(**summary["nudges"]),
         "first-delivery checks: A {}/{}, B {}/{}; unchecked: {}".format(
             tier_a["passed"], tier_a["checked"], tier_b["passed"], tier_b["checked"], summary["unchecked"]),
-        "read-only results used: yes {yes}, partly {partly}, no {no}; not rated: {unrated}".format(**summary["used"]),
+        "read job results used: yes {yes}, partly {partly}, no {no}; not rated: {unrated}".format(**summary["used"]),
     ])
 
 
@@ -1760,6 +2059,9 @@ def main(argv) -> int:
     run.add_argument("--artifact", metavar="ID")
     run.add_argument("--role-file", metavar="PATH")
     run.add_argument("--output-schema", metavar="PATH")
+    run.add_argument("--json", action="store_true")
+    run.add_argument("--slots", type=int, metavar="N")
+    run.add_argument("--heartbeat", type=int, metavar="SECONDS")
     quota = subcommands.add_parser("quota")
     quota.add_argument("--timeout", type=float, default=10.0, metavar="SECONDS")
     args = parser.parse_args(argv)

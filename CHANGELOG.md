@@ -4,6 +4,53 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Workflow stages on Codex. A workflow agent whose prompt carries a
+  `crossfeed-stage` block can run on Codex and return its text or
+  structured answer through `agent()`. With routing enabled, `executor:
+  auto` considers Codex when the 5-hour window is short or the routing
+  policy selects it. A launch requires positive Codex headroom and Bash
+  permission. `executor: codex` requires `schema` and fails if the stage
+  cannot run on Codex. A `task` stage may edit in place. `review` and
+  `research` stages are told to leave project files alone. Worktree
+  isolation sends `auto` through ordinary Claude admission and causes an
+  explicit Codex request to fail. After dispatch, only a silent `auto`
+  stage can fall back, while the window has room and the dispatcher
+  confirms Codex never started.
+- `approveStages` defaults to off. Enabling it lets crossfeed launch a
+  stage when Claude Code returns `ask`. In auto permission mode, the tested
+  commands returned `ask` even with matching Bash allow rules. An explicit
+  deny rule blocked the launch.
+- While stages run on Codex, the status line counts active stage
+  dispatchers, including those waiting for a slot, and shows the latest
+  reported action among them or `started` if none has reported an action.
+- `run --json` returns machine-readable output. `run --json --heartbeat
+  SECONDS` also emits heartbeat and progress records. `run --slots N` makes
+  each dispatcher wait for one of N shared slots before checking quota.
+  Workflow stages use eight slots per data directory.
+
+### Changed
+
+- crossfeed no longer passes `-s read-only` or `-s workspace-write` to
+  Codex: every job runs under your Codex configuration. The Quick start
+  now asks you to let `codex exec` write the workspace, since its default
+  is read-only. Read jobs are told to leave project files alone, and
+  crossfeed warns when Codex reports that a read job edited a file.
+- Crossfeed sets `CLAUDE.md` as the sole fallback filename for project
+  instructions. Codex uses it in a directory when neither
+  `AGENTS.override.md` nor `AGENTS.md` supplies instructions there.
+- Job output lists `codex edits` (from Codex's own file-change events)
+  apart from `workspace changes during the run`, which only write jobs
+  report and which can include other agents' changes. Read jobs no longer
+  take a workspace snapshot.
+- Job rows carry a boolean `write` field and retain the legacy `sandbox`
+  role label (`read-only` or `workspace-write`) so 0.5.0 readers can still
+  count and resume new jobs. `/crossfeed report` says "read job results"
+  where it said "read-only results".
+
 ## 0.5.0 - 2026-11-27
 
 ### Added

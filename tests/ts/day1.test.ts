@@ -231,10 +231,11 @@ test('takeNotices drains once without resetting the stretch counter', async () =
   expect(core.toolCall('Bash', false)).not.toBe(undefined)
 })
 
-test('reminder is read-only by default and quotes session; static guidance covers missing CLI', async () => {
+test('reminder says when to add --write and quotes session; static guidance covers missing CLI', async () => {
   for (const session of [undefined, '', "it's; 检查"]) {
     const reminder = stretchReminder({ reasons: ['pressure'], calls: 12, u: 85, script: '/plugin/crossfeed.py', session })
-    expect(reminder.includes('read-only unless --write is added')).toBe(true)
+    expect(reminder.includes('Add --write for work that should change project files.')).toBe(true)
+    expect(reminder.includes('read-only')).toBe(false)
     expect(reminder.includes('--session')).toBe(session !== undefined)
     if (session !== undefined) expect(reminder.includes('--session ' + shellQuote(session))).toBe(true)
   }

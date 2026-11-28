@@ -313,7 +313,7 @@ class ReportTests(CrossfeedCase):
                          "launches stopped at the Codex stop: 1\n"
                          "nudges: balance on 1, balance off 1, stretch 2\n"
                          "first-delivery checks: A 5/6, B 2/2; unchecked: 6\n"
-                         "read-only results used: yes 0, partly 0, no 0; not rated: 12\n")
+                         "read job results used: yes 0, partly 0, no 0; not rated: 12\n")
 
     def test_report_json_and_fold(self):
         records = self.balance_records()
@@ -361,7 +361,7 @@ class ReportTests(CrossfeedCase):
                                  "launches stopped at the Codex stop: 0\n"
                                  "nudges: balance on 0, balance off 0, stretch 0\n"
                                  "first-delivery checks: A 0/0, B 0/0; unchecked: 0\n"
-                                 "read-only results used: yes 0, partly 0, no 0; not rated: 0\n")
+                                 "read job results used: yes 0, partly 0, no 0; not rated: 0\n")
 
     def test_report_counts_background_events_by_origin_trigger_and_outcome(self):
         old = (self.now - datetime.timedelta(days=8)).isoformat()
@@ -370,6 +370,9 @@ class ReportTests(CrossfeedCase):
             {"type": "spawn", "origin": "agent-tool", "outcome": "started", "ts": self.stamp},
             {"type": "spawn", "origin": "agent-tool", "outcome": "unconfirmed", "ts": self.stamp},
             {"type": "spawn", "origin": "workflow", "outcome": "refused", "ts": self.stamp},
+            {"type": "spawn", "origin": "workflow", "outcome": "stage-codex", "ts": self.stamp},
+            {"type": "spawn", "origin": "workflow", "outcome": "stage-fallback", "ts": self.stamp},
+            {"type": "spawn", "origin": "workflow", "outcome": "stage-failed", "ts": self.stamp},
             {"type": "spawn", "origin": [], "outcome": "refused", "ts": self.stamp},
             {"type": "breaker", "task_id": "job", "outcome": "stopped", "ts": self.stamp},
             {"type": "breaker", "task_id": "agent", "outcome": "denied", "ts": self.stamp},
@@ -379,14 +382,20 @@ class ReportTests(CrossfeedCase):
         result = run_crossfeed(["report", "--json"], env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
-        self.assertEqual(report["spawns"], {"agent-tool": {"started": 1, "refused": 0, "unconfirmed": 1},
-                                            "workflow": {"started": 0, "refused": 1, "unconfirmed": 0}})
+        self.assertEqual(report["spawns"], {
+            "agent-tool": {"started": 1, "refused": 0, "unconfirmed": 1,
+                           "stage-codex": 0, "stage-fallback": 0, "stage-failed": 0},
+            "workflow": {"started": 0, "refused": 1, "unconfirmed": 0,
+                         "stage-codex": 1, "stage-fallback": 1, "stage-failed": 1},
+        })
         self.assertEqual(report["breaker"], {"stopped": 1, "denied": 1, "error": 0})
         self.assertEqual(report["wakes"], {"pace": {"prompt": 1, "notice": 0},
                                           "breaker": {"prompt": 0, "notice": 1}})
         text = run_crossfeed(["report"], env=self.env).stdout.decode()
-        self.assertIn("agent starts: agent-tool (started 1, refused 0, unconfirmed 1), "
-                      "workflow (started 0, refused 1, unconfirmed 0)\n", text)
+        self.assertIn("agent starts: agent-tool (started 1, refused 0, unconfirmed 1, "
+                      "stage-codex 0, stage-fallback 0, stage-failed 0), "
+                      "workflow (started 0, refused 1, unconfirmed 0, "
+                      "stage-codex 1, stage-fallback 1, stage-failed 1)\n", text)
         self.assertIn("breaker stops: 1 stopped, 1 denied, 0 errors\n", text)
         self.assertIn("wake-ups: pace (prompt 1, notice 0), breaker (prompt 0, notice 1)\n", text)
 
@@ -396,6 +405,20 @@ class ReportTests(CrossfeedCase):
         result = run_crossfeed(["report", "--json"], env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["spawns"], {})
+
+    def test_report_used_counts_read_roles_in_legacy_and_current_rows(self):
+        newer_read, newer_write = self.job("new-read"), self.job("new-write")
+        for new in (newer_read, newer_write):
+            del new["sandbox"]
+        self.write_records([
+            dict(newer_read, write=False), dict(newer_write, write=True),
+            self.job("old-read"), dict(self.job("old-write"), sandbox="workspace-write"),
+            *({"type": "use", "id": job, "verdict": verdict, "ts": self.stamp}
+              for job, verdict in (("old-read", "yes"), ("new-read", "partly"), ("old-write", "no"), ("new-write", "no"))),
+        ])
+        result = run_crossfeed(["report", "--json"], env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["used"], {"yes": 1, "partly": 1, "no": 0, "unrated": 0})
 
     def test_report_decisions_and_used(self):
         old = (self.now - datetime.timedelta(days=8)).isoformat()
@@ -441,7 +464,7 @@ class ReportTests(CrossfeedCase):
         ])
         self.assertEqual(lines[-2:], [
             "first-delivery checks: A 0/0, B 0/0; unchecked: 6",
-            "read-only results used: yes 1, partly 1, no 1; not rated: 1",
+            "read job results used: yes 1, partly 1, no 1; not rated: 1",
         ])
 
     def test_report_counts_interrupted_after_timeout(self):

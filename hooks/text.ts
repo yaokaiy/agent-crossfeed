@@ -48,6 +48,35 @@ export function shellQuote(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'"
 }
 
+export function shellCommand(argv: readonly string[]): string {
+  return argv.map(arg => /^[A-Za-z0-9_./-]+$/.test(arg) ? arg : shellQuote(arg)).join(' ')
+}
+
+export function stageMarker(nonce: string): string {
+  return `crossfeed-route: ${nonce}`
+}
+
+export function stageFailure(id: string, reason: string): string {
+  return `crossfeed-stage-failed: ${id}: ${reason}`
+}
+
+export type StageChanges = { codexEdited: string[]; workspace?: { observed: string[] | 'unavailable'; headMoved: boolean } }
+
+export function readStageWarning(edited: string[]): string {
+  return `Warning: this read job edited ${edited.length} file(s): ${edited.join(', ')}`
+}
+
+export function stageResult(result: string, path: string, { codexEdited, workspace }: StageChanges): string {
+  const separator = result === '' ? '' : result.endsWith('\n') ? '\n' : '\n\n'
+  const lines = [`Full result: ${path}`, `Codex edits: ${codexEdited.join(', ') || 'none'}`]
+  if (workspace) {
+    lines.push(workspace.observed === 'unavailable' ? 'Workspace changes: unavailable'
+      : `Workspace changes during the run: ${workspace.observed.join(', ') || 'none'}`)
+    if (workspace.headMoved) lines.push('HEAD moved during the run.')
+  } else if (codexEdited.length) lines.push(readStageWarning(codexEdited))
+  return result + separator + lines.join('\n')
+}
+
 export function heredocDelimiter(brief: string, now: number): string {
   const base = 'CROSSFEED_BRIEF_' + now.toString(36)
   let delimiter = base
@@ -109,18 +138,23 @@ export function staticSection(script: string, codexStopPercent = DEFAULTS.codexS
     'This session can hand self-contained work to the Codex CLI, which runs on a separate subscription. crossfeed watches both quotas and tells you when to use it.',
     '- When a subagent call is refused with a message that starts with "crossfeed:", run the command in that message. Do not retry the subagent.',
     '- When a crossfeed notice says hand-offs are on, decide at the start of each task, before your first command: if its core is execution with a result you can check (run the tests and fix until they pass, a change across several files, three or more dependent shell steps, a search or data analysis over many files), write a full brief and run it on Codex. Keep talking with the user, design, architecture and UX decisions, steps that need tools only you have, and edits under about 20 lines for yourself.',
-    "- A workflow's agents all run on Claude, so while hand-offs are on, launch heavy workflows one at a time.",
+    '- An eligible workflow stage can carry a `crossfeed-stage` block with `v`, `id`, `executor`, `kind` and optional `schema`. The default `auto` follows the routing policy and may run on Claude, while `executor: codex` requires `schema` and fails if Codex cannot run the stage. Codex stages use your Codex permissions. A Codex `task` stage may edit the session checkout. Serialize stages that could edit the same files. For worktree isolation, use ordinary Claude admission. Leave stages that need Claude-only MCP tools, skills or agent types unmarked. Launch heavy workflows one at a time while hand-offs are on.',
     `- Start a job as a background Bash command: \`python3 -I ${shellQuote(script)} run --kind task|review|research [--write]${stop}\` with the brief on stdin. \`task\` is execution; \`review\` and \`research\` are judgment, and crossfeed gives them its strongest Codex model. You are notified when it exits. Never poll, sleep, or read its output early.`,
     '- A brief states the goal, the decisions already made, paths, constraints, the check command and the format of the answer. Codex sees none of this conversation.',
     `- To fix or extend the same work, continue its thread with \`run --resume <job>${stop}\` and only the new instructions.`,
     '- While a write job runs, do not edit files in its directory.',
-    `- A Codex result is a claim. Check it before you report it: after a write job, read the change list and run the check as \`python3 -I ${shellQuote(script)} check <job> -- <command>\`; after a read-only job that succeeded, verify its claims and record whether you used it as \`python3 -I ${shellQuote(script)} used <job> <yes|partly|no>\`.`,
+    `- A Codex result is a claim. Check it before you report it: after a write job, read the change list and run the check as \`python3 -I ${shellQuote(script)} check <job> -- <command>\`; after a read job that succeeded, verify its claims and record whether you used it as \`python3 -I ${shellQuote(script)} used <job> <yes|partly|no>\`.`,
     "- Exit code 75 means Codex is out of quota or at crossfeed's stop: do the work yourself.",
     '- Exit code 127 means the codex CLI was not found: do the work yourself and tell the user.',
   ].join('\n')
 }
 
-export function statusLine(a: { mode: Mode; u?: number; F?: number; w?: number; accountAhead?: boolean; activeSurplus?: number; codexPercent?: number; codexAvailable?: boolean; codexStale?: boolean; P: number; reserve: boolean; limits?: { label: string; percent: number; state: BucketState }[] }): string {
+export function statusLine(a: {
+  mode: Mode; u?: number; F?: number; w?: number; accountAhead?: boolean; activeSurplus?: number;
+  codexPercent?: number; codexAvailable?: boolean; codexStale?: boolean; P: number; reserve: boolean;
+  limits?: { label: string; percent: number; state: BucketState }[];
+  stages?: { count: number; id: string; progress: string };
+}): string {
   if (a.mode === 'off') return 'crossfeed off'
   const parts = [`crossfeed ${a.mode}`]
   if (a.u !== undefined) {
@@ -138,6 +172,12 @@ export function statusLine(a: { mode: Mode; u?: number; F?: number; w?: number; 
   else if (a.codexStale) parts.push('codex stale')
   parts.push(waiting ? 'waiting for a reading' : `pressure ${Math.round(a.P * 100) / 100}`)
   if (a.reserve) parts.push('reserve')
+  if (a.stages && a.stages.count > 0) {
+    const { count, id, progress } = a.stages
+    const characters = Array.from(progress)
+    const latest = characters.length > 60 ? characters.slice(0, 59).join('') + '…' : progress
+    parts.push(`codex stages ${count}`, `${id.replace(/[\r\n]+/g, ' ')}: ${latest}`)
+  }
   return parts.join(' · ')
 }
 
@@ -166,7 +206,7 @@ export function stretchReminder(a: { calls: number; u?: number; script: string; 
     : a.u === undefined ? 'Claude 5h usage unknown.' : `Claude 5h ${Math.round(a.u)}%.`
   const session = a.session === undefined ? '' : ' --session ' + shellQuote(a.session)
   const command = `python3 -I ${shellQuote(a.script)} run --kind task${stopFlag(a.codexStopPercent)}${session}`
-  return `crossfeed: ${a.calls} main-loop tool calls since the last user prompt; ${usage} Hand-offs are on (${a.reasons.join(', ')}). Hand self-contained work to Codex with ${command} and the full brief on stdin. The job is read-only unless --write is added. Start it as a background Bash command, wait for the exit notification, and check the result.`
+  return `crossfeed: ${a.calls} main-loop tool calls since the last user prompt; ${usage} Hand-offs are on (${a.reasons.join(', ')}). Hand self-contained work to Codex with ${command} and the full brief on stdin. Add --write for work that should change project files. Start it as a background Bash command, wait for the exit notification, and check the result.`
 }
 
 export function pressureNotice(a: { u: number; F?: number; P: number }): string {

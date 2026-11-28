@@ -124,6 +124,180 @@ export type Spawn = {
   subagentType: string; model?: string; fork: boolean; parentModel: string
   tool_use_id: string; background: boolean; parentAgentId?: string; isTeammate?: boolean
   workflow?: { runId: string; agentIndex: number }; resume?: { agentId: string }
+  isolation?: string
+}
+
+export type StageContract = {
+  id: string
+  executor: 'auto' | 'codex'
+  kind: 'review' | 'research' | 'task'
+  schema?: Record<string, unknown>
+  brief: string
+}
+
+function jsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+type Schema = Record<string, unknown>
+const STRICT_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'])
+const STRICT_SCHEMA_KEYS = new Set([
+  'type', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const',
+  'description', 'title', 'anyOf', '$defs', '$ref', 'minimum', 'maximum',
+  'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf', 'minItems', 'maxItems',
+  'minLength', 'maxLength', 'pattern', 'format',
+])
+
+function localDefinition(ref: unknown, root: Schema): unknown {
+  if (typeof ref !== 'string' || !ref.startsWith('#/$defs/')) return undefined
+  let pointer: string
+  try { pointer = decodeURIComponent(ref.slice(2)) } catch { return undefined }
+  let target: unknown = root
+  for (const token of pointer.split('/')) {
+    if (/~(?![01])/.test(token)) return undefined
+    const key = token.replace(/~1/g, '/').replace(/~0/g, '~')
+    if (!jsonObject(target) || !Object.hasOwn(target, key)) return undefined
+    target = target[key]
+  }
+  return target
+}
+
+// Well inside the API's 120,000-character limit on property names, definition
+// names, enum and const values together: the serialized schema bounds them all.
+const STRICT_SCHEMA_MAX_CHARS = 15_000
+
+export function strictCompatible(root: Schema): boolean {
+  if (root.type !== 'object' || Object.hasOwn(root, 'anyOf') || Object.hasOwn(root, '$ref')) return false
+  let serialized: string | undefined
+  try { serialized = JSON.stringify(root) } catch { return false }
+  if (serialized === undefined || serialized.length > STRICT_SCHEMA_MAX_CHARS) return false
+  const checkedDepth = new Map<Schema, number>()
+  const visiting = new Set<Schema>()
+  let propertiesCount = 0
+  let enumCount = 0
+  function visit(schema: unknown, parentDepth: number): boolean {
+    if (!jsonObject(schema) || visiting.has(schema)) return false
+    const checked = checkedDepth.get(schema)
+    if (checked !== undefined && checked >= parentDepth) return true
+    visiting.add(schema)
+    checkedDepth.set(schema, parentDepth)
+    if (Object.keys(schema).some(key => !STRICT_SCHEMA_KEYS.has(key))) return false
+    for (const key of ['description', 'title', 'pattern', 'format']) {
+      if (Object.hasOwn(schema, key) && typeof schema[key] !== 'string') return false
+    }
+    for (const key of ['minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf']) {
+      const value = schema[key]
+      if (Object.hasOwn(schema, key) && (typeof value !== 'number' || !Number.isFinite(value) || (key === 'multipleOf' && value <= 0))) return false
+    }
+    for (const key of ['minItems', 'maxItems', 'minLength', 'maxLength']) {
+      const value = schema[key]
+      if (Object.hasOwn(schema, key) && (typeof value !== 'number' || !Number.isInteger(value) || value < 0)) return false
+    }
+    if (Object.hasOwn(schema, 'enum')) {
+      if (!Array.isArray(schema.enum) || !schema.enum.length) return false
+      if (checked === undefined) enumCount += schema.enum.length
+      if (enumCount > 250) return false
+    }
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type]
+    if (Object.hasOwn(schema, 'type')) {
+      if (types.some(type => typeof type !== 'string' || !STRICT_TYPES.has(type))) return false
+      if (Array.isArray(schema.type) && (types.length !== 2 || new Set(types).size !== 2 || !types.includes('null'))) return false
+    } else if (!Object.hasOwn(schema, '$ref') && !Object.hasOwn(schema, 'anyOf')) return false
+    const depth = parentDepth + (types.includes('object') || types.includes('array') ? 1 : 0)
+    if (depth > 5) return false
+    if (types.includes('object')) {
+      const { properties, required, additionalProperties } = schema
+      if (!jsonObject(properties) || !Array.isArray(required) || additionalProperties !== false ||
+          required.length !== Object.keys(properties).length || new Set(required).size !== required.length ||
+          !required.every(key => typeof key === 'string' && Object.hasOwn(properties, key))) return false
+      if (checked === undefined) propertiesCount += required.length
+      if (propertiesCount > 100 || !Object.values(properties).every(child => visit(child, depth))) return false
+    } else if (['properties', 'required', 'additionalProperties'].some(key => Object.hasOwn(schema, key))) return false
+    if (types.includes('array') ? !visit(schema.items, depth) : Object.hasOwn(schema, 'items')) return false
+    if (Object.hasOwn(schema, '$defs') && (!jsonObject(schema.$defs) || !Object.values(schema.$defs).every(child => visit(child, 0)))) return false
+    if (Object.hasOwn(schema, '$ref') && !visit(localDefinition(schema.$ref, root), parentDepth)) return false
+    if (Object.hasOwn(schema, 'anyOf') && (!Array.isArray(schema.anyOf) || !schema.anyOf.length ||
+        !schema.anyOf.every(child => visit(child, parentDepth)))) return false
+    visiting.delete(schema)
+    return true
+  }
+  return visit(root, 0)
+}
+
+// The wrapper a non-strict schema is sent as: strict mode then fixes the shape
+// of Codex's final message, and the value itself travels as JSON text, the way
+// tool-call arguments do. The original schema goes into the brief.
+export const ANSWER_FIELD_SCHEMA = {
+  type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false,
+} as const
+
+// The structured value of a Codex answer: the whole final message under a
+// strict-compatible schema, else the JSON text in its `answer` field. Claude
+// Code validates the value against the workflow's own schema.
+// `json` is the source text, never re-serialized: the engine parses the streamed
+// tool arguments itself, and a round trip through JavaScript numbers would
+// change values such as 9007199254740993 or 1e400 before validation.
+export function stageAnswer(result: string, schema: Schema): { value: unknown; json: string } | { error: string } {
+  const message = result.replace(/^\uFEFF/, '').trim()
+  let outer: unknown
+  try { outer = JSON.parse(message) } catch { return { error: 'the final message is not JSON' } }
+  let strict = false
+  try { strict = strictCompatible(schema) } catch { /* Sent wrapped, as the launch did. */ }
+  if (strict) return { value: outer, json: message }
+  if (!jsonObject(outer) || typeof outer.answer !== 'string') return { error: 'the final message has no answer field' }
+  const answer = outer.answer.trim()
+  let value: unknown
+  try { value = JSON.parse(answer) } catch { return { error: 'the answer field is not JSON' } }
+  return { value, json: answer }
+}
+
+function fenceLine(line: string) {
+  return /^\uFEFF? {0,3}(`{3,}|~{3,})([^\r\n]*)/.exec(line)
+}
+
+function closesFence(marker: string, info: string, opener: string): boolean {
+  return marker[0] === opener[0] && marker.length >= opener.length && /^[ \t]*$/.test(info)
+}
+
+export function parseStage(spawn: Pick<Spawn, 'subagentType'> & { prompt: string }): StageContract | { error: string } | undefined {
+  if (spawn.subagentType !== 'workflow-subagent') return undefined
+  const lines = spawn.prompt.match(/[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+$/g) ?? []
+  let fence: { marker: string; start: number; stage: boolean } | undefined
+  let block: { start: number; end: number } | undefined
+  for (const [index, line] of lines.entries()) {
+    const match = fenceLine(line)
+    if (!match) continue
+    const marker = match[1]!
+    const info = match[2]!
+    if (fence) {
+      if (!closesFence(marker, info, fence.marker)) continue
+      if (fence.stage) block = { start: fence.start, end: index }
+      fence = undefined
+      continue
+    }
+    // A backtick in the info string makes this an inline span or ordinary text.
+    const backticks = marker.startsWith('`')
+    if (backticks && info.includes('`')) continue
+    const stage = backticks && /^crossfeed-stage(?:\s|$)/.test(info.trim())
+    if (stage && block) return { error: 'expected exactly one crossfeed-stage block' }
+    fence = { marker, start: index, stage }
+  }
+  if (fence?.stage) return { error: 'unclosed crossfeed-stage block' }
+  if (!block) return undefined
+
+  let value: unknown
+  try { value = JSON.parse(lines.slice(block.start + 1, block.end).join('').trim()) }
+  catch { return { error: 'invalid JSON in crossfeed-stage block' } }
+  if (!jsonObject(value)) return { error: 'crossfeed-stage must be a JSON object' }
+  const { v, id, executor = 'auto', kind = 'review', schema } = value
+  if (v !== 1) return { error: 'crossfeed-stage v must be 1' }
+  if (typeof id !== 'string' || !id.trim()) return { error: 'crossfeed-stage id must be a non-empty string' }
+  if (executor !== 'auto' && executor !== 'codex') return { error: 'crossfeed-stage executor must be auto or codex' }
+  if (kind !== 'review' && kind !== 'research' && kind !== 'task') return { error: 'crossfeed-stage kind must be review, research or task' }
+  if (schema !== undefined && !jsonObject(schema)) return { error: 'crossfeed-stage schema must be an object' }
+  if (executor === 'codex' && schema === undefined) return { error: 'crossfeed-stage executor codex requires schema' }
+  const brief = [...lines.slice(0, block.start), ...lines.slice(block.end + 1)].join('')
+  return { id, executor, kind, schema, brief }
 }
 
 export function spawnOrigin(spawn: Spawn): SpawnOrigin {

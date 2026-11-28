@@ -1,6 +1,10 @@
 import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { AgentSpawnInput, On, ProcessRunResult, RenderSurface, SessionRateLimit } from 'claude-code'
+import type { AgentSpawnInput, On, ProcessRunResult, ProcessSpawnRequest, RenderSurface, SessionRateLimit, TurnStepChunk } from 'claude-code'
+import type { Caught, EngineInterface, StreamNext } from 'claude-code'
+import { DEFAULTS } from '../../hooks/config'
+import { createCore } from '../../hooks/core'
+import { failOpenStep } from '../../hooks/register'
 import type { BackgroundRow } from '../../hooks/core'
 import type { BackgroundState } from '../../types'
 
@@ -13,6 +17,10 @@ const AGENT_RESULT = { result: { status: 'async_launched' as const, agentId: 'te
 const QUOTA = { source: 'app-server', age_s: 0, limit_reached: false, error: null, app_server_error: null, windows: [{ minutes: 10080, used_percent: 18, resets_at: 1900000000 }] }
 const COMPOSE = { model: 'test', promptModel: 'test', surfaces: [], tools: [], outputStyle: null, traits: [] }
 const ORIGIN = { kind: 'composer' as const }
+const STAGE_PATH = '/tmp/检查 stage/result.md'
+const STAGE_FILE = 'full 检查\n'
+const STAGE_FOOTER = `Full result: ${STAGE_PATH}\nCodex edits: none`
+const STAGE_RESPONSE = { id: 'test-job', status: 'done', exit: 0, result_path: STAGE_PATH, result: 'capped 检查\n', codex_edited: [] }
 
 function processResult(stdout: string, exitCode = 0): ProcessRunResult {
   return { stdout, exitCode, stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
@@ -26,9 +34,14 @@ function setup(on: On) {
     spawns: [] as AgentSpawnInput[], spawnModel: undefined as string | undefined, denySpawn: false,
     failUsage: false, failDowngrade: false, downgradeExit: 0,
     now: BASE, quota: processResult(JSON.stringify(QUOTA)), rejectProcess: false, failClock: false,
-    usage: [] as SessionRateLimit[], cwd: CWD,
+    usage: [] as SessionRateLimit[], cwd: CWD, failCwd: false,
     lockout: processResult('{"reset_at":null}'), processFailure: '',
     stash: processResult('/tmp/检查 brief.md\n'), rejectStash: false,
+    stashes: [] as ProcessRunResult[], spawnGate: undefined as Promise<void> | undefined,
+    stageChecks: [] as string[], failStageCheck: false, stageVerdict: 'allow' as 'allow' | 'deny' | 'ask',
+    stageLaunches: [] as ProcessSpawnRequest[], stageGates: [] as Promise<void>[], stageExitGates: [] as Promise<void>[],
+    stageCode: 0, stageStdout: JSON.stringify(STAGE_RESPONSE), stageStderr: ['diagnostics\n'], stageFile: STAGE_FILE, stageReads: [] as string[],
+    stageSpawnFault: false, claudeSteps: [] as number[],
     processes: [] as { argv: readonly string[]; timeout?: number; stdin?: string }[],
     agents: [] as unknown[], statuses: [] as (string | undefined)[], logs: [] as string[], commands: [] as string[],
     bashCalls: 0, denyBash: false, denyAgent: false, failStatus: false,
@@ -78,7 +91,7 @@ function setup(on: On) {
     }
     return { value: { startedAt: BASE, context: { window: 200000 }, rateLimits } }
   })
-  on('session.cwd', () => ({ value: world.cwd }))
+  on('session.cwd', () => world.failCwd ? { deny: 'cwd unavailable' } : { value: world.cwd })
   on('session.model', async () => {
     // As for usage, a held reply carries the model in use when it was asked for.
     const model = world.model
@@ -90,9 +103,11 @@ function setup(on: On) {
     if (world.failModel) throw new Error('model unavailable')
     return { value: model }
   })
-  on('agent.spawn', (_$, e) => {
+  on('agent.spawn', async (_$, e) => {
     world.spawns.push(e)
-    return world.denySpawn ? { deny: 'engine denied spawn' } : { model: world.spawnModel ?? e.model ?? 'claude-fable-5-2', agentId: world.nextAgentId }
+    const result = world.denySpawn ? { deny: 'engine denied spawn' } : { model: world.spawnModel ?? e.model ?? 'claude-fable-5-2', agentId: world.nextAgentId }
+    if (world.spawnGate) await world.spawnGate
+    return result
   })
   on('session.id', () => {
     world.sessionIdReads += 1
@@ -167,7 +182,7 @@ function setup(on: On) {
     }
     if (e.argv[3] === 'stash') {
       await world.stashGate
-      return world.rejectStash ? { deny: 'stash unavailable' } : { value: world.stash }
+      return world.rejectStash ? { deny: 'stash unavailable' } : { value: world.stashes.shift() ?? world.stash }
     }
     if (world.processFailure) throw new Error(world.processFailure)
     if (world.rejectProcess) return { deny: 'process unavailable' }
@@ -202,6 +217,31 @@ function setup(on: On) {
     const decision = world.verdicts.get(id) ?? 'allow'
     return { decision, reason: decision === 'deny' ? world.stopDeniedReason : undefined }
   })
+  on('tool.check', { tool: 'Bash' }, (_$, e, next) => {
+    if (e.tool_use_id !== undefined) return next(e)
+    world.stageChecks.push((e.input as { command: string }).command)
+    if (world.failStageCheck) throw new Error('permission check unavailable')
+    return { decision: world.stageVerdict, reason: world.stageVerdict === 'deny' ? 'a Bash deny rule' : undefined }
+  })
+  on('process.spawn', async function* (_$, e) {
+    const stageIndex = world.stageLaunches.length
+    const gate = world.stageGates[stageIndex]
+    const exitGate = world.stageExitGates[stageIndex]
+    world.stageLaunches.push({ argv: e.argv, env: e.env })
+    if (gate) await gate
+    if (world.stageSpawnFault) return { deny: 'dispatcher spawn failed' }
+    const middle = Math.floor(world.stageStdout.length / 2)
+    yield { stream: 'stdout', text: world.stageStdout.slice(0, middle) }
+    for (const text of world.stageStderr) yield { stream: 'stderr', text }
+    if (exitGate) await exitGate
+    yield { stream: 'stdout', text: world.stageStdout.slice(middle) }
+    return { value: { code: world.stageCode, signal: null } }
+  })
+  on('fs.read', (_$, e) => {
+    world.stageReads.push(e.path)
+    return { value: world.stageFile }
+  })
+  on('fs.stat', () => ({ value: { kind: 'file', size: new TextEncoder().encode(world.stageFile).length, isLink: false, mtimeMs: world.now } }))
   on('tool.call', { tool: 'TaskStop' }, async (_$, e) => {
     const id = e.task_id ?? ''
     world.stops.push(id)
@@ -219,6 +259,12 @@ function setup(on: On) {
     return { text: e.text, context: e.context }
   })
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.step', async function* (_$, e) {
+    world.claudeSteps.push(e.index)
+    yield { kind: 'text', index: 0, text: 'Claude answer' }
+    yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+    return { turnId: e.turnId, index: e.index, answer: 'Claude answer', toolUses: [], stopReason: 'end_turn', usage: null }
+  })
   on('turn.complete', (_$, e) => ({ text: e.answer }))
   on('classic.StopFailure', () => ({}))
   return world
@@ -1858,4 +1904,746 @@ test('the row queue uses one writer and drops the oldest entries above 500', asy
   expect(batch[499]).toEqual(expect.objectContaining({ model: 'test-503' }))
   expect(world.maxWriters).toBe(1)
   expect(world.logs.some(log => log.includes('dropped 3 oldest rows'))).toBe(true)
+})
+
+const STAGE_SCHEMA = { type: 'object', properties: { note: { type: 'string' } }, required: ['note'], additionalProperties: false }
+const STAGE_BRIEF = 'Review 检查.\r\n'
+const EXPLICIT_STAGE = { executor: 'codex', schema: STAGE_SCHEMA }
+
+function stageSpawn(fields: Record<string, unknown> = {}) {
+  const contract = JSON.stringify({ v: 1, id: 'stage-one', ...fields })
+  return { ...WORKFLOW_SPAWN, prompt: STAGE_BRIEF + '```crossfeed-stage\r\n' + contract + '\r\n```\r\n' }
+}
+
+async function stageStart($: Engine, world: ReturnType<typeof setup>, fields = {}, agentId = 'stage-agent') {
+  world.nextAgentId = agentId
+  const ran = await $.agent.spawn(stageSpawn(fields))
+  expect(ran.deny).toBe(undefined)
+  const prompt = world.spawns.at(-1)!.prompt
+  expect(prompt.includes('crossfeed-route: ')).toBe(true)
+  await $.turn.start({ text: prompt, turnId: agentId, agentId })
+}
+
+async function stageStep($: Engine, agentId: string, index = 0) {
+  const stream = $.turn.step({ turnId: agentId, agentId, index, model: 'opus', messageCount: 10 })
+  const chunks: TurnStepChunk[] = []
+  // A hook that answers without next() ends the generator with its own result;
+  // `stream.result` only settles with what beneath returned.
+  for (let step = await stream.next(); ; step = await stream.next()) {
+    if (step.done) return { chunks, result: step.value }
+    chunks.push(step.value)
+  }
+}
+
+function stageGate() {
+  let resolve = () => {}
+  const promise = new Promise<void>(done => { resolve = done })
+  return { promise, resolve }
+}
+
+function stageQuota(used_percent: number) {
+  return processResult(JSON.stringify({ ...QUOTA, windows: [{ ...QUOTA.windows[0], used_percent }] }))
+}
+
+test('explicit stages stash the brief and schema and launch the exact allowed command', { options: {
+  codexStopPercent: 80, model: "model'one", effort: 'medium', timeoutMinutes: 12,
+} }, async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 5, resetsAt: RESET }]
+  world.stashes.push(processResult('/tmp/检查 brief.md\n'), processResult('/tmp/schema.json\n'))
+  world.stageFile = '\ufeff{\r\n"note":"完整 naïve"\r\n}\r\n'
+  await start($)
+  await stageStart($, world, { ...EXPLICIT_STAGE, kind: 'research' })
+  expect(world.processes.filter(p => p.argv[3] === 'stash').map(p => p.stdin)).toEqual([
+    STAGE_BRIEF, JSON.stringify(STAGE_SCHEMA),
+  ])
+  const script = world.processes[0]!.argv[2]!
+  const { chunks, result } = await stageStep($, 'stage-agent')
+  expect(world.stageChecks).toEqual([
+    `python3 -I ${script} run --kind research --tier B --json --slots 8 --heartbeat 60 --dir '/tmp/检查 project' --brief-file '/tmp/检查 brief.md' --output-schema /tmp/schema.json --codex-stop 80 --model 'model'\\''one' --effort medium --timeout 12`,
+  ])
+  expect(world.stageLaunches).toEqual([{
+    argv: ['python3', '-I', script, 'run', '--kind', 'research', '--tier', 'B', '--json', '--slots', '8', '--heartbeat', '60', '--dir', CWD,
+      '--brief-file', '/tmp/检查 brief.md', '--output-schema', '/tmp/schema.json', '--codex-stop', '80',
+      '--model', "model'one", '--effort', 'medium', '--timeout', '12'],
+    env: { CLAUDE_CODE_SESSION_ID: 'test-session' },
+  }])
+  expect(world.stageReads).toEqual([STAGE_PATH])
+  const tool = result.toolUses[0]!
+  expect(tool).toEqual(expect.objectContaining({ name: 'StructuredOutput', input: { note: '完整 naïve' } }))
+  expect(chunks).toEqual([
+    { kind: 'tool', index: 0, id: expect.any(String), name: 'StructuredOutput' },
+    { kind: 'input', index: 0, json: world.stageFile.trim() },
+    { kind: 'stop', stopReason: 'tool_use', usage: null },
+  ])
+  expect(world.claudeSteps).toEqual([])
+  expect(world.records.flat()).toEqual([])
+  await completeTurn($, 'stage-agent', 'stage-agent')
+  await waitForBackground(() => world.records.flat().length === 1)
+  expect(world.records.flat()).toEqual([{ type: 'spawn', session: 'test-session', origin: 'workflow',
+    run_id: 'wf_test', agent_index: 2, model: WORKFLOW_SPAWN.model ?? null, outcome: 'stage-codex' }])
+})
+
+test('auto stage admission follows the short window and tier decision', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 5, resetsAt: RESET }]
+  await start($)
+  const review = stageSpawn()
+  await $.agent.spawn(review)
+  expect(world.spawns.at(-1)?.prompt).toBe(review.prompt)
+  expect(world.stageChecks).toEqual([])
+  await stageStart($, world, { kind: 'task' }, 'task-agent')
+  expect(world.stageChecks.at(-1)?.includes('--kind task --tier A')).toBe(true)
+  await measure($, world, 80)
+  await stageStart($, world, { kind: 'research' }, 'research-agent')
+  expect(world.stageChecks.at(-1)?.includes('--kind research --tier B')).toBe(true)
+  world.now += 6 * MINUTE
+  world.quota = stageQuota(84.9)
+  await measure($, world, 86)
+  await stageStart($, world, { kind: 'task' }, 'short-agent')
+  expect(world.stageChecks.at(-1)?.includes('--kind task --tier A')).toBe(true)
+})
+
+test('stage prerequisites preserve auto admission and explain explicit refusals', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  for (const [name, reason] of [
+    ['zero', 'Codex weekly use is 85%'], ['unknown', 'no Codex reading'], ['brief', 'could not save the stage brief'],
+    ['schema', 'could not save the stage schema'], ['deny', 'a Bash deny rule'], ['ask', 'Bash(python3 -I '],
+  ] as const) {
+    world.quota = name === 'zero' ? stageQuota(85) : name === 'unknown' ? processResult('', 1) : stageQuota(18)
+    world.stageVerdict = name === 'deny' || name === 'ask' ? name : 'allow'
+    world.rejectStash = name === 'brief'
+    if (name === 'schema') world.stashes.push(world.stash, processResult('', 1))
+    await start($)
+    const explicit = await $.agent.spawn(stageSpawn(EXPLICIT_STAGE))
+    expect(explicit.deny?.includes(reason)).toBe(true)
+    if (name === 'ask') expect(explicit.deny?.includes(' run *)')).toBe(true)
+    if (name === 'schema') world.stashes.push(world.stash, processResult('', 1))
+    const auto = await $.agent.spawn(stageSpawn({ schema: STAGE_SCHEMA }))
+    expect(auto.deny?.includes('refuses new background Claude agents')).toBe(true)
+  }
+  expect(world.spawns).toEqual([])
+  expect(world.stageChecks.length).toBe(4)
+  expect(world.stageLaunches).toEqual([])
+  world.stageVerdict = 'deny'
+  await measure($, world, 5)
+  const auto = stageSpawn({ kind: 'task' })
+  expect((await $.agent.spawn(auto)).deny).toBe(undefined)
+  expect(world.spawns.at(-1)?.prompt).toBe(auto.prompt)
+})
+
+test('missing stage launch prerequisites refuse Codex and preserve ordinary auto admission', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  await start($)
+  for (const [failure, reason] of [
+    ['directory', 'could not determine the session directory'],
+    ['stash', 'could not save the stage brief'],
+    ['permission', 'could not check Bash permission'],
+  ] as const) {
+    world.failCwd = failure === 'directory'
+    world.rejectStash = failure === 'stash'
+    world.failStageCheck = failure === 'permission'
+    const explicit = stageSpawn(EXPLICIT_STAGE)
+    expect((await $.agent.spawn(explicit)).deny?.includes(reason)).toBe(true)
+    const auto = stageSpawn()
+    expect((await $.agent.spawn(auto)).deny).toBe(undefined)
+    expect(world.spawns.at(-1)?.prompt).toBe(auto.prompt)
+  }
+  expect(world.spawns.length).toBe(3)
+  expect(world.stageChecks.length).toBe(2)
+  expect(world.stageLaunches).toEqual([])
+})
+
+test('concurrent explicit stages await the same stale quota refresh', async ($, on) => {
+  const world = setup(on)
+  await start($)
+  world.now += 16 * MINUTE
+  const gate = stageGate()
+  world.quotaGate = gate.promise
+  const probes = () => world.sequence.filter(name => name === 'quota').length
+  const count = probes()
+  const first = $.agent.spawn(stageSpawn({ ...EXPLICIT_STAGE, id: 'first' }))
+  try {
+    await waitForBackground(() => probes() === count + 1)
+    const second = $.agent.spawn(stageSpawn({ ...EXPLICIT_STAGE, id: 'second' }))
+    for (let index = 0; index < 100; index++) await Promise.resolve()
+    expect(probes()).toBe(count + 1)
+    gate.resolve()
+    for (const result of await Promise.all([first, second])) expect(result.deny).toBe(undefined)
+    expect(world.spawns.length).toBe(2)
+    expect(world.spawns.every(spawn => spawn.prompt.includes('crossfeed-route: '))).toBe(true)
+    expect(world.stageChecks.length).toBe(2)
+    expect(probes()).toBe(count + 1)
+  } finally {
+    gate.resolve()
+    await first
+  }
+})
+
+test('contract refusal precedes background admission and ignores other agent types and off mode', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  await start($)
+  const invalid = stageSpawn({ executor: 'codex' })
+  expect((await $.agent.spawn(invalid)).deny?.includes('requires schema')).toBe(true)
+  expect((await $.agent.spawn({ ...SPAWN, prompt: invalid.prompt })).deny).toBe(undefined)
+  await command($, 'off')
+  expect((await $.agent.spawn(invalid)).deny).toBe(undefined)
+  expect(world.spawns.at(-1)?.prompt).toBe(invalid.prompt)
+  expect(world.stageChecks).toEqual([])
+})
+
+for (const approveStages of [false, true]) {
+  test(`stage permission verdicts with approveStages ${approveStages}`, { options: { approveStages } }, async ($, on) => {
+    const world = setup(on)
+    world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+    world.stageFile = '{"note":"done"}'
+    await start($)
+    for (const verdict of ['allow', 'ask', 'deny'] as const) {
+      world.stageVerdict = verdict
+      for (const executor of ['auto', 'codex'] as const) {
+        const e = stageSpawn({ executor, schema: STAGE_SCHEMA })
+        const agentId = verdict + '-' + executor
+        world.nextAgentId = agentId
+        const count = world.spawns.length
+        const launched = world.stageLaunches.length
+        const result = await $.agent.spawn(e)
+        if (verdict === 'allow' || (verdict === 'ask' && approveStages)) {
+          expect(result.deny).toBe(undefined)
+          const prompt = world.spawns[count]!.prompt
+          expect(prompt.includes('crossfeed-route: ')).toBe(true)
+          await $.turn.start({ text: prompt, turnId: agentId, agentId })
+          expect((await stageStep($, agentId)).result.stopReason).toBe('tool_use')
+          expect(world.stageLaunches.length).toBe(launched + 1)
+          await completeTurn($, agentId, agentId)
+        } else if (executor === 'auto') {
+          expect(result.deny).toBe(undefined)
+          expect(world.spawns[count]?.prompt).toBe(e.prompt)
+          expect(world.stageLaunches.length).toBe(launched)
+        } else {
+          expect(world.spawns.length).toBe(count)
+          expect(world.stageLaunches.length).toBe(launched)
+          if (verdict === 'deny') expect(result.deny?.includes('a Bash deny rule')).toBe(true)
+          else {
+            expect(result.deny?.includes('approveStages in /plugin configure')).toBe(true)
+            expect(result.deny?.includes('outside auto permission mode allow Bash(python3 -I ')).toBe(true)
+            expect(result.deny?.includes(' run *)')).toBe(true)
+          }
+        }
+      }
+    }
+    expect(world.stageChecks.length).toBe(6)
+  })
+}
+
+test('a non-strict schema goes into the brief, Codex answers in the wrapper, and the value passes through unchanged', async ($, on) => {
+  const world = setup(on)
+  const schema = { type: 'object', properties: { note: { type: 'string' }, '检查': { type: ['integer', 'null'] } } }
+  const value = { '检查': null, extra: 'kept' }
+  world.stageFile = JSON.stringify({ answer: JSON.stringify(value) }) + '\r\n'
+  await start($)
+  await stageStart($, world, { executor: 'codex', schema })
+  const stashes = world.processes.filter(p => p.argv[3] === 'stash')
+  expect(stashes.map(s => s.stdin)).toEqual([
+    STAGE_BRIEF + '\n\nSchema:\n' + JSON.stringify(schema) +
+      '\n\nYour final message is a JSON object with one field, `answer`: a string holding the JSON value that satisfies this schema.',
+    JSON.stringify({ type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false }),
+  ])
+  const response = await stageStep($, 'stage-agent')
+  expect(world.stageLaunches[0]?.argv.includes('--output-schema')).toBe(true)
+  expect(response.result.toolUses[0]).toEqual(expect.objectContaining({ name: 'StructuredOutput', input: value }))
+  expect(response.chunks).toEqual([
+    { kind: 'tool', index: 0, id: expect.any(String), name: 'StructuredOutput' },
+    { kind: 'input', index: 0, json: JSON.stringify(value) },
+    { kind: 'stop', stopReason: 'tool_use', usage: null },
+  ])
+})
+
+test('only an issued nonce binds a text stage before the spawn result', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  await start($)
+  await $.turn.start({ text: 'crossfeed-route: 00000000-0000-0000-0000-000000000000', turnId: 'unknown', agentId: 'unknown' })
+  expect((await stageStep($, 'unknown')).result.answer).toBe('Claude answer')
+  const gate = stageGate()
+  world.spawnGate = gate.promise
+  world.nextAgentId = 'early-agent'
+  const pending = $.agent.spawn(stageSpawn())
+  try {
+    await waitForBackground(() => world.spawns.length === 1)
+    const prompt = world.spawns[0]!.prompt
+    await $.turn.start({ text: 'Wrapper\n' + prompt.split('\n').map(line => '  ' + line).join('\n'),
+      turnId: 'early-agent', agentId: 'early-agent' })
+    const { chunks, result } = await stageStep($, 'early-agent')
+    expect(result.answer).toBe(`${STAGE_FILE}\n${STAGE_FOOTER}`)
+    expect(chunks).toEqual([{ kind: 'text', index: 0, text: result.answer },
+      { kind: 'stop', stopReason: 'end_turn', usage: null }])
+    expect(world.stageReads).toEqual([STAGE_PATH])
+    await completeTurn($, 'early-agent', 'early-agent')
+    await $.turn.start({ text: prompt, turnId: 'replay', agentId: 'replay' })
+    expect((await stageStep($, 'replay')).result.answer).toBe('crossfeed-stage-failed: stage-one: the stage already ran under another agent')
+  } finally {
+    gate.resolve()
+    await pending
+  }
+  await waitForBackground(() => world.records.flat().length === 1)
+  expect(world.records.flat().map(row => row.outcome)).toEqual(['stage-codex'])
+  expect(world.stageLaunches.length).toBe(1)
+})
+
+test('a new step after StructuredOutput fails without rerunning the stage on Claude', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  world.stageFile = '{"note":"r"}'
+  await start($)
+  for (const [agent, fields, short] of [
+    ['auto-open', { schema: STAGE_SCHEMA }, false],
+    ['explicit-open', EXPLICIT_STAGE, false],
+    ['auto-short', { schema: STAGE_SCHEMA }, true],
+  ] as const) {
+    await stageStart($, world, fields, agent)
+    expect((await stageStep($, agent)).result.stopReason).toBe('tool_use')
+    if (short) await measure($, world, 86)
+    for (const index of [1, 2]) {
+      const { result } = await stageStep($, agent, index)
+      expect(result.answer).toBe('crossfeed-stage-failed: stage-one: StructuredOutput was rejected')
+      expect(result.toolUses).toEqual([])
+    }
+    await completeTurn($, agent, agent)
+  }
+  await waitForBackground(() => world.records.flat().length === 3)
+  expect(world.records.flat().map(row => row.outcome)).toEqual(['stage-failed', 'stage-failed', 'stage-failed'])
+  expect(world.claudeSteps).toEqual([])
+  expect(world.stageLaunches.length).toBe(3)
+})
+
+test('dispatcher failures report non-zero exit, not-started, invalid JSON and spawn faults', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  await start($)
+  for (const [code, status, fields, fault, reason] of [
+    [1, 'failed', {}, false, 'Codex job failed (exit 1)'],
+    [75, 'not-started', {}, false, 'Codex job did not start'],
+    [0, 'done', EXPLICIT_STAGE, false, 'the final message is not JSON'],
+    [0, 'done', EXPLICIT_STAGE, true, 'stage dispatch failed'],
+  ] as const) {
+    world.stageCode = code
+    world.stageStdout = JSON.stringify({ ...STAGE_RESPONSE, status, exit: code })
+    world.stageFile = '\ufeff\r\n{invalid}'
+    world.stageSpawnFault = fault
+    await stageStart($, world, fields)
+    const { result } = await stageStep($, 'stage-agent')
+    expect(result.answer).toBe('crossfeed-stage-failed: stage-one: ' + reason)
+    expect(result.toolUses).toEqual([])
+    await completeTurn($, 'stage-agent', 'stage-agent')
+  }
+  await waitForBackground(() => world.records.flat().length === 4)
+  expect(world.records.flat().map(row => row.outcome)).toEqual(Array(4).fill('stage-failed'))
+  expect(world.claudeSteps).toEqual([])
+})
+
+test('stage heartbeats share a thinking block before text and StructuredOutput', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  world.stageStderr = ['diagnostics\ncrossfeed: heart', 'beat\r', '\ncrossfeed: heartbeat\ncrossfeed: heartbeat ignored\n']
+  const thinking = { kind: 'thinking', index: 0, text: 'Waiting for the Codex job.\n' }
+  await start($)
+  await stageStart($, world, {}, 'heartbeat-text')
+  const text = await stageStep($, 'heartbeat-text')
+  expect(text.chunks).toEqual([thinking, thinking, { kind: 'text', index: 1, text: text.result.answer },
+    { kind: 'stop', stopReason: 'end_turn', usage: null }])
+  expect(text.result.answer).toBe(`${STAGE_FILE}\n${STAGE_FOOTER}`)
+  world.stageFile = '{"note":"schema result"}'
+  await stageStart($, world, EXPLICIT_STAGE, 'heartbeat-schema')
+  const schema = await stageStep($, 'heartbeat-schema')
+  expect(schema.chunks).toEqual([thinking, thinking,
+    { kind: 'tool', index: 1, id: expect.any(String), name: 'StructuredOutput' },
+    { kind: 'input', index: 1, json: world.stageFile },
+    { kind: 'stop', stopReason: 'tool_use', usage: null }])
+  expect(schema.result.toolUses[0]).toEqual(expect.objectContaining({ name: 'StructuredOutput', input: { note: 'schema result' } }))
+  expect(schema.result.index).toBe(0)
+  expect(world.claudeSteps).toEqual([])
+})
+
+test('stage progress becomes thinking and prevents a late fallback', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  world.stageStderr = ['diagnostics\ncrossfeed: prog', 'ress ran pytest (exit 0)\r', '\ncrossfeed: progress searched 测试\n']
+  const progress = [{ kind: 'thinking', index: 0, text: 'Codex: ran pytest (exit 0)\n' },
+    { kind: 'thinking', index: 0, text: 'Codex: searched 测试\n' }]
+  await start($)
+  await stageStart($, world, {}, 'progress-ok')
+  const success = await stageStep($, 'progress-ok')
+  expect(success.chunks).toEqual([...progress, { kind: 'text', index: 1, text: success.result.answer },
+    { kind: 'stop', stopReason: 'end_turn', usage: null }])
+  world.stageCode = 1
+  world.stageStdout = JSON.stringify({ ...STAGE_RESPONSE, status: 'failed', exit: 1 })
+  await stageStart($, world, {}, 'progress-failed')
+  const failure = await stageStep($, 'progress-failed')
+  expect(failure.result.answer).toBe('crossfeed-stage-failed: stage-one: Codex job failed (exit 1)')
+  expect(failure.chunks).toEqual([...progress, { kind: 'text', index: 1, text: failure.result.answer },
+    { kind: 'stop', stopReason: 'end_turn', usage: null }])
+  expect(world.claudeSteps).toEqual([])
+})
+
+test('missing Codex permits silent fallback but BOM-prefixed progress blocks it', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  world.stageCode = 127
+  world.stageStdout = JSON.stringify({ ...STAGE_RESPONSE, status: 'not-started', exit: 127 })
+  await start($)
+  world.stageStderr = ['crossfeed: codex executable not found\n']
+  await stageStart($, world, {}, 'missing')
+  expect((await stageStep($, 'missing')).result.answer).toBe('Claude answer')
+  expect((await stageStep($, 'missing', 1)).result.answer).toBe('Claude answer')
+  await completeTurn($, 'missing', 'missing')
+  world.stageStderr = ['\ufeffcrossfeed: pro', 'gress searched 检查\r', '\n']
+  await stageStart($, world, {}, 'with-progress')
+  const failure = await stageStep($, 'with-progress')
+  expect(failure.result.answer).toBe('crossfeed-stage-failed: stage-one: Codex job did not start')
+  expect(failure.chunks).toEqual([
+    { kind: 'thinking', index: 0, text: 'Codex: searched 检查\n' },
+    { kind: 'text', index: 1, text: failure.result.answer },
+    { kind: 'stop', stopReason: 'end_turn', usage: null },
+  ])
+  await completeTurn($, 'with-progress', 'with-progress')
+  await waitForBackground(() => world.records.flat().length === 2)
+  expect(world.records.flat().map(row => row.outcome)).toEqual(['stage-fallback', 'stage-failed'])
+  expect(world.claudeSteps).toEqual([0, 1])
+})
+
+test('a confirmed non-start falls back independently of change fields', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  world.stageCode = 75
+  await start($)
+  world.stageStdout = JSON.stringify({ status: 'not-started', codex_edited: ['a.txt'], observed: ['b.txt'], head_moved: true })
+  await stageStart($, world, {}, 'not-started')
+  expect((await stageStep($, 'not-started')).result.answer).toBe('Claude answer')
+  await completeTurn($, 'not-started', 'not-started')
+  await waitForBackground(() => world.records.flat().length === 1)
+  expect(world.records.flat()[0]).toEqual(expect.objectContaining({ outcome: 'stage-fallback' }))
+  expect(world.claudeSteps).toEqual([0])
+})
+
+test('a fault caught after launch gives a stage failure without calling next', async () => {
+  const active = createCore(DEFAULTS, '/tmp/crossfeed.py')
+  const route = { nonce: 'a1', id: 'fault', executor: 'auto', kind: 'review', argv: [],
+    row: { type: 'spawn', session: null, origin: 'workflow', run_id: null, agent_index: null, model: null },
+  } as const
+  active.stages.bind('fault-agent', active.stages.issue(route, 'review'))
+  expect(active.stages.start('fault-agent', route)).toBe(true)
+  const $ = { ui: { log() {}, async status() {} }, clock: { async now() { return BASE } } } as unknown as EngineInterface
+  let calls = 0
+  const next = Object.assign(() => { calls++; throw new Error('unexpected Claude continuation') }, {
+    called: false, signal: new AbortController().signal, event: 'turn.step', error: { message: 'late fault' },
+  }) as unknown as StreamNext<'turn.step'> & Caught
+  const rows: BackgroundRow[] = []
+  const stream = failOpenStep($, { agentId: 'fault-agent', turnId: 'test', index: 0, model: 'opus', messageCount: 1 },
+    next, active, row => rows.push(row))
+  const first = await stream.next()
+  expect(first.value).toEqual({ kind: 'text', index: 0, text: 'crossfeed-stage-failed: fault: stage hook failed' })
+  await stream.next()
+  await stream.next()
+  expect(calls).toBe(0)
+  expect(active.stages.status()).toBe(undefined)
+  expect(rows.map(row => row.outcome)).toEqual(['stage-failed'])
+})
+
+test('a worktree spawn stays on Claude in auto and refuses explicit Codex', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  await start($)
+  const auto = { ...stageSpawn(), isolation: 'worktree' }
+  const explicit = { ...stageSpawn(EXPLICIT_STAGE), isolation: 'worktree' }
+  expect((await $.agent.spawn(auto)).deny).toBe(undefined)
+  expect(world.spawns.at(-1)?.prompt).toBe(auto.prompt)
+  expect((await $.agent.spawn(explicit)).deny)
+    .toBe('crossfeed-stage-failed: stage-one: stage uses worktree isolation; Codex would run in the session checkout')
+  expect(world.stageChecks).toEqual([])
+  expect(world.stageLaunches).toEqual([])
+})
+
+test('worktree isolation reported separately still prevents dispatch', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  on('vcs.isolate', () => ({ deny: 'test fixture does not create a worktree' }))
+  await start($)
+  for (const [agentId, fields, answer] of [
+    ['worktree-auto', {}, 'Claude answer'],
+    ['worktree-codex', EXPLICIT_STAGE, 'crossfeed-stage-failed: stage-one: stage uses worktree isolation; Codex would run in the session checkout'],
+  ] as const) {
+    await stageStart($, world, fields, agentId)
+    await $.vcs.isolate({ agentId, for: 'agent', name: agentId, from: CWD, base: 'head' })
+    expect((await stageStep($, agentId)).result.answer).toBe(answer)
+    await completeTurn($, agentId, agentId)
+  }
+  expect(world.stageLaunches).toEqual([])
+})
+
+test('stage status shows starts and the latest action across concurrent stages', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  const firstProgress = stageGate(), secondProgress = stageGate()
+  const firstExit = stageGate(), secondExit = stageGate()
+  world.stageGates = [firstProgress.promise, secondProgress.promise]
+  world.stageExitGates = [firstExit.promise, secondExit.promise]
+  const displayed = (suffix: string) => world.statuses.at(-1)?.endsWith(suffix) === true
+  const stages: ReturnType<typeof stageStep>[] = []
+  await start($)
+  try {
+    await stageStart($, world, { id: 'first' }, 'first-agent')
+    stages.push(stageStep($, 'first-agent'))
+    await waitForBackground(() => world.stageLaunches.length === 1)
+    expect(displayed(' · codex stages 1 · first: started')).toBe(true)
+    world.stageStderr = ['crossfeed: progress ran pytest (exit 0)\n', 'crossfeed: heartbeat\n']
+    firstProgress.resolve()
+    await waitForBackground(() => displayed(' · codex stages 1 · first: ran pytest (exit 0)'))
+    await stageStart($, world, { id: 'second' }, 'second-agent')
+    stages.push(stageStep($, 'second-agent'))
+    await waitForBackground(() => world.stageLaunches.length === 2)
+    expect(displayed(' · codex stages 2 · first: ran pytest (exit 0)')).toBe(true)
+    world.stageStderr = ['crossfeed: progress searched changes\n']
+    secondProgress.resolve()
+    await waitForBackground(() => displayed(' · codex stages 2 · second: searched changes'))
+    await command($, 'off')
+    expect(world.statuses.at(-1)).toBe('crossfeed off')
+    await command($, 'auto')
+    expect(displayed(' · codex stages 2 · second: searched changes')).toBe(true)
+    secondExit.resolve()
+    await stages[1]
+    expect(displayed(' · codex stages 1 · first: ran pytest (exit 0)')).toBe(true)
+    firstExit.resolve()
+    await stages[0]
+    expect(world.statuses.at(-1)?.includes(' · codex stages ')).toBe(false)
+  } finally {
+    firstProgress.resolve()
+    secondProgress.resolve()
+    firstExit.resolve()
+    secondExit.resolve()
+    await Promise.all(stages)
+  }
+})
+
+test('stage status clears on failure and Claude fallback', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  await start($)
+  for (const [agent, kind, answer] of [
+    ['task', 'task', 'crossfeed-stage-failed: stage-one: Codex job failed (exit 1)'],
+    ['review', 'review', 'Claude answer'],
+  ] as const) {
+    world.stageCode = kind === 'task' ? 1 : 127
+    world.stageStdout = JSON.stringify({ ...STAGE_RESPONSE, status: kind === 'task' ? 'failed' : 'not-started', exit: world.stageCode })
+    const before = world.statuses.length
+    await stageStart($, world, { kind }, agent)
+    expect((await stageStep($, agent)).result.answer).toBe(answer)
+    expect(world.statuses.slice(before).some(status => status?.endsWith(' · codex stages 1 · stage-one: started'))).toBe(true)
+    expect(world.statuses.at(-1)?.includes(' · codex stages ')).toBe(false)
+  }
+})
+
+test('an aborted stage clears status and ignores late progress', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  world.stageStderr = ['crossfeed: progress late update\n']
+  const gate = stageGate()
+  world.stageGates = [gate.promise]
+  await start($)
+  const agentId = 'aborted-stage'
+  await stageStart($, world, {}, agentId)
+  const pending = stageStep($, agentId)
+  try {
+    await waitForBackground(() => world.stageLaunches.length === 1)
+    expect(world.statuses.at(-1)?.endsWith(' · codex stages 1 · stage-one: started')).toBe(true)
+    await $.turn.complete({ answer: '', reason: 'aborted', durationMs: 1, isAborted: true, turnId: agentId, agentId })
+    expect(world.statuses.at(-1)?.includes(' · codex stages ')).toBe(false)
+  } finally {
+    gate.resolve()
+    await pending
+  }
+  expect(world.statuses.some(status => status?.includes('late update'))).toBe(false)
+})
+
+test('status display failures preserve stage thinking and answers', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  world.stageStderr = ['crossfeed: progress ran pytest (exit 0)\n']
+  await start($)
+  await stageStart($, world)
+  world.failStatus = true
+  const { chunks, result } = await stageStep($, 'stage-agent')
+  expect(chunks[0]).toEqual({ kind: 'thinking', index: 0, text: 'Codex: ran pytest (exit 0)\n' })
+  expect(result.answer).toBe(`${STAGE_FILE}\n${STAGE_FOOTER}`)
+  expect(world.claudeSteps).toEqual([])
+})
+
+test('an auto stage failure after a heartbeat stays with the hook outside a short window', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  world.stageCode = 1
+  world.stageStdout = JSON.stringify({ ...STAGE_RESPONSE, status: 'failed', exit: 1 })
+  world.stageStderr = ['crossfeed: heartbeat\n']
+  await start($)
+  for (const [agentId, fields] of [['failed-text', {}], ['failed-schema', { schema: STAGE_SCHEMA }]] as const) {
+    await stageStart($, world, fields, agentId)
+    const { chunks, result } = await stageStep($, agentId)
+    expect(result.answer).toBe('crossfeed-stage-failed: stage-one: Codex job failed (exit 1)')
+    expect(chunks).toEqual([{ kind: 'thinking', index: 0, text: 'Waiting for the Codex job.\n' },
+      { kind: 'text', index: 1, text: result.answer }, { kind: 'stop', stopReason: 'end_turn', usage: null }])
+    expect((await stageStep($, agentId, 1)).result.answer).toBe(result.answer)
+    await completeTurn($, agentId, agentId)
+  }
+  await waitForBackground(() => world.records.flat().length === 2)
+  expect(world.records.flat().map(row => row.outcome)).toEqual(['stage-failed', 'stage-failed'])
+  expect(world.claudeSteps).toEqual([])
+})
+
+test('retried agents fail while the original dispatcher runs and retain its outcome', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  world.stageCode = 1
+  world.stageStdout = JSON.stringify({ ...STAGE_RESPONSE, status: 'failed', exit: 1 })
+  const gate = stageGate()
+  world.stageGates = [gate.promise]
+  await start($)
+  await stageStart($, world, {}, 'original-agent')
+  const prompt = world.spawns.at(-1)!.prompt
+  const original = stageStep($, 'original-agent')
+  const checkRetry = async (agentId: string) => {
+    await $.turn.start({ text: prompt, turnId: agentId, agentId })
+    const retry = await stageStep($, agentId)
+    expect(retry.result.answer).toBe('crossfeed-stage-failed: stage-one: the stage already ran under another agent')
+    expect(retry.result.toolUses).toEqual([])
+    await completeTurn($, agentId, agentId)
+  }
+  try {
+    await waitForBackground(() => world.stageLaunches.length === 1)
+    await checkRetry('retry-while-running')
+    expect(world.records.flat()).toEqual([])
+  } finally {
+    gate.resolve()
+    await original
+  }
+  expect((await original).result.answer).toBe('crossfeed-stage-failed: stage-one: Codex job failed (exit 1)')
+  await completeTurn($, 'original-agent', 'original-agent')
+  await checkRetry('retry-after-failure')
+  await waitForBackground(() => world.records.flat().length === 1)
+  expect(world.records.flat().map(row => row.outcome)).toEqual(['stage-failed'])
+  expect(world.stageLaunches.length).toBe(1)
+  expect(world.claudeSteps).toEqual([])
+})
+
+test('write stage argv and text reports separate edits from observed changes', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  await start($)
+  for (const [agent, schema, observed, display] of [
+    ['write-paths', undefined, ['other.txt'], 'Workspace changes during the run: other.txt'],
+    ['write-unavailable', undefined, 'unavailable', 'Workspace changes: unavailable'],
+    ['write-schema', STAGE_SCHEMA, ['other.txt'], ''],
+  ] as const) {
+    world.stageStdout = JSON.stringify({ ...STAGE_RESPONSE, codex_edited: ['检查.md'], observed, head_moved: false })
+    world.stageFile = schema ? '{"note":"done"}' : STAGE_FILE
+    await stageStart($, world, { kind: 'task', schema }, agent)
+    const { result } = await stageStep($, agent)
+    expect(world.stageChecks.at(-1)?.includes(' --write')).toBe(true)
+    expect(world.stageLaunches.at(-1)?.argv.includes('--write')).toBe(true)
+    if (schema) {
+      expect(result.answer).toBe('')
+      expect(result.toolUses[0]).toEqual(expect.objectContaining({ name: 'StructuredOutput', input: { note: 'done' } }))
+    } else {
+      expect(result.answer).toBe(`${STAGE_FILE}\nFull result: ${STAGE_PATH}\nCodex edits: 检查.md\n${display}`)
+    }
+  }
+})
+
+test('read-stage edits reach the text warning, schema toast and spawn rows', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  await start($)
+  world.stageStdout = JSON.stringify({ ...STAGE_RESPONSE, codex_edited: ['检查.md'] })
+  const warning = 'this read job edited 1 file(s): 检查.md'
+  await stageStart($, world, { kind: 'review' }, 'read-text')
+  expect(world.stageLaunches.length).toBe(0)
+  const text = await stageStep($, 'read-text')
+  expect(world.stageLaunches.at(-1)?.argv.includes('--write')).toBe(false)
+  expect(text.result.answer).toContain(warning)
+  expect(text.result.answer?.includes('Workspace changes')).toBe(false)
+  await completeTurn($, 'read-text', 'read-text')
+  world.stageFile = '{"note":"done"}'
+  await stageStart($, world, { ...EXPLICIT_STAGE, kind: 'research' }, 'read-schema')
+  const schema = await stageStep($, 'read-schema')
+  expect(world.stageLaunches.at(-1)?.argv.includes('--write')).toBe(false)
+  expect(schema.result.answer).toBe('')
+  expect(schema.result.toolUses[0]).toEqual(expect.objectContaining({ input: { note: 'done' } }))
+  expect(world.toasts.at(-1)).toContain('Stage stage-one: Warning: ' + warning)
+  await completeTurn($, 'read-schema', 'read-schema')
+  await waitForBackground(() => world.records.flat().length === 2)
+  expect(world.records.flat().map(row => [row.outcome, 'codex_edited' in row ? row.codex_edited : null]))
+    .toEqual([['stage-codex', 1], ['stage-codex', 1]])
+})
+
+test('text stages return a complete result line longer than 8 KiB', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  world.stageFile = '检查' + 'x'.repeat(9000) + 'end'
+  await start($)
+  await stageStart($, world)
+  const { result } = await stageStep($, 'stage-agent')
+  expect(result.answer).toBe(`${world.stageFile}\n\n${STAGE_FOOTER}`)
+})
+
+test('task stages fall back only after a silent not-started response while Claude is available', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 80, resetsAt: RESET }]
+  world.stageFile = '{"note":"done"}'
+  await start($)
+  for (const [agent, executor, status, heartbeat, fallback] of [
+    ['quota-auto', 'auto', 'not-started', false, true],
+    ['quota-explicit', 'codex', 'not-started', false, false],
+    ['quota-after-heartbeat', 'auto', 'not-started', true, false],
+    ['failed-write', 'auto', 'failed', false, false],
+  ] as const) {
+    world.stageCode = status === 'not-started' ? 75 : 1
+    world.stageStdout = JSON.stringify({ ...STAGE_RESPONSE, status, exit: world.stageCode })
+    world.stageStderr = heartbeat ? ['crossfeed: heartbeat\n'] : []
+    await stageStart($, world, { kind: 'task', executor, schema: STAGE_SCHEMA }, agent)
+    const { result } = await stageStep($, agent)
+    const reason = status === 'not-started' ? 'Codex job did not start' : 'Codex job failed (exit 1)'
+    expect(result.answer).toBe(fallback ? 'Claude answer' : 'crossfeed-stage-failed: stage-one: ' + reason)
+    expect(result.toolUses).toEqual([])
+    await completeTurn($, agent, agent)
+  }
+  world.stageCode = 0
+  world.stageStdout = JSON.stringify({ ...STAGE_RESPONSE, observed: [], head_moved: false })
+  await stageStart($, world, { kind: 'task', schema: STAGE_SCHEMA }, 'rejected-output')
+  expect((await stageStep($, 'rejected-output')).result.stopReason).toBe('tool_use')
+  expect((await stageStep($, 'rejected-output', 1)).result.answer)
+    .toBe('crossfeed-stage-failed: stage-one: StructuredOutput was rejected')
+  await completeTurn($, 'rejected-output', 'rejected-output')
+  await waitForBackground(() => world.records.flat().length === 5)
+  expect(world.records.flat().map(row => row.outcome)).toEqual(['stage-fallback', ...Array(4).fill('stage-failed')])
+  expect(world.claudeSteps).toEqual([0])
+})
+
+test('a fifth stage starts its dispatcher at once while four are running; the slot wait is the dispatcher\'s', async ($, on) => {
+  const world = setup(on)
+  world.usage = [{ kind: 'five_hour', percentUsed: 86, resetsAt: RESET }]
+  await start($)
+  const gate = stageGate()
+  const agents = ['one', 'two', 'three', 'four', 'five']
+  world.stageGates = agents.slice(0, 4).map(() => gate.promise)
+  for (const agent of agents) await stageStart($, world, {}, agent)
+  const steps = agents.map(agent => stageStep($, agent))
+  try {
+    await waitForBackground(() => world.stageLaunches.length === 5)
+    expect(world.stageLaunches.map(({ argv }) => argv.slice(9, 11))).toEqual(agents.map(() => ['--slots', '8']))
+    expect(world.claudeSteps).toEqual([])
+  } finally {
+    gate.resolve()
+    await Promise.all(steps)
+  }
 })

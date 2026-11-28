@@ -10,6 +10,7 @@ export type Config = {
   codexStopPercent: number
   shedPercent: number
   wake: boolean
+  approveStages: boolean
   timeoutMinutes: number
 }
 
@@ -23,6 +24,7 @@ export const DEFAULTS: Config = {
   codexStopPercent: 85,
   shedPercent: 85,
   wake: true,
+  approveStages: false,
   timeoutMinutes: 30,
 }
 
@@ -46,6 +48,7 @@ export function toConfig(options: Record<string, unknown> | undefined): Config {
     shedPercent: typeof values.shedPercent === 'number' && values.shedPercent > 0 && values.shedPercent <= 100
       ? values.shedPercent : DEFAULTS.shedPercent,
     wake: typeof values.wake === 'boolean' ? values.wake : DEFAULTS.wake,
+    approveStages: typeof values.approveStages === 'boolean' ? values.approveStages : DEFAULTS.approveStages,
     timeoutMinutes: positiveNumber(values.timeoutMinutes, DEFAULTS.timeoutMinutes),
   }
 }

@@ -47,6 +47,19 @@ class RecordTests(CrossfeedCase):
         self.assertEqual(self.record(b"", 0, 0), [])
         self.assertFalse((self.home / "ledger.jsonl").exists())
 
+    def test_stage_spawn_outcomes_round_trip(self):
+        expected = [dict(SPAWN, outcome=outcome) for outcome in ("stage-codex", "stage-fallback", "stage-failed")]
+        payload = "\n".join(map(json.dumps, expected)).encode()
+        records = self.record(payload, 3, 0)
+        self.assertEqual([{key: value for key, value in row.items() if key not in ("v", "ts")}
+                          for row in records], expected)
+
+    def test_stage_edit_count_is_preserved_and_validated(self):
+        payload = "\n".join(json.dumps(dict(SPAWN, outcome="stage-codex", codex_edited=count))
+                            for count in (2, -1, True, "2"))
+        record, = self.record(payload.encode(), 1, 3)
+        self.assertEqual(record["codex_edited"], 2)
+
     def test_crlf_and_a_leading_utf8_bom(self):
         payload = ("\ufeff" + json.dumps(SPAWN) + "\r\n" + json.dumps(WAKE) + "\r\n").encode()
         self.assertEqual([row["type"] for row in self.record(payload, 2, 0)], ["spawn", "wake"])
